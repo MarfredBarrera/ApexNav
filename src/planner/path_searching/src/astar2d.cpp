@@ -13,6 +13,12 @@ Astar2D::~Astar2D()
 
 void Astar2D::init(rclcpp::Node::SharedPtr node, const SDFMap2D::Ptr& sdf_map)
 {
+  // Free existing node pool before reallocation to prevent leak on re-init
+  for (auto* ptr : path_node_pool_) {
+    delete ptr;
+  }
+  path_node_pool_.clear();
+
   if (!node->has_parameter("astar.resolution_astar")) {
     node->declare_parameter("astar.resolution_astar", -1.0);
   }

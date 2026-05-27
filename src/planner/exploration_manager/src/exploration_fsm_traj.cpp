@@ -12,6 +12,7 @@ namespace apexnav_planner {
 
 void ExplorationFSMReal::init(rclcpp::Node::SharedPtr node)
 {
+  bool first_init = (node_ == nullptr);
   node_ = node;
   fp_.reset(new FSMParam);
   fd_.reset(new FSMData);
@@ -42,6 +43,8 @@ void ExplorationFSMReal::init(rclcpp::Node::SharedPtr node)
   fp_->replan_traj_end_threshold_ = node_->get_parameter("fsm/replan_traj_end_threshold").as_double();
   fp_->replan_frontier_change_delay_ = node_->get_parameter("fsm/replan_frontier_change_delay").as_double();
   fp_->replan_timeout_ = node_->get_parameter("fsm/replan_timeout").as_double();
+
+  if (!first_init) return;  // Skip timer/sub/pub creation on re-init (episode reset)
 
   /* ROS2 Timer */
   exec_timer_ = node_->create_wall_timer(
