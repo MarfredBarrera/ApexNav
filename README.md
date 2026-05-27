@@ -31,6 +31,8 @@
 
 This is the **ROS2 Jazzy** port of [ApexNav](https://github.com/Robotics-STAR-Lab/ApexNav), originally built on ROS1 Noetic. The entire codebase has been migrated to work with **Ubuntu 24.04 + ROS2 Jazzy**.
 
+**ROS2 Jazzy support is now available thanks to the community contribution from [romaster93](https://github.com/romaster93).** Please note that this ROS2 port is community-maintained and is not the official paper release.
+
 ### What's Changed from the Original
 - **Build system**: catkin → ament_cmake + colcon
 - **C++ API**: roscpp → rclcpp
