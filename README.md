@@ -1,7 +1,6 @@
 <div align="center">
     <img src="assets/apexnav_logo_white.png" alt="ApexNav Logo" width="200">
     <h2>An Adaptive Exploration Strategy for Zero-Shot Object Navigation with Target-centric Semantic Fusion (Lightweight Version)</h2>
-    <strong>
 
 </div>
 
@@ -171,7 +170,7 @@ unzip data/datasets/objectnav/mp3d/v1.zip -d data/datasets/objectnav/mp3d/v1 && 
 ```
 
 <details>
-<summary>Make sure that the folder `data` structure has the following structure:</summary>
+<summary>Make sure that the folder <code>data</code> structure has the following structure:</summary>
 
 ```
 data
