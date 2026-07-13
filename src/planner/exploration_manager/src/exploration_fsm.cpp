@@ -594,11 +594,11 @@ bool ExplorationFSM::updateFrontierAndObject()
   auto frt_map = expl_manager_->frontier_map2d_;
   auto obj_map = expl_manager_->object_map2d_;
   auto ed = expl_manager_->ed_;
-  Eigen::Vector2d start_pos2d = Eigen::Vector2d(fd_->start_pt_(0), fd_->start_pt_(1));
+  const Eigen::Vector2d sensor_pos(fd_->odom_pos_(0), fd_->odom_pos_(1));
 
   change_flag = frt_map->isAnyFrontierChanged();
   frt_map->searchFrontiers();
-  change_flag |= frt_map->dormantSeenFrontiers(start_pos2d, fd_->start_yaw_(0));
+  change_flag |= frt_map->dormantSeenFrontiers(sensor_pos, fd_->odom_yaw_);
   frt_map->getFrontiers(ed->frontiers_, ed->frontier_averages_);
   frt_map->getDormantFrontiers(ed->dormant_frontiers_, ed->dormant_frontier_averages_);
   obj_map->getObjects(ed->objects_, ed->object_averages_, ed->object_labels_);
