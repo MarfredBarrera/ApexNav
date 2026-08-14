@@ -1,0 +1,53 @@
+# Single service: the VLM servers bind localhost and every client hardcodes
+# http://localhost:<port>, so all processes have to share a network namespace.
+# Run the pieces with scripts/start_session.sh once the container is up.
+
+services:
+  apexnav:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        UID: "${APEX_UID:-1018}"
+        GID: "${APEX_GID:-1020}"
+    image: apexnav:jazzy
+    container_name: apexnav
+    hostname: apexnav
+
+    gpus: all
+
+    # Fast-DDS uses shared memory between the C++ nodes and the Python node; the
+    # 64 MB Docker default is not enough for 640x480 depth frames and the grid_map
+    # point clouds.
+    shm_size: "8gb"
+
+    environment:
+      NVIDIA_DRIVER_CAPABILITIES: all   # 'graphics' is what makes habitat-sim's EGL context work
+      EGL_PLATFORM: surfaceless
+      ROS_DOMAIN_ID: "42"
+      ROS_AUTOMATIC_DISCOVERY_RANGE: LOCALHOST
+      # Both GPUs are visible; GPU 0 has the most free memory on this host.
+      CUDA_VISIBLE_DEVICES: "${APEX_GPUS:-0}"
+
+    # Rootless Docker maps container uid 0 to the host user, so running as root here
+    # is what keeps bind-mount writes owned by you. Under rootful Docker, override
+    # with APEX_USER=1018:1020. See the Dockerfile's user section.
+    user: "${APEX_USER:-0:0}"
+
+    ports:
+      # Host 8766 by default: something else already listens on 8765 on this machine.
+      # The container side stays 8765, so the launch file and docs need no change -
+      # tunnel with `ssh -L 8765:localhost:8766 <host>`.
+      - "${APEX_FOXGLOVE_PORT:-8766}:8765"
+      # ollama's 11434 is deliberately not published: scripts/pull_llm_model.sh and the
+      # llm/ client both reach it on the container's own localhost, and this host
+      # already runs an ollama of its own on that port.
+
+    volumes:
+      - ..:/workspace/ApexNav
+      - ${APEXNAV_DATA:-${HOME}/nas/apexnav_data}:/workspace/ApexNav/data
+
+    working_dir: /workspace/ApexNav
+    stdin_open: true
+    tty: true
+    command: ["sleep", "infinity"]

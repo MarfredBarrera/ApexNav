@@ -1,0 +1,247 @@
+{
+  "configById": {
+    "3D!apexnav": {
+      "cameraState": {
+        "distance": 30,
+        "perspective": true,
+        "phi": 30,
+        "thetaOffset": 0,
+        "target": [0, 0, 0],
+        "targetOffset": [0, 0, 0],
+        "targetOrientation": [0, 0, 0, 1],
+        "fovy": 45,
+        "near": 0.5,
+        "far": 5000
+      },
+      "followMode": "follow-none",
+      "followTf": "world",
+      "scene": {
+        "enableStats": false,
+        "backgroundColor": "#1a1a1e"
+      },
+      "transforms": {
+        "frame:world": { "visible": true },
+        "frame:navigation": { "visible": false }
+      },
+      "topics": {
+        "/habitat/odom": {
+          "visible": true,
+          "type": "arrow",
+          "color": "#ff1900ff"
+        },
+        "/habitat/sensor_pose": {
+          "visible": false,
+          "type": "arrow",
+          "color": "#2e3436ff"
+        },
+        "/robot": { "visible": true },
+        "/planning_vis/frontier": { "visible": true },
+        "/planning_vis/viewpoints": { "visible": true },
+        "/grid_map/update_range": { "visible": true },
+        "/grid_map/occupied": {
+          "visible": true,
+          "colorMode": "flat",
+          "flatColor": "#555753ff",
+          "pointSize": 3
+        },
+        "/grid_map/occupied_inflate": {
+          "visible": true,
+          "colorMode": "flat",
+          "flatColor": "#888a85ff",
+          "pointSize": 3
+        },
+        "/grid_map/unknown": {
+          "visible": false,
+          "colorMode": "flat",
+          "flatColor": "#d3d7cfff",
+          "pointSize": 3
+        },
+        "/grid_map/free": {
+          "visible": true,
+          "colorMode": "flat",
+          "flatColor": "#b0dcf5ff",
+          "pointSize": 3
+        },
+        "/grid_map/esdf": {
+          "visible": false,
+          "colorMode": "colormap",
+          "colorMap": "turbo",
+          "colorField": "intensity",
+          "pointSize": 3
+        },
+        "/grid_map/depth_cloud": {
+          "visible": true,
+          "colorMode": "flat",
+          "flatColor": "#204a87ff",
+          "pointSize": 3
+        },
+        "/grid_map/filtered_depth_cloud": {
+          "visible": false,
+          "colorMode": "flat",
+          "flatColor": "#73d216ff",
+          "pointSize": 3
+        },
+        "/grid_map/occupancy_object": {
+          "visible": false,
+          "colorMode": "flat",
+          "flatColor": "#f57900ff",
+          "pointSize": 3
+        },
+        "/grid_map/all_object_cloud": {
+          "visible": false,
+          "colorMode": "flat",
+          "flatColor": "#a40000ff",
+          "pointSize": 3
+        },
+        "/grid_map/filtered_object_cloud": {
+          "visible": true,
+          "colorMode": "flat",
+          "flatColor": "#5c3566ff",
+          "pointSize": 3
+        },
+        "/grid_map/over_depth_object_cloud": {
+          "visible": false,
+          "colorMode": "flat",
+          "flatColor": "#ce5c00ff",
+          "pointSize": 3
+        },
+        "/grid_map/value_map": {
+          "visible": true,
+          "colorMode": "colormap",
+          "colorMap": "turbo",
+          "colorField": "intensity",
+          "pointSize": 3
+        },
+        "/grid_map/confidence_map": {
+          "visible": true,
+          "colorMode": "colormap",
+          "colorMap": "turbo",
+          "colorField": "intensity",
+          "pointSize": 3
+        },
+        "/object/clouds": {
+          "visible": true,
+          "colorMode": "rgb",
+          "colorField": "rgb",
+          "pointSize": 6
+        }
+      },
+      "layers": {},
+      "publish": {
+        "type": "point",
+        "poseTopic": "/move_base_simple/goal",
+        "pointTopic": "/clicked_point",
+        "poseEstimateTopic": "/initialpose"
+      }
+    },
+    "Image!rgb": {
+      "cameraState": {
+        "distance": 20,
+        "perspective": true,
+        "phi": 60,
+        "target": [0, 0, 0],
+        "targetOffset": [0, 0, 0],
+        "targetOrientation": [0, 0, 0, 1],
+        "thetaOffset": 45,
+        "fovy": 45,
+        "near": 0.5,
+        "far": 5000
+      },
+      "followMode": "follow-pose",
+      "scene": {},
+      "transforms": {},
+      "topics": {},
+      "layers": {},
+      "publish": {},
+      "imageMode": {
+        "imageTopic": "/habitat/camera_rgb"
+      }
+    },
+    "Image!depth": {
+      "cameraState": {
+        "distance": 20,
+        "perspective": true,
+        "phi": 60,
+        "target": [0, 0, 0],
+        "targetOffset": [0, 0, 0],
+        "targetOrientation": [0, 0, 0, 1],
+        "thetaOffset": 45,
+        "fovy": 45,
+        "near": 0.5,
+        "far": 5000
+      },
+      "followMode": "follow-pose",
+      "scene": {},
+      "transforms": {},
+      "topics": {},
+      "layers": {},
+      "publish": {},
+      "imageMode": {
+        "imageTopic": "/habitat/camera_depth"
+      }
+    },
+    "StateTransitions!fsm": {
+      "paths": [
+        { "value": "/ros/state.data", "timestampMethod": "receiveTime", "label": "ros_state" },
+        { "value": "/ros/expl_state.data", "timestampMethod": "receiveTime", "label": "expl_state" },
+        { "value": "/ros/expl_result.data", "timestampMethod": "receiveTime", "label": "expl_result" },
+        { "value": "/habitat/state.data", "timestampMethod": "receiveTime", "label": "habitat_state" }
+      ],
+      "isSynced": true
+    },
+    "Plot!semantics": {
+      "paths": [
+        {
+          "value": "/blip2/cosine_score.data",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "BLIP2 ITM cosine"
+        },
+        {
+          "value": "/detector/confidence_threshold.data",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "detector threshold"
+        }
+      ],
+      "showLegend": true,
+      "isSynced": true,
+      "xAxisVal": "timestamp",
+      "sidebarDimension": 240
+    },
+    "RawMessages!detections": {
+      "topicPath": "/detector/clouds_with_scores.confidence_scores"
+    }
+  },
+  "globalVariables": {},
+  "userNodes": {},
+  "playbackConfig": {
+    "speed": 1
+  },
+  "layout": {
+    "direction": "row",
+    "first": "3D!apexnav",
+    "second": {
+      "direction": "column",
+      "first": "Image!rgb",
+      "second": {
+        "direction": "column",
+        "first": "Image!depth",
+        "second": {
+          "direction": "column",
+          "first": "StateTransitions!fsm",
+          "second": {
+            "direction": "column",
+            "first": "Plot!semantics",
+            "second": "RawMessages!detections",
+            "splitPercentage": 60
+          },
+          "splitPercentage": 40
+        },
+        "splitPercentage": 40
+      },
+      "splitPercentage": 30
+    },
+    "splitPercentage": 66
+  }
+}

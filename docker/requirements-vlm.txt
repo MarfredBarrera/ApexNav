@@ -1,0 +1,61 @@
+# Env B - the four VLM servers, Python 3.9 (/opt/conda/envs/apexnav_vlm)
+#
+# This env exists only because salesforce-lavis==1.0.2 carries py3.9-era pins with no
+# cp312 wheels. It needs neither ROS nor Habitat, and talks to Env A over localhost HTTP.
+#
+# NOT listed here, installed separately in the Dockerfile:
+#   torch/torchvision  - from the cu126 index
+#   salesforce-lavis   - with --no-deps, see below
+#   groundingdino      - built from /opt/external with its CUDA extension
+
+numpy==1.23.5
+setuptools==69.2.0
+
+# --- lavis's actual import requirements --------------------------------------
+# lavis is installed with --no-deps because its declared dependency list has rotted:
+# it requires an *unpinned* spacy, which now resolves to a version needing
+# thinc>=8.3.12 / Python>=3.10, making the whole env unsolvable. Pinning spacy to the
+# last line that still supports 3.9 (3.7.x, which wants thinc<8.3.0) fixes that.
+#
+# The rest of this block is what `from lavis.models import load_model_and_preprocess`
+# actually pulls in, determined by resolving the import chain module by module. lavis's
+# other declared deps (streamlit, plotly, opendatasets, pycocoevalcap, ...) are not on
+# that path. spacy IS on it - lavis/models/__init__.py imports img2prompt_vqa, which
+# imports spacy at module level - so it cannot simply be dropped.
+#
+# --no-deps also removes the transformers conflict the README's install order produces
+# (lavis pins <4.27, ApexNav pins 4.43.2 - upstream issues #22/#23). With --no-deps
+# there is nothing to conflict, and 4.43.2 is what actually gets used either way.
+transformers==4.43.2
+timm==0.4.12
+omegaconf
+einops
+fairscale==0.4.4
+iopath
+pandas
+decord
+webdataset
+spacy==3.7.5
+pycocoevalcap
+
+# --- ApexNav's own pins -------------------------------------------------------
+opencv-python==4.6.0.66
+flask==3.0.3
+fastapi==0.111.1
+uvicorn==0.30.3
+ultralytics==8.3.39
+modelscope==1.16.1
+accelerate==0.32.1
+prettytable>=3.12.0
+
+# MobileSAM has no PyPI release; the README installs it from git.
+mobile_sam @ git+https://github.com/ChaoningZhang/MobileSAM.git
+
+# yolov7 is used as a source checkout (sys.path.insert in vlm/detector/yolov7.py),
+# so its runtime deps have to be installed by hand.
+PyYAML
+seaborn
+matplotlib
+scipy
+tqdm
+requests

@@ -1,0 +1,60 @@
+# Env A - ROS 2 Jazzy + Habitat, Python 3.12 (/opt/venv/apexnav)
+#
+# This env runs habitat_evaluation.py, the C++ nodes and foxglove_bridge. It must be
+# Python 3.12 because Jazzy's rclpy is a cpython-312 C extension, which is why
+# apexnav_environment.yaml (python=3.9, habitat-sim 0.3.1) cannot be used here.
+# See docs/DOCKER_JAZZY_FOXGLOVE.md and upstream issue #36.
+#
+# torch/torchvision are NOT listed here - they are installed separately from the
+# cu124 index in the Dockerfile.
+
+# --- build backend for the habitat-sim source build ---------------------------
+# habitat-sim v0.3.4 uses scikit-build-core; we build it with --no-build-isolation
+# so it compiles against the exact numpy pinned below rather than a fresh numpy 2.x.
+scikit-build-core>=0.10
+pybind11>=2.10
+cmake>=3.27
+ninja
+
+# --- numeric core -------------------------------------------------------------
+# numpy is 1.26.4 (habitat-lab v0.3.4's pin), NOT the 1.23.5 in ApexNav's
+# pyproject.toml: 1.23.5 has no cp312 wheels. Safe here because ApexNav's Python
+# code uses no numpy aliases removed in 1.24+ and no numba JIT.
+numpy==1.26.4
+numpy-quaternion>=2024.0.0
+scipy>=1.13.0
+numba==0.60.0
+
+# --- habitat-sim runtime deps (its own list, minus its numpy>=2.0 pin) --------
+attrs>=19.1.0
+gitpython
+imageio>=2.37.0
+imageio-ffmpeg>=0.6.0
+matplotlib
+pillow==10.4.0
+tqdm
+
+# --- habitat-lab config stack -------------------------------------------------
+hydra-core>=1.2.0
+omegaconf>=2.2.3
+gym==0.23.0
+
+# --- ApexNav ------------------------------------------------------------------
+opencv-python==4.10.0.84
+prettytable>=3.12.0
+seaborn==0.13.2
+requests
+# vlm/server_wrapper.py imports flask at module level, and the VLM *clients* import
+# it transitively, so Env A needs it even though no server runs here.
+flask==3.0.3
+# llm/answer.py imports both clients unconditionally via llm.answer_reader.
+ollama
+openai>=1.58.1
+
+# --- ROS 2 side ---------------------------------------------------------------
+# habitat2ros/habitat_publisher.py uses tf_transformations (the ROS2 port's
+# replacement for ROS1's tf.transformations). The README says
+# `pip install tf-transformations`, but that project does not exist on PyPI - it is
+# a ROS package, installed from apt as ros-jazzy-tf-transformations in the Dockerfile.
+# Only its dependency is a pip package:
+transforms3d
