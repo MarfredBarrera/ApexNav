@@ -51,6 +51,8 @@ void ExplorationFSM::init(rclcpp::Node::SharedPtr node)
   expl_state_pub_ = node_->create_publisher<std_msgs::msg::Int32>("/ros/expl_state", 10);
   action_pub_ = node_->create_publisher<std_msgs::msg::Int32>("/habitat/plan_action", 10);
   expl_result_pub_ = node_->create_publisher<std_msgs::msg::Int32>("/ros/expl_result", 10);
+  object_fusion_pub_ =
+      node_->create_publisher<plan_env::msg::ObjectFusionState>("/object/fusion_state", 10);
   robot_marker_pub_ = node_->create_publisher<visualization_msgs::msg::Marker>("/robot", 10);
 }
 
@@ -602,8 +604,42 @@ bool ExplorationFSM::updateFrontierAndObject()
   frt_map->getFrontiers(ed->frontiers_, ed->frontier_averages_);
   frt_map->getDormantFrontiers(ed->dormant_frontiers_, ed->dormant_frontier_averages_);
   obj_map->getObjects(ed->objects_, ed->object_averages_, ed->object_labels_);
+  publishObjectFusionState();
 
   return change_flag;
+}
+
+// Publish each cluster's fused confidence and the acceptance gate in force, so
+// an evaluation run can pinpoint the update at which a cluster crossed the
+// threshold - i.e. the moment the planner committed to an object
+void ExplorationFSM::publishObjectFusionState()
+{
+  if (!object_fusion_pub_)
+    return;
+
+  vector<ObjectConfidenceInfo> infos;
+  double min_confidence = 0.0;
+  int min_observation_num = 0;
+  expl_manager_->object_map2d_->getObjectConfidences(infos, min_confidence, min_observation_num);
+
+  plan_env::msg::ObjectFusionState msg;
+  msg.header.stamp = node_->get_clock()->now();
+  msg.header.frame_id = "world";
+  msg.update_seq = ++object_fusion_seq_;
+  msg.min_confidence = static_cast<float>(min_confidence);
+  msg.min_observation_num = min_observation_num;
+
+  for (const auto& info : infos) {
+    msg.ids.push_back(info.id);
+    msg.best_labels.push_back(info.best_label);
+    msg.confidences.push_back(static_cast<float>(info.confidence));
+    msg.observation_nums.push_back(info.observation_num);
+    msg.centroids_x.push_back(static_cast<float>(info.average(0)));
+    msg.centroids_y.push_back(static_cast<float>(info.average(1)));
+    msg.is_confident.push_back(info.is_confident);
+  }
+
+  object_fusion_pub_->publish(msg);
 }
 
 // Receive Habitat state messages

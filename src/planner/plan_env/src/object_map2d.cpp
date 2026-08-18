@@ -519,6 +519,32 @@ void ObjectMap2D::getObjects(
   }
 }
 
+/**
+ * @brief Export each cluster's fused confidence and the active acceptance gate
+ *
+ * The gate values are returned alongside the clusters so a consumer sees the
+ * exact threshold that applied to this snapshot, rather than having to track
+ * /detector/confidence_threshold separately.
+ */
+void ObjectMap2D::getObjectConfidences(
+    vector<ObjectConfidenceInfo>& infos, double& min_confidence, int& min_observation_num)
+{
+  infos.clear();
+  infos.reserve(objects_.size());
+  for (const auto& object : objects_) {
+    ObjectConfidenceInfo info;
+    info.id = object.id_;
+    info.best_label = object.best_label_;
+    info.confidence = object.confidence_scores_[0];
+    info.observation_num = object.observation_nums_[0];
+    info.average = object.average_;
+    info.is_confident = isConfidenceObject(object);
+    infos.push_back(info);
+  }
+  min_confidence = min_confidence_;
+  min_observation_num = min_observation_num_;
+}
+
 void ObjectMap2D::getObjectBoxes(vector<pair<Eigen::Vector2d, Eigen::Vector2d>>& boxes)
 {
   boxes.clear();

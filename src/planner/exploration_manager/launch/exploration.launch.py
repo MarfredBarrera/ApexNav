@@ -54,6 +54,15 @@ def generate_launch_description():
         description='Depth image topic (640x480 by default)'
     )
 
+    multiview_fusion_arg = DeclareLaunchArgument(
+        'multiview_fusion',
+        default_value='true',
+        description=(
+            'true = ApexNav multi-view confidence fusion; '
+            'false = single-frame detector confidence only (ablation baseline)'
+        )
+    )
+
     cx_arg = DeclareLaunchArgument('cx', default_value='320.0')
     cy_arg = DeclareLaunchArgument('cy', default_value='240.0')
     fx_arg = DeclareLaunchArgument('fx', default_value='388.1910413097385')
@@ -81,6 +90,7 @@ def generate_launch_description():
             'cy_': LaunchConfiguration('cy'),
             'fx_': LaunchConfiguration('fx'),
             'fy_': LaunchConfiguration('fy'),
+            'multiview_fusion': LaunchConfiguration('multiview_fusion'),
         }.items()
     )
 
@@ -96,6 +106,7 @@ def generate_launch_description():
         cy_arg,
         fx_arg,
         fy_arg,
+        multiview_fusion_arg,
         # Include algorithm
         algorithm_launch,
     ])

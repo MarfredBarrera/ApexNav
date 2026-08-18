@@ -1,0 +1,44 @@
+# Offline replay of a recorded episode.
+#
+# replay_episode.py re-drives a record's action sequence through Habitat with no
+# planner and no VLM servers. Habitat is deterministic given the same episode and
+# actions, so the poses - and therefore the depth and RGB observations - come back
+# bit-identical to the original run. That is why depth is regenerated here rather
+# than stored by the recorder: a 500-step episode is ~590 MB of depth.
+#
+# Usage (hydra-style overrides, same convention as habitat_evaluation.py):
+#   python -m basic_utils.record_episode.replay_episode <record_dir>
+#   python -m basic_utils.record_episode.replay_episode <record_dir> clouds.save=true
+#   python -m basic_utils.record_episode.replay_episode <record_dir> \
+#       output_dir=/tmp/myreplay depth.metric=true
+
+# Where generated artifacts go. {record} expands to the record directory's
+# basename, so replays of different episodes do not collide.
+output_dir: "replays/{record}"
+
+# Write artifacts every Nth step; 1 writes every step. Applies to all outputs
+# below, so depth, rgb and clouds stay in step with each other.
+step_stride: 1
+
+# Depth regeneration - the default product of a replay
+depth:
+  save: true
+  # false: keep habitat's normalized [0,1] values exactly as produced
+  # true:  convert to metres using the depth sensor's min/max range
+  metric: false
+
+rgb:
+  save: false
+
+# Unprojection of depth into the planner's world frame. Off by default - the
+# depth frames above are the input to whatever projection you want to run.
+clouds:
+  save: false
+  # Pixel stride when unprojecting; 1 is every pixel (~307k points/frame)
+  pixel_stride: 2
+  # Drop points at or beyond this fraction of the sensor's max range, where
+  # normalized depth saturates and the value is not a real measurement
+  max_range_frac: 0.95
+
+# Report any step whose replayed pose deviates from the recording by more than this
+tolerance: 1.0e-3

@@ -31,6 +31,7 @@ find_package(OpenCV REQUIRED)
 # 메시지 파일 생성
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/MultipleMasksWithConfidence.msg"
+  "msg/ObjectFusionState.msg"
   DEPENDENCIES std_msgs sensor_msgs
 )
 

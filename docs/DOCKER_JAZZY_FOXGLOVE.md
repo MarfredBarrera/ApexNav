@@ -65,6 +65,162 @@ running totals. A full run resumes from `continue.txt` after Ctrl-C - delete tha
 start over. `--dataset mp3d` will not run: the MP3D scene meshes need their own
 Matterport application.
 
+### Episode records and failure forensics
+
+Every episode appends one structured line to `videos/test_hm3dv2_val/episodes.jsonl` -
+per-episode success, SPL, result category, and the planner's fusion configuration. This is
+the only place per-episode metrics exist; `record.txt` stores running averages.
+
+Episodes whose result category is listed in `record.flush_on` (default `["false positive"]`)
+additionally get a full artifact directory, enough to reconstruct what the agent saw before
+it stopped at the wrong object:
+
+```
+videos/test_hm3dv2_val/records/false positive/epi<N>_<scene>_<episode_id>_<label>/
+    meta.json        # episode identity, LLM answer + threshold, detector and fusion
+                     # config, final metrics, replay commands
+    steps.jsonl      # per step: action, pose, camera pitch, ITM score,
+                     # distance to goal, per-detection confidences, the FSM
+                     # verdict, and the planner's fused per-cluster confidence
+    trajectory.npy   # (T,3) float32 pose array
+    rgb/             # raw observations; 000000.jpg is the reset frame,
+                     # 00000N.jpg is step N in steps.jsonl
+    rgb_annot/       # the same frames with detector boxes and masks drawn
+    masks/           # detector masks, {step}_{detection}.png, lossless 0/1 uint8
+```
+
+`trajectory.npy` follows the same indexing: row 0 is the pose after `env.reset()`, row N
+the pose after step N, so it has one more row than `steps.jsonl` has lines.
+
+#### Pinpointing where the algorithm committed
+
+Two per-step fields answer "when did it decide?", and they measure different things:
+
+- `detections[].score` is the **raw per-frame detector confidence** (YOLO or GroundingDINO).
+  It is *not* what the planner commits on.
+- `object_fusion` is the **fused confidence** accumulated in the planner's object map -
+  one entry per cluster, with `confidence` (target class), `observation_num`, and
+  `is_confident`, alongside the `min_confidence` / `min_observation_num` gate in force.
+  This is what [`isConfidenceObject`](../src/planner/plan_env/src/object_map2d.cpp) reads.
+  It arrives on `/object/fusion_state`; `update_seq` lets you tell whether a step saw a
+  stale snapshot, since the planner's cycle and the simulator's steps are not 1:1.
+- `final_state` / `expl_result` are the FSM's verdict for that step
+  (`params.FINAL_RESULT` / `params.EXPL_RESULT`).
+
+`summarize_run.py` reports both signals per episode:
+
+```
+gate crossed at step 17: cluster 1 confidence 0.815 >= 0.650 after 2 observations (min 2) at (-0.02, 1.49)
+FSM committed at step 34 via SEARCH_BEST_OBJECT
+```
+
+They can disagree, and the disagreement is the point. A gate crossing with no FSM
+commitment means the object passed the confidence test but no path to it was found. An
+FSM commitment via `SEARCH_SUSPICIOUS_OBJECT` or `SEARCH_EXTREME` means the run committed
+through a low-confidence fallback branch and never passed the gate at all - a different
+failure mode from a confidently-wrong detection, and the summarizer flags it.
+
+Everything is buffered in RAM and dropped for episodes that do not match, so successful
+episodes cost only the summary line. A worst-case 500-step episode is about 52 MB on disk
+and roughly the same peak in RAM, so `record.flush_on=all` costs tens of GB over a full
+HM3D-v2 val sweep. `record.enabled=false` turns it off; `record.capture_annotated_rgb=false`
+roughly halves the size.
+
+Value maps are deliberately not captured; use `need_video=true` if you want the planner's
+top-down view.
+
+To review a finished run:
+
+```bash
+python -m basic_utils.failure_check.summarize_run videos/test_hm3dv2_val
+```
+
+That prints the result breakdown and lists each false positive with two ways to reproduce
+it: `test_epi_num=<N>` for a fresh live run, or
+
+```bash
+python -m basic_utils.record_episode.replay_episode '<record_dir>'
+```
+
+to re-drive the recorded action sequence through Habitat alone - no planner and no VLM
+servers needed. The offline replay is exact; a fresh live run may diverge, because the
+planner's A* search is bounded by wall-clock time and the ROS loop cadence is not
+deterministic.
+
+#### What is stored vs regenerated
+
+Habitat is deterministic: replaying the recorded actions reproduces the poses, and
+therefore the RGB and depth observations, bit for bit (verified across processes). So the
+rule is **store what cannot be regenerated, regenerate everything else**:
+
+| data | where it comes from | cost |
+|---|---|---|
+| detector masks | **stored** - reproducing them means re-running GroundingDINO / YOLO / MobileSAM, which is not bit-reproducible across GPUs | ~4 KB each, ~1.6 MB per 500-step episode |
+| depth | **regenerated** by replay | would be ~590 MB per 500-step episode if stored |
+| world-frame point clouds | **regenerated** by replay | ~0.9 MB per frame at pixel stride 2 |
+
+Replay settings live in [`config/replay.yaml`](../config/replay.yaml) and take hydra-style
+overrides, the same convention `habitat_evaluation.py` uses. By default a replay
+regenerates the depth images and nothing else - the projection is opt-in:
+
+```bash
+# depth only (default)
+python -m basic_utils.record_episode.replay_episode '<record_dir>'
+
+# depth in metres, plus world-frame clouds and RGB, every 5th step
+python -m basic_utils.record_episode.replay_episode '<record_dir>' \
+    depth.metric=true clouds.save=true rgb.save=true step_stride=5
+
+# somewhere other than replays/<record name>/
+python -m basic_utils.record_episode.replay_episode '<record_dir>' output_dir=/tmp/myreplay
+```
+
+Depth is written as float32 `.npy`, normalized to `[0,1]` exactly as habitat produced it
+unless `depth.metric=true`. Clouds are `(N,3)` float32 in the planner's world frame
+(x = -gps[2], y = -gps[0], z up, floor near 0).
+
+The unprojection is **pitch-aware**, unlike the planner's own
+`get_object_point_cloud`, which uses yaw only - which is why `map_ros.cpp` discards frames
+where the camera is tilted. Since `steps.jsonl` records `camera_pitch`, look-down frames
+are usable here. Measured against the floor plane, tilted frames land at +0.002 m +/- 0.008;
+ignoring pitch puts them off by ~0.39 m.
+
+To pull one object out, pair its stored mask with the regenerated depth for the same step -
+`steps.jsonl` gives the mask filename per detection.
+
+### Single-frame ablation
+
+`exploration.launch.py` takes a `multiview_fusion` argument that switches the planner
+between ApexNav's multi-view confidence fusion and a single-frame baseline:
+
+```bash
+ros2 launch exploration_manager exploration.launch.py                        # fusion on
+ros2 launch exploration_manager exploration.launch.py multiview_fusion:=false
+```
+
+It sets three coupled parameters together, since changing only one does not give a clean
+baseline:
+
+| parameter | `:=true` | `:=false` |
+|---|---|---|
+| `object.fusion_type` | `1` (weighted) | `0` (latest frame wins) |
+| `object.min_observation_num` | `2` | `1` |
+| `object.use_observation` | `true` | `false` |
+
+With fusion off, an object cluster's confidence is whatever the detector reported in the
+current frame, one sighting is enough to accept it, and negative-evidence decay is
+disabled. Point clouds still accumulate across frames - navigation targets depend on the
+cluster geometry - so this isolates the *confidence* signal, not all multi-view behaviour.
+The per-category LLM acceptance threshold arriving on `/detector/confidence_threshold` is
+unchanged, so both arms share the same gate.
+
+`habitat_evaluation.py` reads these parameters back from the running planner and stamps
+them into every record, so an arm is never mislabelled. Verify with:
+
+```bash
+ros2 param get /exploration_node object.fusion_type
+```
+
 ### Running components by hand
 
 One shell per component (`... exec apexnav bash`). The environment matters: the servers
@@ -325,11 +481,15 @@ and does not publish ollama at all. Tunnel accordingly:
 
 ## Known upstream quirk: record.txt in single-episode mode
 
-`habitat_evaluation.py` prints `Episode N data written to .../record.txt` at line 543,
-but line 553 (`if flag_once: break`) returns *before* the `write_record` calls at
-557/569. So when you pass `test_epi_num=<id>`, the message appears and no file is
-written. Metrics still print to stdout. Multi-episode runs (no `test_epi_num`) write the
-record normally. Not something this container setup changes.
+`habitat_evaluation.py` prints `Episode N data written to .../record.txt`, but the
+`if flag_once: break` returns *before* the `write_record` calls. So when you pass
+`test_epi_num=<id>`, the message appears and no file is written. Metrics still print to
+stdout. Multi-episode runs (no `test_epi_num`) write the record normally. Not something
+this container setup changes.
+
+The episode recorder is deliberately flushed *before* that break, so `episodes.jsonl` and
+the artifact directories are written in single-episode mode too - which is what makes
+`test_epi_num=<N>` usable for re-running a recorded false positive.
 
 ## Troubleshooting
 

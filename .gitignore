@@ -3,6 +3,7 @@ data
 
 outputs
 videos
+replays
 
 __pycache__/
 *.egg-info

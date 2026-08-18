@@ -19,6 +19,7 @@
 #include <std_msgs/msg/float64.hpp>
 #include <std_msgs/msg/int32.hpp>
 #include <visualization_msgs/msg/marker.hpp>
+#include <plan_env/msg/object_fusion_state.hpp>
 
 using Eigen::Vector2d;
 using Eigen::Vector3d;
@@ -97,6 +98,8 @@ private:
   rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr ros_state_pub_;
   rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr expl_state_pub_;
   rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr expl_result_pub_;
+  rclcpp::Publisher<plan_env::msg::ObjectFusionState>::SharedPtr object_fusion_pub_;
+  uint32_t object_fusion_seq_ = 0;
   rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr robot_marker_pub_;
 
   /* Action Planner */
@@ -114,6 +117,7 @@ private:
 
   /* Helper functions */
   bool updateFrontierAndObject();
+  void publishObjectFusionState();
   void transitState(ROS_STATE new_state, string pos_call);
   void wrapAngle(double& angle);
   void publishRobotMarker();

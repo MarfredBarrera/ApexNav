@@ -54,6 +54,22 @@ struct DetectedObject {
   int label;                                              ///< Semantic class label from detection
 };
 
+/**
+ * @brief Fused-confidence snapshot of one object cluster
+ *
+ * Mirrors the state the acceptance gate actually reads, so an external
+ * consumer can see when a cluster crossed the threshold without needing
+ * access to the full ObjectCluster.
+ */
+struct ObjectConfidenceInfo {
+  int id;               ///< Cluster identifier
+  int best_label;       ///< Most confident semantic class, -1 if none
+  double confidence;    ///< Fused confidence for the target class (label 0)
+  int observation_num;  ///< Frames the target class was observed in
+  Vector2d average;     ///< Cluster centroid
+  bool is_confident;    ///< Passes isConfidenceObject()
+};
+
 struct Viewpoint2D {
   Vector2d pos_;   ///< 2D position of viewpoint in world coordinates
   double yaw_;     ///< Heading angle in radians
@@ -117,6 +133,8 @@ public:
       bool limited_confidence = true, bool extreme = false);
   void getObjects(
       vector<vector<Vector2d>>& clusters, vector<Vector2d>& averages, vector<int>& labels);
+  void getObjectConfidences(
+      vector<ObjectConfidenceInfo>& infos, double& min_confidence, int& min_observation_num);
   void getObjectBoxes(vector<pair<Vector2d, Vector2d>>& boxes);
   void getObjectBoxes(vector<pair<Vector3d, Vector3d>>& boxes);
   void getObjectBoxes(vector<Vector3d>& bmin, vector<Vector3d>& bmax);

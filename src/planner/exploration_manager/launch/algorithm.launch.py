@@ -4,7 +4,7 @@ Converted from ROS1 algorithm.xml
 """
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
+from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from ament_index_python.packages import get_package_share_directory
@@ -12,23 +12,34 @@ import os
 import math
 
 
-def generate_launch_description():
-    # Get package directories
-    exploration_manager_share = get_package_share_directory('exploration_manager')
+def object_fusion_params(context):
+    """Resolve the multiview_fusion argument into the three coupled object params.
+
+    'true'  - ApexNav's weighted multi-view confidence fusion (paper default)
+    'false' - single-frame baseline: the cluster's confidence is whatever the
+              detector reported this frame, one sighting is enough to accept an
+              object, and negative-evidence decay is off. Point clouds still
+              accumulate across frames because navigation targets depend on the
+              cluster geometry; only the confidence signal becomes single-frame.
+    """
+    raw = LaunchConfiguration('multiview_fusion').perform(context).strip().lower()
+    if raw not in ('true', 'false', '1', '0'):
+        raise RuntimeError(
+            f"multiview_fusion must be true or false, got '{raw}'"
+        )
+    enabled = raw in ('true', '1')
+
+    return {
+        'object.fusion_type': 1 if enabled else 0,  # 0: no_fusion 1: ours 2: max
+        'object.min_observation_num': 2 if enabled else 1,
+        'object.use_observation': enabled,
+    }
+
+
+def launch_setup(context, *args, **kwargs):
+    """Build the exploration node once the launch arguments can be resolved."""
     trajectory_manager_share = get_package_share_directory('trajectory_manager')
     lkh_mtsp_solver_share = get_package_share_directory('lkh_mtsp_solver')
-
-    # Declare launch arguments
-    map_size_x_arg = DeclareLaunchArgument('map_size_x_', default_value='80.0')
-    map_size_y_arg = DeclareLaunchArgument('map_size_y_', default_value='80.0')
-    odometry_topic_arg = DeclareLaunchArgument('odometry_topic_', default_value='/habitat/odom')
-    sensor_pose_topic_arg = DeclareLaunchArgument('sensor_pose_topic_', default_value='/habitat/sensor_pose')
-    depth_topic_arg = DeclareLaunchArgument('depth_topic_', default_value='/habitat/camera_depth')
-    cx_arg = DeclareLaunchArgument('cx_', default_value='320.0')
-    cy_arg = DeclareLaunchArgument('cy_', default_value='240.0')
-    fx_arg = DeclareLaunchArgument('fx_', default_value='388.1910413097385')
-    fy_arg = DeclareLaunchArgument('fy_', default_value='422.0475153598262')
-    is_real_world_arg = DeclareLaunchArgument('is_real_world_', default_value='false')
 
     # Load trajectory planning parameters
     planning_param_file = os.path.join(
@@ -96,9 +107,8 @@ def generate_launch_description():
                 'frontier.min_contain_unknown': 30,
 
                 # Object (C++ uses dots)
-                'object.min_observation_num': 2,
-                'object.fusion_type': 1,  # 0: no_fusion 1: ours 2: max
-                'object.use_observation': True,
+                # min_observation_num / fusion_type / use_observation come from
+                # the multiview_fusion launch argument, merged in below
                 'object.vis_cloud': True,
 
                 # Perception utils (C++ uses dots)
@@ -110,6 +120,8 @@ def generate_launch_description():
                 # A* path searching (C++ uses dots)
                 'astar.lambda_heu': 1.0,
                 'astar.resolution_astar': 0.1,
+
+                **object_fusion_params(context),
             }
         ],
         remappings=[
@@ -130,19 +142,30 @@ def generate_launch_description():
         }]
     )
 
+    return [exploration_node, tsp_solver_node]
+
+
+def generate_launch_description():
     return LaunchDescription([
         # Arguments
-        map_size_x_arg,
-        map_size_y_arg,
-        odometry_topic_arg,
-        sensor_pose_topic_arg,
-        depth_topic_arg,
-        cx_arg,
-        cy_arg,
-        fx_arg,
-        fy_arg,
-        is_real_world_arg,
+        DeclareLaunchArgument('map_size_x_', default_value='80.0'),
+        DeclareLaunchArgument('map_size_y_', default_value='80.0'),
+        DeclareLaunchArgument('odometry_topic_', default_value='/habitat/odom'),
+        DeclareLaunchArgument('sensor_pose_topic_', default_value='/habitat/sensor_pose'),
+        DeclareLaunchArgument('depth_topic_', default_value='/habitat/camera_depth'),
+        DeclareLaunchArgument('cx_', default_value='320.0'),
+        DeclareLaunchArgument('cy_', default_value='240.0'),
+        DeclareLaunchArgument('fx_', default_value='388.1910413097385'),
+        DeclareLaunchArgument('fy_', default_value='422.0475153598262'),
+        DeclareLaunchArgument('is_real_world_', default_value='false'),
+        DeclareLaunchArgument(
+            'multiview_fusion',
+            default_value='true',
+            description=(
+                'true = ApexNav multi-view confidence fusion; '
+                'false = single-frame detector confidence only'
+            ),
+        ),
         # Nodes
-        exploration_node,
-        tsp_solver_node,
+        OpaqueFunction(function=launch_setup),
     ])

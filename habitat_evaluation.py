@@ -7,6 +7,13 @@ real-time planning and decision making, incorporates vision-language models
 for object detection and image-text matching, and generates comprehensive
 evaluation metrics.
 
+The pieces live in dedicated modules:
+    habitat2ros/eval_node.py        - every ROS topic this process touches
+    basic_utils/eval/video.py       - video frame composition
+    basic_utils/eval/reporting.py   - running totals and record files
+    basic_utils/eval/habitat_utils.py - pose/label helpers shared with replay
+    basic_utils/record_episode/     - per-episode forensic recorder
+
 Usage:
     # Run with HM3D-v1 dataset
     python habitat_evaluation.py --dataset hm3dv1
@@ -24,12 +31,8 @@ Author: Zager-Zhang
 """
 
 # Standard library imports
-import argparse
-import gzip
-import json
 import os
 import signal
-import threading
 import time
 from copy import deepcopy
 
@@ -37,567 +40,321 @@ from copy import deepcopy
 from hydra import initialize, compose
 import numpy as np
 import rclpy
-from rclpy.executors import SingleThreadedExecutor
-from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-from geometry_msgs.msg import PoseStamped
-from omegaconf import DictConfig
-from prettytable import PrettyTable
-from sensor_msgs.msg import PointCloud2
-from std_msgs.msg import Int32, Int32MultiArray, Float32MultiArray, Float64
+from omegaconf import DictConfig, OmegaConf
 import tqdm
 
 # Habitat-related imports
 import habitat
 from habitat.config.default import patch_config
-from habitat.config.default_structured_configs import (
-    CollisionsMeasurementConfig,
-    FogOfWarConfig,
-    TopDownMapMeasurementConfig,
-)
 from habitat.sims.habitat_simulator.actions import HabitatSimActions
-from habitat.utils.visualizations.maps import colorize_draw_agent_and_fit_to_height
-from habitat.utils.visualizations.utils import (
-    images_to_video,
-    observations_to_image,
-    overlay_frame,
-)
 
 # ROS message imports
 from plan_env.msg import MultipleMasksWithConfidence
 
 # Local project imports
-from basic_utils.failure_check.count_files import count_files_in_directory
+from basic_utils.eval.habitat_utils import (
+    agent_world_pose,
+    load_category_mapping,
+    resolve_label,
+    slugify_label,
+)
+from basic_utils.eval.reporting import RunTotals
+from basic_utils.eval.setup import (
+    add_visualization_measurements,
+    parse_dataset_arg,
+    signal_handler,
+)
+from basic_utils.eval.video import EpisodeVideo
 from basic_utils.failure_check.failure_check import check_failure, is_on_same_floor
 from basic_utils.object_point_cloud_utils.object_point_cloud import (
     get_object_point_cloud,
 )
-from basic_utils.record_episode.read_record import read_record
-from basic_utils.record_episode.write_record import write_record
-from basic_utils.visualization.apexnav_frame import (
-    FrameStyle,
-    render_apexnav_frame,
-    update_view_center,
-)
-from basic_utils.visualization.planner_vis_listener import PlannerVisListener
-from habitat2ros.habitat_publisher import ROSPublisherNonNode
+from basic_utils.record_episode.episode_recorder import EpisodeRecorder
+from habitat2ros.eval_node import HabitatEvalNode, query_planner_fusion_config
 from llm.answer_reader.answer_reader import read_answer
-from params import HABITAT_STATE, ROS_STATE, ACTION, RESULT_TYPES
-from vlm.Labels import MP3D_ID_TO_NAME
+from params import HABITAT_STATE, ACTION
 from vlm.utils.get_itm_message import get_itm_message_cosine
 from vlm.utils.get_object_utils import get_object
 
 
-class HabitatEvalNode(Node):
-    def __init__(self):
-        super().__init__('habitat_eval_node')
+ACTION_TO_HABITAT = {
+    ACTION.MOVE_FORWARD: "move_forward",
+    ACTION.TURN_LEFT: "turn_left",
+    ACTION.TURN_RIGHT: "turn_right",
+    ACTION.TURN_DOWN: "look_down",
+    ACTION.TURN_UP: "look_up",
+    ACTION.STOP: "stop",
+}
 
-        # QoS profile
-        qos = QoSProfile(
-            reliability=ReliabilityPolicy.RELIABLE,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=10
+# Camera pitch change applied by a single look_up / look_down action
+PITCH_STEP = np.pi / 6.0
+
+
+def episode_is_feasible(episode):
+    """True when at least one goal sits on the agent's starting floor."""
+    return any(
+        is_on_same_floor(height=goal.position[1], episode=episode)
+        for goal in episode.goals
+    )
+
+
+def run_episode(env, node, ctx, label, llm_answer, room):
+    """Drive one episode to completion.
+
+    Returns (count_steps, pass_object) - the step count and whether the agent
+    ever came within the success radius of a goal during the episode.
+    """
+    count_steps = 0
+    pass_object = 0.0
+    camera_pitch = 0.0
+    cld_with_score_msg = MultipleMasksWithConfidence()
+
+    while rclpy.ok() and not env.episode_over:
+        rclpy.spin_once(node, timeout_sec=0.1)
+
+        # Keep publishing observations, confidence, and trigger so the FSM
+        # always has fresh odom and can re-trigger after episode transitions
+        node.publish_observations()
+
+        # Skip episode if target is not on the same floor
+        if not episode_is_feasible(env.current_episode):
+            break
+
+        # Parse action from decision system
+        if node.global_action is None:
+            continue
+        if count_steps == ctx["max_episode_steps"] - 1:
+            node.global_action = ACTION.STOP
+        planned_action = node.global_action
+        node.global_action = None
+
+        name = ACTION_TO_HABITAT.get(planned_action)
+        if name is None:
+            continue
+        action = getattr(HabitatSimActions, name)
+        if planned_action == ACTION.TURN_DOWN:
+            camera_pitch -= PITCH_STEP
+        elif planned_action == ACTION.TURN_UP:
+            camera_pitch += PITCH_STEP
+
+        count_steps += 1
+        print(f"\n--------------Step: {count_steps}--------------")
+        print(f"Finding [{label}]; Action: {action};")
+
+        # Notify ROS system that action execution is starting
+        node.publish_int32(node.state_pub, HABITAT_STATE.ACTION_EXEC)
+
+        observations = env.step(action)
+
+        # Keep the untouched observation: get_object() below overwrites
+        # observations["rgb"] in place with the annotated image
+        recorder = ctx["recorder"]
+        rgb_raw = (
+            observations["rgb"].copy()
+            if recorder.enabled and recorder.capture_rgb
+            else None
         )
 
-        # State variables
-        self.global_action = None
-        self.ros_state = ROS_STATE.INIT
-        self.final_state = 0
-        self.expl_result = 0
-        self.msg_observations = None
-        self.fusion_threshold = 0.0
-        self.pub_timer = None
+        # Calculate ITM cosine similarity score
+        cosine = get_itm_message_cosine(observations["rgb"], label, room)
+        print(f"Target related room: {room}")
+        print(f"ITM cosine similarity: {cosine:.3f}")
+        node.publish_float64(node.itm_score_pub, cosine)
 
-        # Publishers
-        self.obj_point_cloud_pub = self.create_publisher(
-            PointCloud2, "habitat/object_point_cloud", qos)
-        self.state_pub = self.create_publisher(Int32, "/habitat/state", qos)
-        self.trigger_pub = self.create_publisher(PoseStamped, "/move_base_simple/goal", qos)
-        self.itm_score_pub = self.create_publisher(Float64, "/blip2/cosine_score", qos)
-        self.confidence_threshold_pub = self.create_publisher(
-            Float64, "/detector/confidence_threshold", qos)
-        self.cld_with_score_pub = self.create_publisher(
-            MultipleMasksWithConfidence, "/detector/clouds_with_scores", qos)
-        self.progress_pub = self.create_publisher(Int32MultiArray, "/habitat/progress", qos)
-        self.record_pub = self.create_publisher(Float32MultiArray, "/habitat/record", qos)
+        # Detect objects in the current observation
+        observations["rgb"], score_list, object_masks_list, label_list = get_object(
+            label, observations["rgb"], ctx["detector_cfg"], llm_answer
+        )
 
-        # ROS Publisher for habitat topics
-        self.ros_pub = ROSPublisherNonNode(self)
+        # Publish habitat observations to ROS
+        observations["camera_pitch"] = camera_pitch
+        node.msg_observations = deepcopy(observations)
+        del observations["camera_pitch"]
+        node.ros_pub.habitat_publish_ros_topic(node.msg_observations)
 
-        # Subscribers
-        self.create_subscription(Int32, "/habitat/plan_action", self.ros_action_callback, qos)
-        self.create_subscription(Int32, "/ros/state", self.ros_state_callback, qos)
-        self.create_subscription(Int32, "/ros/expl_state", self.ros_final_state_callback, qos)
-        self.create_subscription(Int32, "/ros/expl_result", self.ros_expl_result_callback, qos)
+        # Generate and publish object point clouds
+        cld_with_score_msg.point_clouds = get_object_point_cloud(
+            ctx["cfg"], observations, object_masks_list, node
+        )
+        cld_with_score_msg.confidence_scores = score_list
+        cld_with_score_msg.label_indices = label_list
+        node.cld_with_score_pub.publish(cld_with_score_msg)
 
-    def ros_action_callback(self, msg):
-        self.global_action = msg.data
+        info = env.get_metrics()
+        step_pose = agent_world_pose(observations)
+        ctx["video"].track(observations)
 
-    def ros_state_callback(self, msg):
-        self.ros_state = msg.data
+        recorder.log_step(
+            step=count_steps,
+            action=planned_action,
+            pose=step_pose,
+            camera_pitch=camera_pitch,
+            rgb_raw=rgb_raw,
+            rgb_annotated=observations["rgb"],
+            score_list=score_list,
+            label_list=label_list,
+            itm=cosine,
+            distance_to_goal=info["distance_to_goal"],
+            final_state=node.final_state,
+            expl_result=node.expl_result,
+            object_fusion=node.object_fusion,
+            object_masks=object_masks_list,
+        )
+        ctx["video"].capture(
+            observations, info, itm_score=cosine, step=count_steps, target=label
+        )
 
-    def ros_final_state_callback(self, msg):
-        self.final_state = msg.data
+        # Track if agent has passed close to the target
+        if info["distance_to_goal"] <= ctx["success_distance"] and pass_object == 0:
+            pass_object = 1
 
-    def ros_expl_result_callback(self, msg):
-        self.expl_result = msg.data
+        if ctx["step_delay"] > 0:
+            time.sleep(ctx["step_delay"])
 
-    def publish_int32(self, publisher, data):
-        msg = Int32()
-        msg.data = data
-        publisher.publish(msg)
+        # Notify ROS system that action execution is complete
+        node.publish_int32(node.state_pub, HABITAT_STATE.ACTION_FINISH)
 
-    def publish_float64(self, publisher, data):
-        msg = Float64()
-        msg.data = float(data)
-        publisher.publish(msg)
-
-    def publish_int32_array(self, publisher, data_list):
-        msg = Int32MultiArray()
-        msg.data = data_list
-        publisher.publish(msg)
-
-    def publish_float32_array(self, publisher, data_list):
-        msg = Float32MultiArray()
-        msg.data = [float(x) for x in data_list]
-        publisher.publish(msg)
-
-    def publish_observations_callback(self):
-        """Timer callback to publish habitat observations and trigger messages"""
-        if self.msg_observations is None:
-            return
-        tmp = deepcopy(self.msg_observations)
-        self.ros_pub.habitat_publish_ros_topic(tmp)
-        self.publish_float64(self.confidence_threshold_pub, self.fusion_threshold)
-        trigger = PoseStamped()
-        self.trigger_pub.publish(trigger)
-
-    def start_observation_timer(self):
-        """Start timer for publishing observations"""
-        self.pub_timer = self.create_timer(0.25, self.publish_observations_callback)
-
-    def stop_observation_timer(self):
-        """Stop observation timer"""
-        if self.pub_timer is not None:
-            self.pub_timer.cancel()
-            self.pub_timer = None
+    return count_steps, pass_object
 
 
-def transform_rgb_bgr(image):
-    """Convert RGB image to BGR format"""
-    return image[:, :, [2, 1, 0]]
-
-
-def slugify_label(label):
-    """Turn a target category into a filename-safe token.
-
-    Categories may list alternatives and contain spaces, e.g.
-    "table | dining table | coffee table | desk" -> "table".
-    """
-    primary = str(label).split("|")[0].strip().lower()
-    slug = "".join(c if c.isalnum() else "_" for c in primary).strip("_")
-    while "__" in slug:
-        slug = slug.replace("__", "_")
-    return slug or "object"
-
-
-def agent_world_pose(observations):
-    """Agent pose in the planner's world frame as (x, y, yaw).
-
-    Mirrors the habitat -> ROS convention used by ROSPublisherNonNode, so the
-    pose lines up with everything the planner publishes.
-    """
-    gps = observations["gps"]
-    compass = observations["compass"]
-    yaw = float(np.asarray(compass).reshape(-1)[0])
-    return float(-gps[2]), float(-gps[0]), yaw
-
-
-def signal_handler(sig, frame):
-    """Handle Ctrl+C signal for graceful shutdown"""
-    print("Ctrl+C detected! Shutting down...")
-    rclpy.shutdown()
-    os._exit(0)
-
-
-def _parse_dataset_arg():
-    """Parse CLI to choose dataset and capture remaining Hydra overrides."""
-    parser = argparse.ArgumentParser(
-        description="Habitat ObjectNav Evaluation", add_help=True
-    )
-    parser.add_argument(
-        "--dataset",
-        type=str,
-        choices=["hm3dv1", "hm3dv2", "mp3d"],
-        default="hm3dv2",
-        help="Choose dataset: hm3dv1, hm3dv2 or mp3d (default: hm3dv2)",
-    )
-    parser.add_argument(
-        "--delay",
-        type=float,
-        default=0.0,
-        help="Delay in seconds between each step (default: 0.0)",
-    )
-    # Keep unknown so users can still pass Hydra-style overrides (e.g., key=value)
-    args, unknown = parser.parse_known_args()
-    return args.dataset, args.delay, unknown
-
-
-def main(cfg: DictConfig, node: HabitatEvalNode, step_delay: float = 0.0) -> None:
-    # Load MP3D validation data for object category mapping
-    with gzip.open(
-        "data/datasets/objectnav/mp3d/v1/val/val.json.gz", "rt", encoding="utf-8"
-    ) as f:
-        val_data = json.load(f)
-    category_to_coco = val_data.get("category_to_mp3d_category_id", {})
-    id_to_name = {
-        category_to_coco[cat]: MP3D_ID_TO_NAME[idx]
-        for idx, cat in enumerate(category_to_coco)
-    }
-
-    start_time = time.time()
+def main(
+    cfg: DictConfig,
+    node: HabitatEvalNode,
+    step_delay: float = 0.0,
+    dataset: str = "hm3dv2",
+) -> None:
+    category_to_coco, id_to_name = load_category_mapping()
 
     node.final_state = 0
     node.expl_result = 0
-    result_list = [0] * len(RESULT_TYPES)
-
     cfg = patch_config(cfg)
 
     # Extract configuration parameters
     video_output_path = cfg.video_output_path.format(split=cfg.habitat.dataset.split)
-    need_video = cfg.need_video
-    record_file_path = os.path.join(video_output_path, cfg.record_file_name)
-    continue_path = os.path.join(video_output_path, cfg.continue_file_name)
     max_episode_steps = cfg.habitat.environment.max_episode_steps
     success_distance = cfg.habitat.task.measurements.success.success_distance
 
-    # Video style: "apexnav" renders the planner's own top-down view,
-    # "habitat" keeps the stock observation + ground-truth map layout
-    video_style = cfg.get("video_style", "apexnav")
-    video_fps = int(cfg.get("video_fps", 6))
-    vis_cfg = cfg.get("visualization", {}) or {}
-    frame_style = FrameStyle(vis_cfg)
-
-    detector_cfg = cfg.detector
-
     llm_cfg = cfg.llm
-    llm_client = llm_cfg.llm_client
     llm_answer_path = llm_cfg.llm_answer_path
-    llm_response_path = llm_cfg.llm_response_path
 
     # Single test parameters
     env_num_once = cfg.test_epi_num  # Which episode to test for single run
     flag_once = env_num_once != -1  # Whether to run single test
 
-    # Create directories if they don't exist
     os.makedirs(os.path.dirname(llm_answer_path), exist_ok=True)
     os.makedirs(video_output_path, exist_ok=True)
 
-    # Add top_down_map and collisions visualization
-    with habitat.config.read_write(cfg):
-        cfg.habitat.task.measurements.update(
-            {
-                "top_down_map": TopDownMapMeasurementConfig(
-                    map_padding=3,
-                    map_resolution=256,
-                    draw_source=True,
-                    draw_border=True,
-                    draw_shortest_path=True,
-                    draw_view_points=True,
-                    draw_goal_positions=True,
-                    draw_goal_aabbs=False,
-                    fog_of_war=FogOfWarConfig(
-                        draw=True,
-                        visibility_dist=5.0,
-                        fov=79,
-                    ),
-                ),
-                "collisions": CollisionsMeasurementConfig(),
-            }
-        )
+    # Forensic recorder: buffers each episode in RAM, writes pose/trajectory/RGB
+    # only for the failure categories listed in record.flush_on
+    recorder = EpisodeRecorder(cfg.get("record", {}), video_output_path)
+    recorder.set_context(dataset=dataset)
+    planner_cfg_read = False
 
-    env = habitat.Env(cfg)
+    video = EpisodeVideo(cfg)
+    totals = RunTotals(
+        video_output_path, cfg.record_file_name, cfg.continue_file_name, flag_once
+    )
+
+    env = habitat.Env(add_visualization_measurements(cfg))
     print("Environment creation successful")
     number_of_episodes = env.number_of_episodes
 
-    # Listen to the planner's visualization topics on a dedicated executor so
-    # map updates are not throttled by the evaluation loop's own spin cadence
-    vis_listener = None
-    vis_executor = None
-    vis_thread = None
-    if need_video and video_style == "apexnav":
-        vis_listener = PlannerVisListener(
-            map_size=vis_cfg.get("map_size", [80.0, 80.0]),
-            resolution=vis_cfg.get("map_resolution", 0.05),
-        )
-        vis_executor = SingleThreadedExecutor()
-        vis_executor.add_node(vis_listener)
-        vis_thread = threading.Thread(target=vis_executor.spin, daemon=True)
-        vis_thread.start()
-        print("ApexNav planner visualization listener started")
-
-    trail = []
-    view_center = None
-
-    def build_frame(observations, info, itm_score=None, step=None, target=None):
-        """Compose one video frame in the configured style."""
-        nonlocal view_center
-
-        if vis_listener is None:
-            frame = observations_to_image(observations, info)
-            info.pop("top_down_map", None)
-            return overlay_frame(frame, info)
-
-        gt_map = None
-        if frame_style.show_gt_map and "top_down_map" in info:
-            gt_map = colorize_draw_agent_and_fit_to_height(info["top_down_map"], 320)
-
-        pose = agent_world_pose(observations)
-        view_center = update_view_center(view_center, pose[:2], frame_style)
-        snapshot = vis_listener.snapshot(
-            center=view_center, extent=frame_style.map_extent_m
-        )
-
-        meta = {
-            "pose": pose,
-            "trail": trail,
-            "target": target,
-            "step": step,
-            "itm": itm_score,
-            "distance_to_goal": info.get("distance_to_goal"),
-        }
-        return render_apexnav_frame(
-            snapshot,
-            rgb=observations["rgb"],
-            meta=meta,
-            style=frame_style,
-            gt_map=gt_map,
-        )
-
-    # Read previous records and set initial values
-    (
-        num_total,
-        num_success,
-        spl_all,
-        soft_spl_all,
-        distance_to_goal_all,
-        distance_to_goal_reward_all,
-        last_time,
-    ) = read_record(continue_path, flag_once)
-
-    if num_total >= number_of_episodes:
+    if totals.num_total >= number_of_episodes:
         raise ValueError("Already finished all episodes.")
 
-    pbar = tqdm.tqdm(total=env.number_of_episodes)
+    ctx = {
+        "cfg": cfg,
+        "detector_cfg": cfg.detector,
+        "recorder": recorder,
+        "video": video,
+        "max_episode_steps": max_episode_steps,
+        "success_distance": success_distance,
+        "step_delay": step_delay,
+    }
+    detector_cfg_plain = OmegaConf.to_container(cfg.detector, resolve=True)
 
-    env_count = num_total if not flag_once else env_num_once
+    pbar = tqdm.tqdm(total=number_of_episodes)
+
+    # Fast-forward to the resume point, or to the single episode under test
+    env_count = env_num_once if flag_once else totals.num_total
     while env_count:
         pbar.update()
         env.current_episode = next(env.episode_iterator)
         env_count -= 1
 
-    for epi in range(number_of_episodes - num_total):
-        # Publish progress information
-        node.publish_int32_array(node.progress_pub, [num_total, number_of_episodes])
-
-        if flag_once:
-            while env_count:
-                env.current_episode = next(env.episode_iterator)
-                env_count -= 1
+    for _ in range(number_of_episodes - totals.num_total):
+        node.publish_int32_array(
+            node.progress_pub, [totals.num_total, number_of_episodes]
+        )
 
         # Initialize episode variables
-        pass_object = 0.0
-        near_object = 0.0
         node.global_action = None
-        cld_with_score_msg = MultipleMasksWithConfidence()
-        count_steps = 0
+        # Drop the previous episode's fusion snapshot; the planner re-inits its
+        # object map on EPISODE_FINISH but the latch here would otherwise persist
+        node.object_fusion = None
 
-        camera_pitch = 0.0
         observations = env.reset()
-        observations["camera_pitch"] = camera_pitch
+        observations["camera_pitch"] = 0.0
         node.msg_observations = deepcopy(observations)
         del observations["camera_pitch"]
-        label = env.current_episode.object_category
 
-        # Convert object category to coco name format
-        if label in category_to_coco:
-            coco_id = category_to_coco[label]
-            label = id_to_name.get(coco_id, label)
+        label = resolve_label(
+            env.current_episode.object_category, category_to_coco, id_to_name
+        )
 
         # Get LLM answer and fusion threshold for the target object
         llm_answer, room, node.fusion_threshold = read_answer(
-            llm_answer_path, llm_response_path, label, llm_client
+            llm_answer_path, llm_cfg.llm_response_path, label, llm_cfg.llm_client
         )
 
-        # Initialize video frame collection
-        vis_frames = []
-        trail.clear()
-        trail.append(agent_world_pose(observations)[:2])
-        view_center = None
-        if vis_listener is not None:
-            vis_listener.reset()
-            frame_style.reset_value_scale()
-        info = env.get_metrics()
-        if need_video:
-            vis_frames = [build_frame(observations, info, step=0, target=label)]
+        # Begin buffering this episode. run_index is the 0-based iterator
+        # position, i.e. exactly the value to pass back as test_epi_num
+        recorder.start(
+            scene_id=env.current_episode.scene_id,
+            episode_id=env.current_episode.episode_id,
+            run_index=env_num_once if flag_once else totals.num_total,
+            label=label,
+            llm_answer=llm_answer,
+            room=room,
+            fusion_threshold=node.fusion_threshold,
+            detector_cfg=detector_cfg_plain,
+            start_pose=agent_world_pose(observations),
+            start_rgb=observations["rgb"],
+        )
+
+        video.start_episode(observations)
+        video.capture(observations, env.get_metrics(), step=0, target=label)
 
         # Start publishing basic information and trigger messages
         node.start_observation_timer()
-
         print("Agent is waiting in the environment!!!")
-
-        # Wait for ROS system to be ready
-        node.ros_state = ROS_STATE.INIT
-        while node.ros_state == ROS_STATE.INIT or node.ros_state == ROS_STATE.WAIT_TRIGGER:
-            if node.ros_state == ROS_STATE.INIT:
-                print("Waiting for ROS to get odometry...")
-            elif node.ros_state == ROS_STATE.WAIT_TRIGGER:
-                print("Waiting for ROS trigger...")
-            rclpy.spin_once(node, timeout_sec=0.1)
-
-        # Stop timer publishing when starting action execution
+        node.wait_for_planner_ready()
         node.stop_observation_timer()
+
+        # The planner is alive by now, so its fusion arm can be read back once
+        # and stamped into every record produced by this run
+        if recorder.enabled and not planner_cfg_read:
+            recorder.set_context(planner_cfg=query_planner_fusion_config(node))
+            planner_cfg_read = True
 
         print("Agent is ready to go!!!!")
 
-        while rclpy.ok() and not env.episode_over:
-            # Process ROS callbacks
-            rclpy.spin_once(node, timeout_sec=0.1)
+        count_steps, pass_object = run_episode(
+            env, node, ctx, label, llm_answer, room
+        )
 
-            # Keep publishing observations, confidence, and trigger so FSM
-            # always has fresh odom and can re-trigger after episode transitions
-            if node.msg_observations is not None:
-                node.ros_pub.habitat_publish_ros_topic(deepcopy(node.msg_observations))
-                node.publish_float64(node.confidence_threshold_pub, node.fusion_threshold)
-                trigger = PoseStamped()
-                node.trigger_pub.publish(trigger)
-
-            # Skip episode if target is not on the same floor
-            is_feasible = 0
-            for goal in env.current_episode.goals:
-                height = goal.position[1]
-                is_feasible += is_on_same_floor(
-                    height=height, episode=env.current_episode
-                )
-            if not is_feasible:
-                break
-
-            # Parse action from decision system
-            action = None
-            if node.global_action is not None:
-                if count_steps == max_episode_steps - 1:
-                    node.global_action = ACTION.STOP
-
-                if node.global_action == ACTION.MOVE_FORWARD:
-                    action = HabitatSimActions.move_forward
-                elif node.global_action == ACTION.TURN_LEFT:
-                    action = HabitatSimActions.turn_left
-                elif node.global_action == ACTION.TURN_RIGHT:
-                    action = HabitatSimActions.turn_right
-                elif node.global_action == ACTION.TURN_DOWN:
-                    action = HabitatSimActions.look_down
-                    camera_pitch = camera_pitch - np.pi / 6.0
-                elif node.global_action == ACTION.TURN_UP:
-                    action = HabitatSimActions.look_up
-                    camera_pitch = camera_pitch + np.pi / 6.0
-                elif node.global_action == ACTION.STOP:
-                    action = HabitatSimActions.stop
-
-                node.global_action = None
-
-            if action is None:
-                continue
-
-            count_steps += 1
-            print(f"\n--------------Step: {count_steps}--------------")
-            print(f"Finding [{label}]; Action: {action};")
-
-            # Notify ROS system that action execution is starting
-            node.publish_int32(node.state_pub, HABITAT_STATE.ACTION_EXEC)
-
-            observations = env.step(action)
-
-            # Calculate ITM cosine similarity score
-            cosine = get_itm_message_cosine(observations["rgb"], label, room)
-            print(f"Target related room: {room}")
-            print(f"ITM cosine similarity: {cosine:.3f}")
-
-            node.publish_float64(node.itm_score_pub, cosine)
-
-            # Detect objects in the current observation
-            observations["rgb"], score_list, object_masks_list, label_list = get_object(
-                label, observations["rgb"], detector_cfg, llm_answer
-            )
-
-            # Publish habitat observations to ROS
-            observations["camera_pitch"] = camera_pitch
-            node.msg_observations = deepcopy(observations)
-            del observations["camera_pitch"]
-            node.ros_pub.habitat_publish_ros_topic(node.msg_observations)
-
-            # Generate and publish object point clouds
-            obj_point_cloud_list = get_object_point_cloud(
-                cfg, observations, object_masks_list, node
-            )
-
-            # Publish detection-related information
-            cld_with_score_msg.point_clouds = obj_point_cloud_list
-            cld_with_score_msg.confidence_scores = score_list
-            cld_with_score_msg.label_indices = label_list
-            node.cld_with_score_pub.publish(cld_with_score_msg)
-
-            # Generate video frame
-            info = env.get_metrics()
-            trail.append(agent_world_pose(observations)[:2])
-            if need_video:
-                vis_frames.append(
-                    build_frame(
-                        observations,
-                        info,
-                        itm_score=cosine,
-                        step=count_steps,
-                        target=label,
-                    )
-                )
-
-            # Track if agent has passed close to the target
-            distance_to_goal = info["distance_to_goal"]
-            if distance_to_goal <= success_distance and pass_object == 0:
-                pass_object = 1
-
-            # Optional delay between steps for visualization
-            if step_delay > 0:
-                time.sleep(step_delay)
-
-            # Notify ROS system that action execution is complete
-            node.publish_int32(node.state_pub, HABITAT_STATE.ACTION_FINISH)
-
-        # Notify ROS system that current episode evaluation is complete
+        # Notify ROS system that current episode evaluation is complete, then
+        # wait for the FSM to reset before the next episode starts
         node.publish_int32(node.state_pub, HABITAT_STATE.EPISODE_FINISH)
-
-        # Wait for FSM to process EPISODE_FINISH and reset to INIT state
-        # This prevents a race condition where the next episode starts
-        # before the FSM has re-initialized
-        for _ in range(50):  # up to 5 seconds
-            rclpy.spin_once(node, timeout_sec=0.1)
-            if node.ros_state == ROS_STATE.INIT:
-                break
+        node.wait_for_planner_reset()
 
         # Collect evaluation metrics
         info = env.get_metrics()
-        spl = info["spl"]
-        soft_spl = info["soft_spl"]
-        distance_to_goal = info["distance_to_goal"]
-        distance_to_goal_reward = info["distance_to_goal_reward"]
         success = info["success"]
-
-        # Check if agent got close to the target object
-        if distance_to_goal <= success_distance:
-            near_object = 1
+        near_object = 1 if info["distance_to_goal"] <= success_distance else 0
 
         # Determine episode result
         if success == 1:
-            num_success += 1
             result_text = "success"
         else:
             result_text = check_failure(
@@ -610,95 +367,45 @@ def main(cfg: DictConfig, node: HabitatEvalNode, step_delay: float = 0.0) -> Non
                 near_object,
             )
 
-        # Update cumulative statistics
-        num_total += 1
-        spl_all += spl
-        soft_spl_all += soft_spl
-        distance_to_goal_all += distance_to_goal
-        distance_to_goal_reward_all += distance_to_goal_reward
+        # Flush the buffered episode. Done before the flag_once break below so
+        # single-episode debug runs also produce a record
+        record_dir = recorder.finish(
+            result_text,
+            {
+                "success": success,
+                "spl": info["spl"],
+                "soft_spl": info["soft_spl"],
+                "distance_to_goal": info["distance_to_goal"],
+                "distance_to_goal_reward": info["distance_to_goal_reward"],
+                "pass_object": pass_object,
+                "near_object": near_object,
+                "final_state": node.final_state,
+                "expl_result": node.expl_result,
+                "task_number": totals.num_total + 1,
+            },
+        )
+        if record_dir:
+            print(f"Episode artifacts written to {record_dir}")
 
-        # Generate video file, e.g. "epi10_couch.mp4". The counter is the run's
-        # episode number - the same "No.N task" written to the record file -
-        # rather than the dataset episode id, which repeats across episodes and
-        # would make clips overwrite each other
         scene_id = env.current_episode.scene_id
         episode_id = env.current_episode.episode_id
-        video_name = f"epi{num_total}_{slugify_label(label)}"
-        time_spend = time.time() - start_time + last_time
+        totals.add(info, success)
 
-        img2video_output_path = os.path.join(video_output_path, result_text)
-
-        if flag_once:
-            img2video_output_path = "videos"
-
-        if need_video:
-            images_to_video(
-                vis_frames, img2video_output_path, video_name, fps=video_fps, quality=9
-            )
-        vis_frames.clear()
-
-        # Display average performance metrics
-        table1 = PrettyTable(["Metric", "Average"])
-        table1.add_row(["Average Success", f"{num_success/num_total * 100:.2f}%"])
-        table1.add_row(["Average SPL", f"{spl_all/num_total * 100:.2f}%"])
-        table1.add_row(["Average Soft SPL", f"{soft_spl_all/num_total * 100:.2f}%"])
-        table1.add_row(
-            ["Average Distance to Goal", f"{distance_to_goal_all/num_total:.4f}"]
+        # Video name uses the run's episode number - the same "No.N task"
+        # written to the record file - rather than the dataset episode id,
+        # which repeats across episodes and would overwrite clips
+        video_dir = (
+            "videos" if flag_once else os.path.join(video_output_path, result_text)
         )
-        print(table1)
-        print(f"Episode {num_total} data written to {record_file_path}")
-        print(f"Result: {result_text}")
+        video.save(video_dir, f"epi{totals.num_total}_{slugify_label(label)}")
 
-        # Display total performance metrics
-        table2 = PrettyTable(["Metric", "Total"])
-        table2.add_row(["Total Success", f"{num_success}"])
-        table2.add_row(["Total SPL", f"{spl_all:.2f}"])
-        table2.add_row(["Total Soft SPL", f"{soft_spl_all:.2f}"])
-        table2.add_row(["Total Distance to Goal", f"{distance_to_goal_all:.4f}"])
+        averages, run_totals = totals.report(result_text)
 
         if flag_once:
             break
 
-        # Write results to record file
-        write_record(
-            scene_id,
-            episode_id,
-            table1,
-            result_text,
-            label,
-            num_total,
-            time_spend,
-            record_file_path,
-        )
-
-        # Write results to continue file
-        write_record(
-            scene_id,
-            episode_id,
-            table2,
-            result_text,
-            label,
-            num_total,
-            time_spend,
-            continue_path,
-        )
-
-        # Count files in each result category folder
-        for i in range(len(RESULT_TYPES)):
-            folder = RESULT_TYPES[i]  # Get current category (folder name)
-            folder_path = os.path.join(video_output_path, folder)  # Build folder path
-            file_count = count_files_in_directory(folder_path)  # Count files in folder
-            result_list[i] = file_count
-
-        # Publish comprehensive record data
-        record_data = [
-            num_success / num_total * 100,
-            spl_all / num_total * 100,
-            soft_spl_all / num_total * 100,
-            distance_to_goal_all / num_total,
-        ]
-        record_data.extend(result_list)
-        node.publish_float32_array(node.record_pub, record_data)
+        totals.persist(scene_id, episode_id, label, result_text, averages, run_totals)
+        node.publish_float32_array(node.record_pub, totals.record_payload())
 
         pbar.update()
         env.current_episode = next(env.episode_iterator)
@@ -706,11 +413,7 @@ def main(cfg: DictConfig, node: HabitatEvalNode, step_delay: float = 0.0) -> Non
 
     env.close()
     pbar.close()
-
-    if vis_executor is not None:
-        vis_executor.shutdown()
-        vis_thread.join(timeout=2.0)
-        vis_listener.destroy_node()
+    video.close()
 
 
 if __name__ == "__main__":
@@ -726,12 +429,12 @@ if __name__ == "__main__":
 
     try:
         node = HabitatEvalNode()
-        dataset, step_delay, overrides = _parse_dataset_arg()
+        dataset, step_delay, overrides = parse_dataset_arg()
         cfg_name = f"habitat_eval_{dataset}"
         # Compose the chosen config and pass through extra Hydra overrides
         with initialize(version_base=None, config_path="config"):
             cfg = compose(config_name=cfg_name, overrides=overrides)
-        main(cfg, node, step_delay=step_delay)
+        main(cfg, node, step_delay=step_delay, dataset=dataset)
     except Exception as e:
         print(f"Unexpected error occurred: {e}")
         rclpy.shutdown()
