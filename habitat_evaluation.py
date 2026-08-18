@@ -29,6 +29,7 @@ import gzip
 import json
 import os
 import signal
+import threading
 import time
 from copy import deepcopy
 
@@ -36,6 +37,7 @@ from copy import deepcopy
 from hydra import initialize, compose
 import numpy as np
 import rclpy
+from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from geometry_msgs.msg import PoseStamped
@@ -54,6 +56,7 @@ from habitat.config.default_structured_configs import (
     TopDownMapMeasurementConfig,
 )
 from habitat.sims.habitat_simulator.actions import HabitatSimActions
+from habitat.utils.visualizations.maps import colorize_draw_agent_and_fit_to_height
 from habitat.utils.visualizations.utils import (
     images_to_video,
     observations_to_image,
@@ -71,6 +74,12 @@ from basic_utils.object_point_cloud_utils.object_point_cloud import (
 )
 from basic_utils.record_episode.read_record import read_record
 from basic_utils.record_episode.write_record import write_record
+from basic_utils.visualization.apexnav_frame import (
+    FrameStyle,
+    render_apexnav_frame,
+    update_view_center,
+)
+from basic_utils.visualization.planner_vis_listener import PlannerVisListener
 from habitat2ros.habitat_publisher import ROSPublisherNonNode
 from llm.answer_reader.answer_reader import read_answer
 from params import HABITAT_STATE, ROS_STATE, ACTION, RESULT_TYPES
@@ -179,6 +188,31 @@ def transform_rgb_bgr(image):
     return image[:, :, [2, 1, 0]]
 
 
+def slugify_label(label):
+    """Turn a target category into a filename-safe token.
+
+    Categories may list alternatives and contain spaces, e.g.
+    "table | dining table | coffee table | desk" -> "table".
+    """
+    primary = str(label).split("|")[0].strip().lower()
+    slug = "".join(c if c.isalnum() else "_" for c in primary).strip("_")
+    while "__" in slug:
+        slug = slug.replace("__", "_")
+    return slug or "object"
+
+
+def agent_world_pose(observations):
+    """Agent pose in the planner's world frame as (x, y, yaw).
+
+    Mirrors the habitat -> ROS convention used by ROSPublisherNonNode, so the
+    pose lines up with everything the planner publishes.
+    """
+    gps = observations["gps"]
+    compass = observations["compass"]
+    yaw = float(np.asarray(compass).reshape(-1)[0])
+    return float(-gps[2]), float(-gps[0]), yaw
+
+
 def signal_handler(sig, frame):
     """Handle Ctrl+C signal for graceful shutdown"""
     print("Ctrl+C detected! Shutting down...")
@@ -237,6 +271,13 @@ def main(cfg: DictConfig, node: HabitatEvalNode, step_delay: float = 0.0) -> Non
     max_episode_steps = cfg.habitat.environment.max_episode_steps
     success_distance = cfg.habitat.task.measurements.success.success_distance
 
+    # Video style: "apexnav" renders the planner's own top-down view,
+    # "habitat" keeps the stock observation + ground-truth map layout
+    video_style = cfg.get("video_style", "apexnav")
+    video_fps = int(cfg.get("video_fps", 6))
+    vis_cfg = cfg.get("visualization", {}) or {}
+    frame_style = FrameStyle(vis_cfg)
+
     detector_cfg = cfg.detector
 
     llm_cfg = cfg.llm
@@ -278,6 +319,60 @@ def main(cfg: DictConfig, node: HabitatEvalNode, step_delay: float = 0.0) -> Non
     env = habitat.Env(cfg)
     print("Environment creation successful")
     number_of_episodes = env.number_of_episodes
+
+    # Listen to the planner's visualization topics on a dedicated executor so
+    # map updates are not throttled by the evaluation loop's own spin cadence
+    vis_listener = None
+    vis_executor = None
+    vis_thread = None
+    if need_video and video_style == "apexnav":
+        vis_listener = PlannerVisListener(
+            map_size=vis_cfg.get("map_size", [80.0, 80.0]),
+            resolution=vis_cfg.get("map_resolution", 0.05),
+        )
+        vis_executor = SingleThreadedExecutor()
+        vis_executor.add_node(vis_listener)
+        vis_thread = threading.Thread(target=vis_executor.spin, daemon=True)
+        vis_thread.start()
+        print("ApexNav planner visualization listener started")
+
+    trail = []
+    view_center = None
+
+    def build_frame(observations, info, itm_score=None, step=None, target=None):
+        """Compose one video frame in the configured style."""
+        nonlocal view_center
+
+        if vis_listener is None:
+            frame = observations_to_image(observations, info)
+            info.pop("top_down_map", None)
+            return overlay_frame(frame, info)
+
+        gt_map = None
+        if frame_style.show_gt_map and "top_down_map" in info:
+            gt_map = colorize_draw_agent_and_fit_to_height(info["top_down_map"], 320)
+
+        pose = agent_world_pose(observations)
+        view_center = update_view_center(view_center, pose[:2], frame_style)
+        snapshot = vis_listener.snapshot(
+            center=view_center, extent=frame_style.map_extent_m
+        )
+
+        meta = {
+            "pose": pose,
+            "trail": trail,
+            "target": target,
+            "step": step,
+            "itm": itm_score,
+            "distance_to_goal": info.get("distance_to_goal"),
+        }
+        return render_apexnav_frame(
+            snapshot,
+            rgb=observations["rgb"],
+            meta=meta,
+            style=frame_style,
+            gt_map=gt_map,
+        )
 
     # Read previous records and set initial values
     (
@@ -336,12 +431,15 @@ def main(cfg: DictConfig, node: HabitatEvalNode, step_delay: float = 0.0) -> Non
 
         # Initialize video frame collection
         vis_frames = []
+        trail.clear()
+        trail.append(agent_world_pose(observations)[:2])
+        view_center = None
+        if vis_listener is not None:
+            vis_listener.reset()
+            frame_style.reset_value_scale()
         info = env.get_metrics()
         if need_video:
-            frame = observations_to_image(observations, info)
-            info.pop("top_down_map")
-            frame = overlay_frame(frame, info)
-            vis_frames = [frame]
+            vis_frames = [build_frame(observations, info, step=0, target=label)]
 
         # Start publishing basic information and trigger messages
         node.start_observation_timer()
@@ -450,11 +548,17 @@ def main(cfg: DictConfig, node: HabitatEvalNode, step_delay: float = 0.0) -> Non
 
             # Generate video frame
             info = env.get_metrics()
+            trail.append(agent_world_pose(observations)[:2])
             if need_video:
-                frame = observations_to_image(observations, info)
-                info.pop("top_down_map")
-                frame = overlay_frame(frame, info)
-                vis_frames.append(frame)
+                vis_frames.append(
+                    build_frame(
+                        observations,
+                        info,
+                        itm_score=cosine,
+                        step=count_steps,
+                        target=label,
+                    )
+                )
 
             # Track if agent has passed close to the target
             distance_to_goal = info["distance_to_goal"]
@@ -513,21 +617,23 @@ def main(cfg: DictConfig, node: HabitatEvalNode, step_delay: float = 0.0) -> Non
         distance_to_goal_all += distance_to_goal
         distance_to_goal_reward_all += distance_to_goal_reward
 
-        # Generate video file
+        # Generate video file, e.g. "epi10_couch.mp4". The counter is the run's
+        # episode number - the same "No.N task" written to the record file -
+        # rather than the dataset episode id, which repeats across episodes and
+        # would make clips overwrite each other
         scene_id = env.current_episode.scene_id
         episode_id = env.current_episode.episode_id
-        video_name = f"{os.path.basename(scene_id)}_{episode_id}"
+        video_name = f"epi{num_total}_{slugify_label(label)}"
         time_spend = time.time() - start_time + last_time
 
         img2video_output_path = os.path.join(video_output_path, result_text)
 
         if flag_once:
             img2video_output_path = "videos"
-            video_name = "video_once"
 
         if need_video:
             images_to_video(
-                vis_frames, img2video_output_path, video_name, fps=6, quality=9
+                vis_frames, img2video_output_path, video_name, fps=video_fps, quality=9
             )
         vis_frames.clear()
 
@@ -600,6 +706,11 @@ def main(cfg: DictConfig, node: HabitatEvalNode, step_delay: float = 0.0) -> Non
 
     env.close()
     pbar.close()
+
+    if vis_executor is not None:
+        vis_executor.shutdown()
+        vis_thread.join(timeout=2.0)
+        vis_listener.destroy_node()
 
 
 if __name__ == "__main__":

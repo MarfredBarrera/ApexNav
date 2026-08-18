@@ -33,6 +33,7 @@ docker compose -f docker/docker-compose.yml exec apexnav ./scripts/build_ws.sh
 docker compose -f docker/docker-compose.yml exec apexnav ./scripts/verify_install.sh
 
 # 6. launch the pipeline: 4 VLM servers + foxglove_bridge + planner + eval shell
+#    add -e VLM_GPU=<n> to put it on a GPU other than 0 - see "Which GPU each process uses"
 docker compose -f docker/docker-compose.yml exec apexnav ./scripts/start_session.sh
 
 # 7. attach (Ctrl-b d to detach and leave everything running)
@@ -128,6 +129,53 @@ with nothing to reinstall and no second copy to keep in sync.
 
 `use_core` and `use_vlm` are shell functions from `/opt/apexnav/apexnav-env.sh`,
 available in any shell in the container including `docker exec`.
+
+## Which GPU each process uses
+
+The container sees **every** GPU (`gpus: all`, and `CUDA_VISIBLE_DEVICES` is not set in
+`docker-compose.yml`), so the choice is per session rather than per container — no
+recreate needed to move work to another card.
+
+None of the four servers takes a `--device` flag: each asks for `torch.device("cuda")`,
+which is the first device *its own process* can see. `start_session.sh` exploits that by
+giving each pane its own `CUDA_VISIBLE_DEVICES`:
+
+```bash
+DC="docker compose -f docker/docker-compose.yml"
+
+# everything on GPU 3
+$DC exec -e VLM_GPU=3 apexnav ./scripts/start_session.sh
+
+# servers on 3, habitat-sim's EGL context on 4
+$DC exec -e VLM_GPU=3 -e SIM_GPU=4 apexnav ./scripts/start_session.sh
+
+# blip2itm is the heaviest of the four; give it a card of its own
+$DC exec -e VLM_GPU=3 -e GPU_BLIP2ITM=4 apexnav ./scripts/start_session.sh
+```
+
+`exec` does not inherit your host shell's environment, hence `-e` on each variable —
+`VLM_GPU=3 $DC exec apexnav ...` would silently start on GPU 0. From a shell already
+inside the container the plain prefix form works: `VLM_GPU=3 ./scripts/start_session.sh`.
+
+| variable | default | applies to |
+|---|---|---|
+| `VLM_GPU` | `0` | all four servers, and `SIM_GPU` if unset |
+| `GPU_GROUNDING_DINO`, `GPU_BLIP2ITM`, `GPU_SAM`, `GPU_YOLOV7` | `VLM_GPU` | that one server |
+| `SIM_GPU` | `VLM_GPU` | the eval window — habitat-sim and anything else run there |
+
+Indices are host GPU indices as `nvidia-smi` reports them, *not* offsets into some
+already-masked list: a process-level `CUDA_VISIBLE_DEVICES` replaces the inherited value
+outright rather than nesting inside it. The script checks the indices against
+`nvidia-smi -L` and refuses to start on a bad one, because the failure is otherwise quiet
+— `sam` and `blip2itm` fall back to CPU and just look slow. The started session prints
+its assignment; `nvidia-smi` confirms it once the weights load.
+
+The `ros` window gets no `CUDA_VISIBLE_DEVICES` at all — `foxglove_bridge` and the
+planner are C++ nodes that never touch CUDA.
+
+Two sessions cannot split GPUs inside one container: the ports (12181–12184) are
+hardcoded in the clients, so only one set of servers can run at a time. Use a second
+container for that.
 
 ## Why two environments
 

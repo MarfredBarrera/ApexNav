@@ -26,8 +26,10 @@ services:
       EGL_PLATFORM: surfaceless
       ROS_DOMAIN_ID: "42"
       ROS_AUTOMATIC_DISCOVERY_RANGE: LOCALHOST
-      # Both GPUs are visible; GPU 0 has the most free memory on this host.
-      CUDA_VISIBLE_DEVICES: "${APEX_GPUS:-0}"
+      # CUDA_VISIBLE_DEVICES is deliberately NOT set here: container env vars are fixed at
+      # create time, so pinning a GPU here would need a --force-recreate to change. The
+      # container sees every GPU (`gpus: all`) and each process picks its own device -
+      # scripts/start_session.sh takes VLM_GPU / SIM_GPU per session.
 
     # Rootless Docker maps container uid 0 to the host user, so running as root here
     # is what keeps bind-mount writes owned by you. Under rootful Docker, override

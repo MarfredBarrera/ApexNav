@@ -219,6 +219,10 @@ inline void MapROS::dilateGrids(std::vector<Eigen::Vector2i>& grids, int dilatio
 
 inline void MapROS::publishObjectMap()
 {
+  // Building these clouds is expensive; skip entirely when nobody is listening.
+  if (object_grid_pub_->get_subscription_count() == 0)
+    return;
+
   Point3D pt;
   PointCloud3D cloud;
   // Iterate through updated map region to find object cells
@@ -244,6 +248,10 @@ inline void MapROS::publishObjectMap()
 
 inline void MapROS::publishOccupied()
 {
+  // Building these clouds is expensive; skip entirely when nobody is listening.
+  if (occupied_pub_->get_subscription_count() == 0)
+    return;
+
   Point3D pt;
   PointCloud3D cloud;
   // Iterate through updated region to find occupied cells
@@ -269,6 +277,10 @@ inline void MapROS::publishOccupied()
 
 inline void MapROS::publishInfOccupied()
 {
+  // Building these clouds is expensive; skip entirely when nobody is listening.
+  if (occupied_inflate_pub_->get_subscription_count() == 0)
+    return;
+
   Point3D pt;
   PointCloud3D cloud;
   Eigen::Vector2i min_cut = map_->md_->update_min_;
@@ -302,6 +314,10 @@ inline void MapROS::publishInfOccupied()
 
 inline void MapROS::publishUnknown()
 {
+  // Building these clouds is expensive; skip entirely when nobody is listening.
+  if (unknown_pub_->get_subscription_count() == 0)
+    return;
+
   Point3D pt;
   PointCloud3D cloud;
   Eigen::Vector2i min_cut = map_->md_->update_min_;
@@ -334,6 +350,10 @@ inline void MapROS::publishUnknown()
 
 inline void MapROS::publishFree()
 {
+  // Building these clouds is expensive; skip entirely when nobody is listening.
+  if (free_pub_->get_subscription_count() == 0)
+    return;
+
   Point3D pt;
   PointCloud3D cloud;
   Eigen::Vector2i min_cut = map_->md_->update_min_;
@@ -371,6 +391,10 @@ inline void MapROS::publishFree()
 
 inline void MapROS::publishConfidenceMap()
 {
+  // Building these clouds is expensive; skip entirely when nobody is listening.
+  if (confidence_map_pub_->get_subscription_count() == 0)
+    return;
+
   double value;
   pcl::PointCloud<pcl::PointXYZI> cloud;
   pcl::PointXYZI pt;
@@ -412,6 +436,10 @@ inline void MapROS::publishConfidenceMap()
 
 inline void MapROS::publishValueMap()
 {
+  // Building these clouds is expensive; skip entirely when nobody is listening.
+  if (value_map_pub_->get_subscription_count() == 0)
+    return;
+
   double value;
   pcl::PointCloud<pcl::PointXYZI> cloud;
   pcl::PointXYZI pt;
@@ -462,6 +490,10 @@ inline void MapROS::publishValueMap()
 inline void MapROS::publishPointCloud(
     const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr& pub, const PointCloud3D::Ptr& point_cloud)
 {
+  // Building these clouds is expensive; skip entirely when nobody is listening.
+  if (pub->get_subscription_count() == 0)
+    return;
+
   Point3D pt;
   PointCloud3D cloud;
   // Copy all points from input cloud
@@ -481,6 +513,10 @@ inline void MapROS::publishPointCloud(
 
 inline void MapROS::publishESDFMap()
 {
+  // Building these clouds is expensive; skip entirely when nobody is listening.
+  if (esdf_pub_->get_subscription_count() == 0)
+    return;
+
   double dist;
   pcl::PointCloud<pcl::PointXYZI> cloud;
   pcl::PointXYZI pt;

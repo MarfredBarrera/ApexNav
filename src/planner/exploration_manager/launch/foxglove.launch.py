@@ -45,9 +45,14 @@ def generate_launch_description():
             # The grid_map point clouds and 640x480 depth frames overrun the default
             # 10 MB buffer as soon as the map grows.
             'send_buffer_limit': 100000000,
-            'use_compression': True,
+            # Deflate costs CPU on a box shared with other users, and the heavy
+            # clouds are gated off in the layout now. Compress in the tunnel
+            # instead (`ssh -C`) if the bytes ever matter.
+            'use_compression': False,
             'max_qos_depth': 10,
-            'num_threads': 0,          # 0 = one per core
+            # NOT 0: that means one thread per core, which is 128 here (271 threads
+            # measured in total). A bridge feeding one client needs a handful.
+            'num_threads': 4,
             'capabilities': ['clientPublish', 'connectionGraph', 'assets'],
         }]
     )

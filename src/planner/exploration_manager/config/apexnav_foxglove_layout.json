@@ -37,7 +37,7 @@
         "/robot": { "visible": true },
         "/planning_vis/frontier": { "visible": true },
         "/planning_vis/viewpoints": { "visible": true },
-        "/grid_map/update_range": { "visible": true },
+        "/grid_map/update_range": { "visible": false },
         "/grid_map/occupied": {
           "visible": true,
           "colorMode": "flat",
@@ -57,7 +57,7 @@
           "pointSize": 3
         },
         "/grid_map/free": {
-          "visible": true,
+          "visible": false,
           "colorMode": "flat",
           "flatColor": "#b0dcf5ff",
           "pointSize": 3
@@ -70,7 +70,7 @@
           "pointSize": 3
         },
         "/grid_map/depth_cloud": {
-          "visible": true,
+          "visible": false,
           "colorMode": "flat",
           "flatColor": "#204a87ff",
           "pointSize": 3
@@ -94,7 +94,7 @@
           "pointSize": 3
         },
         "/grid_map/filtered_object_cloud": {
-          "visible": true,
+          "visible": false,
           "colorMode": "flat",
           "flatColor": "#5c3566ff",
           "pointSize": 3
@@ -113,7 +113,7 @@
           "pointSize": 3
         },
         "/grid_map/confidence_map": {
-          "visible": true,
+          "visible": false,
           "colorMode": "colormap",
           "colorMap": "turbo",
           "colorField": "intensity",

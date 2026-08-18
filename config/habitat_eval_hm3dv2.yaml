@@ -61,3 +61,37 @@ continue_file_name: "continue.txt"
 need_video: false
 video_output_path: "videos/test_hm3dv2_{split}"
 test_epi_num: -1
+
+# Video rendering
+# "apexnav" draws the planner's own top-down view (value map, occupancy grid,
+# frontier/object clusters, TSP tour, planned path, trajectory, agent pose)
+# with the annotated RGB observation inset; "habitat" keeps the stock layout.
+video_style: apexnav
+video_fps: 6
+visualization:
+  frame_size: [1280, 720]
+  map_size: [80.0, 80.0]      # must match map_size_x/y passed to the planner
+  map_resolution: 0.05        # must match sdf_map.resolution
+  inset_width_frac: 0.28
+  max_px_per_cell: 8.0
+  map_extent_m: 15.0        # fixed map window in metres (0 = fit explored area)
+  map_follow_margin: 0.25   # window slides only inside this edge margin
+  agent_size_m: 0.45        # agent triangle length in metres
+  value_cmap: turbo         # turbo/jet/inferno/magma/plasma/viridis/hot
+  value_floor: 0.02         # hide value cells below this
+  value_norm: auto          # auto = ramp tops out at the max value seen
+  value_vmax: 1.0           # ramp maximum when value_norm is not auto
+  value_vmax_floor: 0.05    # lowest auto maximum, avoids amplifying noise
+  camera_hfov_deg: 79.0
+  camera_range_m: 5.0
+  show_value_map: true
+  show_inflation: true
+  show_frontiers: true
+  show_objects: true
+  show_tsp_tour: true
+  show_planned_path: true
+  show_trail: true
+  show_fov: true
+  show_rgb_inset: true
+  show_legend: true
+  show_gt_map: false          # habitat ground-truth top-down map as 2nd inset
