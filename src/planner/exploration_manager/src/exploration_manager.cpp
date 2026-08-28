@@ -85,6 +85,14 @@ void ExplorationManager::initialize(rclcpp::Node::SharedPtr node)
   RCLCPP_INFO(node_->get_logger(), "[ExplorationManager] KinoAstar and GCopter initialized for real-world mode");
 }
 
+void ExplorationManager::reset()
+{
+  sdf_map_->resetMap();
+  frontier_map2d_->reset();
+  path_finder_->reset();
+  ed_.reset(new ExplorationData);
+}
+
 int ExplorationManager::planNextBestPoint(const Vector3d& pos, const double& yaw)
 {
   Vector2d pos2d = Vector2d(pos(0), pos(1));

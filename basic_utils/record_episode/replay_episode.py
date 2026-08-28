@@ -26,7 +26,11 @@ import os
 
 import numpy as np
 
-from basic_utils.eval.habitat_utils import agent_world_pose
+from basic_utils.eval.habitat_utils import (
+    agent_world_pose,
+    semantic_goal_overlap,
+    semantic_instances_for_masks,
+)
 
 
 def camera_tf_matrix(pose, camera_height, pitch):
@@ -178,6 +182,53 @@ def record_matches_target(record_dir, target_episodes):
     return any(selector in candidates for selector in selectors)
 
 
+def _commit_semantic_evidence(record_dir, entry, semantic, goal_object_ids, overlap):
+    """Re-evaluate one saved committed detector mask against semantic pixels."""
+    commit = entry.get("planner_commit") or {}
+    index = commit.get("matched_detection_index")
+    if index is None:
+        return None
+    try:
+        detection = entry.get("detections", [])[int(index)]
+    except (IndexError, TypeError, ValueError):
+        return None
+    mask_name = detection.get("mask")
+    if not mask_name:
+        return None
+
+    import cv2
+
+    mask = cv2.imread(
+        os.path.join(record_dir, "masks", mask_name), cv2.IMREAD_GRAYSCALE
+    )
+    if mask is None:
+        return None
+    summaries = semantic_instances_for_masks(semantic, [mask])
+    evidence = semantic_goal_overlap(summaries[0], goal_object_ids, overlap)
+    if evidence is not None:
+        evidence["step"] = int(entry["step"])
+        evidence["cluster_id"] = commit.get("cluster_id")
+    return evidence
+
+
+def _semantic_object_categories(env):
+    """Map semantic sensor instance IDs to readable scene category names."""
+    try:
+        objects = env.sim.semantic_annotations().objects
+    except (AttributeError, RuntimeError):
+        return {}
+    categories = {}
+    for semantic_object in objects:
+        if semantic_object is None:
+            continue
+        try:
+            instance_id = str(semantic_object.id).rsplit("_", 1)[-1]
+            categories[instance_id] = str(semantic_object.category.name())
+        except (AttributeError, TypeError):
+            continue
+    return categories
+
+
 def replay(record_dir, cfg):
     """Replay the recorded actions and regenerate the requested artifacts.
 
@@ -239,13 +290,30 @@ def replay(record_dir, cfg):
         4: HabitatSimActions.look_down,
         5: HabitatSimActions.look_up,
     }
+    goal_object_ids = [
+        str(goal.object_id)
+        for goal in env.current_episode.goals
+        if getattr(goal, "object_id", None) is not None
+    ]
+    semantic_overlap = float(meta.get("ground_truth_semantic_overlap", 0.5))
+    semantic_categories = _semantic_object_categories(env)
+    semantic_checks = []
+    if not goal_object_ids:
+        print("Semantic instance check unavailable: episode has no goal object IDs")
+    elif "semantic" not in observations:
+        print(
+            "Semantic instance check unavailable: semantic sensor is absent. "
+            "Re-run after composing the updated habitat_eval config."
+        )
 
     out_root = str(cfg.output_dir).format(record=os.path.basename(record_dir.rstrip("/")))
     gif_save = bool(cfg.visualization.gif.save)
     mp4_save = bool(cfg.visualization.mp4.save)
     decision_save = bool(cfg.visualization.decision_frame.save)
     if bool(cfg.visualization.decision_frame.only_false_positive):
-        decision_save = decision_save and meta.get("result") == "false positive"
+        decision_save = decision_save and meta.get("result") in {
+            "false positive", "last mile nav failure"
+        }
     save_rgb = os.path.join(out_root, "rgb") if (cfg.rgb.save or gif_save or mp4_save or decision_save) else None
     save_depth = os.path.join(out_root, "depth") if cfg.depth.save else None
     dump_clouds = os.path.join(out_root, "clouds") if cfg.clouds.save else None
@@ -296,6 +364,20 @@ def replay(record_dir, cfg):
 
         error = float(np.max(np.abs(np.asarray(pose) - np.asarray(entry["pose"]))))
         max_error = max(max_error, error)
+        if goal_object_ids and "semantic" in observations and entry.get("planner_commit"):
+            evidence = _commit_semantic_evidence(
+                record_dir,
+                entry,
+                observations["semantic"],
+                goal_object_ids,
+                semantic_overlap,
+            )
+            if evidence is not None:
+                for instance in evidence["observed_instances"]:
+                    category = semantic_categories.get(instance["id"])
+                    if category:
+                        instance["category"] = category
+                semantic_checks.append(evidence)
         if error > float(cfg.tolerance):
             print(
                 f"  step {entry['step']} ({ACTION_NAMES.get(action, action)}): "
@@ -349,6 +431,39 @@ def replay(record_dir, cfg):
         f"spl={metrics['spl']:.4f} distance_to_goal={metrics['distance_to_goal']:.4f}"
     )
     print(f"Recorded:        {meta.get('metrics', {})}")
+    if semantic_checks:
+        # The initial commitment decides the failure mode. Subsequent snapshots
+        # are retained for diagnosing tracking drift, but do not replace it.
+        first_check = semantic_checks[0]
+        verdict = (
+            "correct ground-truth instance"
+            if first_check["is_correct_instance"]
+            else "different instance"
+        )
+        print(
+            "Semantic instance check at commitment: {} "
+            "(step {}, goal pixels {}/{}, overlap {:.1%}, goal IDs {}, "
+            "mask IDs {})".format(
+                verdict,
+                first_check["step"],
+                first_check["goal_pixels"],
+                first_check["semantic_pixels"],
+                first_check["goal_overlap_fraction"],
+                [
+                    {
+                        "id": goal_id,
+                        "category": semantic_categories.get(goal_id),
+                    }
+                    for goal_id in first_check["goal_object_ids"]
+                ],
+                first_check["observed_instances"],
+            )
+        )
+    elif goal_object_ids and "semantic" in observations:
+        print(
+            "Semantic instance check unavailable: the record has no readable "
+            "committed detector mask."
+        )
 
     if depth_written or clouds_written or rgb_written:
         print(
@@ -404,6 +519,24 @@ def replay(record_dir, cfg):
             print(f"Wrote target decision frame: {decision_output} (step {saved_step})")
         else:
             print("No target decision signal recorded; decision frame not written")
+
+    if bool(cfg.visualization.confidence_plot.save):
+        from basic_utils.record_episode.episode_visualization import create_commit_confidence_plot
+
+        confidence_output = os.path.join(
+            out_root, str(cfg.visualization.confidence_plot.filename)
+        )
+        confidence_result = create_commit_confidence_plot(
+            record_dir, confidence_output, steps=steps
+        )
+        if confidence_result:
+            _, trace = confidence_result
+            print(
+                f"Wrote committed-target confidence plot: {confidence_output} "
+                f"(cluster {trace['cluster_id']}, commit step {trace['decision_step']})"
+            )
+        else:
+            print("No committed target confidence trace recorded; plot not written")
 
     recorded_traj = np.load(os.path.join(record_dir, "trajectory.npy"))
     replayed_traj = np.asarray(poses, dtype=np.float32)

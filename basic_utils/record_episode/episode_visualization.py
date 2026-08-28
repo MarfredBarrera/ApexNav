@@ -132,6 +132,126 @@ def find_target_decision_step(steps):
     return fsm_step if fsm_step is not None else gate_step
 
 
+def committed_target_confidence(steps):
+    """Return confidence history for the cluster selected at first commitment.
+
+    Cluster IDs are stable within an episode, so this follows the actual fused
+    target the planner selected rather than a different cluster that becomes
+    confident later. ``None`` means the selected cluster was absent from that
+    step's fusion snapshot.
+    """
+    decision_step = find_target_decision_step(steps)
+    if decision_step is None:
+        return None
+    decision_entry = next(
+        (entry for entry in steps if int(entry.get("step", -1)) == decision_step),
+        None,
+    )
+    commit = _commit_for_entry(decision_entry)
+    if not commit or commit.get("cluster_id") is None:
+        return None
+    cluster_id = int(commit["cluster_id"])
+    history = []
+    gate_step = None
+    threshold = None
+    for entry in steps:
+        fusion = entry.get("object_fusion") or {}
+        if threshold is None and fusion.get("min_confidence") is not None:
+            threshold = float(fusion["min_confidence"])
+        cluster = next(
+            (
+                item for item in fusion.get("clusters", [])
+                if int(item.get("id", -1)) == cluster_id
+            ),
+            None,
+        )
+        confidence = None if cluster is None else float(cluster.get("confidence", 0.0))
+        history.append((int(entry["step"]), confidence))
+        if gate_step is None and cluster and cluster.get("is_confident"):
+            gate_step = int(entry["step"])
+    return {
+        "cluster_id": cluster_id,
+        "decision_step": decision_step,
+        "gate_step": gate_step,
+        "threshold": threshold,
+        "history": history,
+    }
+
+
+def create_commit_confidence_plot(record_dir, output_path, steps=None):
+    """Render the committed target cluster's fused confidence as a PNG."""
+    if steps is None:
+        with open(os.path.join(record_dir, "steps.jsonl"), "r", encoding="utf-8") as handle:
+            steps = [json.loads(line) for line in handle if line.strip()]
+    trace = committed_target_confidence(steps)
+    if trace is None or not any(value is not None for _, value in trace["history"]):
+        return None
+
+    width, height = 960, 480
+    left, right, top, bottom = 72, 28, 72, 62
+    plot_width, plot_height = width - left - right, height - top - bottom
+    frame = np.full((height, width, 3), 250, dtype=np.uint8)
+    steps_x = [step for step, _ in trace["history"]]
+    x_min, x_max = min(steps_x), max(steps_x)
+    x_span = max(x_max - x_min, 1)
+    values = [value for _, value in trace["history"] if value is not None]
+    y_max = max(1.0, max(values) * 1.08, float(trace["threshold"] or 0.0) * 1.08)
+
+    def point(step, confidence):
+        x = left + round((step - x_min) / x_span * plot_width)
+        y = top + round((y_max - confidence) / y_max * plot_height)
+        return int(x), int(y)
+
+    for fraction in np.linspace(0.0, 1.0, 5):
+        value = y_max * (1.0 - fraction)
+        y = top + round(fraction * plot_height)
+        cv2.line(frame, (left, y), (left + plot_width, y), (220, 220, 220), 1)
+        cv2.putText(frame, f"{value:.2f}", (8, y + 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (70, 70, 70), 1, cv2.LINE_AA)
+    cv2.rectangle(frame, (left, top), (left + plot_width, top + plot_height), (70, 70, 70), 1)
+
+    threshold = trace["threshold"]
+    if threshold is not None and 0.0 <= threshold <= y_max:
+        _, y = point(x_min, threshold)
+        cv2.line(frame, (left, y), (left + plot_width, y), (55, 150, 55), 1, cv2.LINE_AA)
+        cv2.putText(frame, f"gate {threshold:.2f}", (left + 6, max(top + 16, y - 5)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (45, 120, 45), 1, cv2.LINE_AA)
+
+    previous = None
+    for step, confidence in trace["history"]:
+        if confidence is None:
+            previous = None
+            continue
+        current = point(step, confidence)
+        if previous is not None:
+            cv2.line(frame, previous, current, (195, 55, 185), 2, cv2.LINE_AA)
+        cv2.circle(frame, current, 3, (195, 55, 185), -1, cv2.LINE_AA)
+        previous = current
+
+    for step, color, label in (
+        (trace["gate_step"], (45, 150, 45), "confident"),
+        (trace["decision_step"], (190, 55, 185), "commit"),
+    ):
+        if step is None:
+            continue
+        x, _ = point(step, 0.0)
+        cv2.line(frame, (x, top), (x, top + plot_height), color, 1, cv2.LINE_AA)
+        cv2.putText(frame, f"{label} {step}", (min(x + 4, width - 145), top + 42),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+
+    cv2.putText(frame, f"Committed target cluster #{trace['cluster_id']} confidence", (left, 31),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (35, 35, 35), 2, cv2.LINE_AA)
+    cv2.putText(frame, "episode step", (left + plot_width // 2 - 38, height - 18),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.48, (55, 55, 55), 1, cv2.LINE_AA)
+    cv2.putText(frame, str(x_min), (left - 5, height - 42),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (70, 70, 70), 1, cv2.LINE_AA)
+    cv2.putText(frame, str(x_max), (left + plot_width - 16, height - 42),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (70, 70, 70), 1, cv2.LINE_AA)
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    cv2.imwrite(output_path, frame)
+    return output_path, trace
+
+
 def _blend_mask(frame, mask, color, alpha):
     """Blend one binary mask into an RGB frame and outline it."""
     mask = np.asarray(mask) > 0
@@ -162,7 +282,7 @@ def _put_banner(frame, text, color):
 
 def _annotate_frame(
     rgb, step, entry, masks_dir, decision_step, gate_step, target_label,
-    label_names=None,
+    label_names=None, show_commit_map=True,
 ):
     frame = np.asarray(rgb).copy()
     detections = (entry or {}).get("detections", [])
@@ -234,16 +354,32 @@ def _annotate_frame(
                 cv2.FONT_HERSHEY_SIMPLEX, 0.52, (30, 30, 30), 1, cv2.LINE_AA)
 
     if step == decision_step and commit:
+        ground_truth_text = ""
+        ground_truth = commit.get("ground_truth_instance")
+        if ground_truth:
+            verdict = "GT INSTANCE" if ground_truth.get("is_correct_instance") else "GT OTHER"
+            ground_truth_text = " | {} {:.0%}".format(
+                verdict, float(ground_truth.get("goal_overlap_fraction", 0.0))
+            )
+        else:
+            # Older records have only centroid-to-goal geometry. It is shown
+            # as context, never presented as an object-instance verdict.
+            geometry = commit.get("ground_truth_geometry") or commit.get("ground_truth")
+            if geometry:
+                ground_truth_text = " | goal centroid {:.2f}m".format(
+                    float(geometry.get("nearest_goal_distance_m", 0.0))
+                )
         _put_banner(
             frame,
-            "PLANNER COMMIT -> cluster #{id} | confidence {confidence:.2f} | views {views}".format(
+            "COMMIT #{id} | conf {confidence:.2f} | views {views}".format(
                 id=commit.get("cluster_id", "?"),
                 confidence=float(commit.get("confidence", 0.0)),
                 views=commit.get("observation_num", "?"),
-            ),
+            ) + ground_truth_text,
             (130, 45, 120),
         )
-        _draw_commit_map(frame, entry or {}, commit)
+        if show_commit_map:
+            _draw_commit_map(frame, entry or {}, commit)
     elif step == gate_step and step != decision_step:
         _put_banner(frame, "CONFIDENCE GATE — target candidate became confident", (40, 150, 70))
     return frame
@@ -372,7 +508,7 @@ def create_decision_frame(record_dir, rgb_dir, output_path, steps=None):
         cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), decision_step,
         by_step.get(decision_step), os.path.join(record_dir, "masks"),
         decision_step, gate_step, str(meta.get("target_label", "")),
-        _semantic_label_names(meta),
+        _semantic_label_names(meta), show_commit_map=False,
     )
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     cv2.imwrite(output_path, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))

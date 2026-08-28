@@ -24,6 +24,7 @@ public:
 
   void updateValueMap(const Vector2d& sensor_pos, const double& sensor_yaw,
       const vector<Vector2i>& free_grids, const double& itm_score);
+  void reset();
   double getValue(const Vector2d& pos);
   double getValue(const Vector2i& idx);
   double getConfidence(const Vector2d& pos);

@@ -54,6 +54,7 @@ public:
   ~FrontierMap2D(){};
 
   void searchFrontiers();
+  void reset();
   bool dormantSeenFrontiers(Vector2d sensor_pos, double sensor_yaw);
   void setForceDormantFrontier(const Vector2d& frontier_center);
 

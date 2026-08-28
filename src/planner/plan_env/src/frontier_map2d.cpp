@@ -54,6 +54,14 @@ FrontierMap2D::FrontierMap2D(const SDFMap2D::Ptr& sdf_map, rclcpp::Node::SharedP
   percep_utils_.reset(new PerceptionUtils2D(node));
 }
 
+void FrontierMap2D::reset()
+{
+  std::fill(frontier_flag_.begin(), frontier_flag_.end(), NONE);
+  frontiers_.clear();
+  dormant_frontiers_.clear();
+  candidate_frontiers_.clear();
+}
+
 void FrontierMap2D::searchFrontiers()
 {
   // Clear previous candidate frontiers from current search iteration

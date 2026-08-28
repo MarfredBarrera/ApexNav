@@ -60,6 +60,15 @@ ObjectMap2D::ObjectMap2D(SDFMap2D* sdf_map, rclcpp::Node::SharedPtr node)
   leaf_size_ = 0.1f;  // Voxel grid leaf size for downsampling
 }
 
+void ObjectMap2D::reset()
+{
+  std::fill(object_buffer_.begin(), object_buffer_.end(), 0);
+  std::fill(object_indexs_.begin(), object_indexs_.end(), -1);
+  objects_.clear();
+  all_object_clouds_->clear();
+  over_depth_object_cloud_->clear();
+}
+
 void ObjectMap2D::setConfidenceThreshold(double val)
 {
   min_confidence_ = val;

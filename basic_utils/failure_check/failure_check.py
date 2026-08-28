@@ -23,7 +23,8 @@ def is_on_same_floor(height, ref_floor_height=None, ceiling_height=2.0, episode=
 
 
 def check_failure(
-    episode, final_state, expl_result, count_steps, max_step, pass_object, near_object
+    episode, final_state, expl_result, count_steps, max_step, pass_object, near_object,
+    commit_ground_truth=None,
 ):
     """
     Analyze and categorize navigation failure types
@@ -40,13 +41,17 @@ def check_failure(
         max_step (int): Maximum allowed steps
         pass_object (bool): Whether agent passed near target object
         near_object (bool): Whether agent ended near target object
+        commit_ground_truth (dict): Semantic object-ID evidence for the
+            committed detector mask, if the recorder captured it
 
     Returns:
         str: Categorized failure type for analysis
 
     Failure Categories:
         - "infeasible": Target not reachable (different floor)
-        - "false positive": Agent thinks it found object but wrong location
+        - "false positive": Agent committed to the wrong object instance
+        - "last mile nav failure": Agent committed to the correct instance
+          but did not reach Habitat's success radius
         - "false negative": Agent passed object but didn't detect it
         - "no frontier": No more explorable areas
         - "stepout feasible": Reached step limit but target was reachable
@@ -80,9 +85,16 @@ def check_failure(
                     failure = "[no frontier] false negative"
                 else:
                     failure = "no frontier"
-            # Think found object but found wrong one
+            # The planner stopped at a confident object but Habitat did not
+            # score success. Split wrong-instance perception from a final
+            # approach/termination failure using exact semantic object-ID
+            # evidence. Missing evidence keeps the conservative false-positive
+            # label rather than guessing from a map centroid.
             elif final_state == FINAL_RESULT.REACH_OBJECT and not near_object:
-                failure = "false positive"
+                if (commit_ground_truth or {}).get("is_correct_instance"):
+                    failure = "last mile nav failure"
+                else:
+                    failure = "false positive"
             else:
                 failure = "unknown failure (active stop)"
         # Passive stop

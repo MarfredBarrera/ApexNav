@@ -71,11 +71,13 @@ Every episode appends one structured line to `videos/test_hm3dv2_val/episodes.js
 per-episode success, SPL, result category, and the planner's fusion configuration. This is
 the only place per-episode metrics exist; `record.txt` stores running averages.
 
-Episodes whose result category is listed in `record.flush_on` (default `["false positive"]`)
+Episodes whose result category is listed in `record.flush_on` (default `["false positive",
+"last mile nav failure"]`)
 additionally get a full artifact directory, enough to reconstruct what the agent saw before
 it stopped at the wrong object. The category keeps its space as a *value* - that is what
 `flush_on` matches and what `episodes.jsonl` stores - but on disk it is written
-`false_positive`, so record paths need no shell quoting (`params.RESULT_DIRNAMES`):
+`false_positive` / `last_mile_nav_failure`, so record paths need no shell quoting
+(`params.RESULT_DIRNAMES`):
 
 ```
 videos/test_hm3dv2_val/records/false_positive/epi<N>_<scene>_<episode_id>_<label>/
@@ -83,7 +85,8 @@ videos/test_hm3dv2_val/records/false_positive/epi<N>_<scene>_<episode_id>_<label
                      # config, final metrics, replay commands
     steps.jsonl      # per step: action, pose, camera pitch, ITM score,
                      # distance to goal, per-detection confidences, the FSM
-                     # verdict, and the planner's fused per-cluster confidence
+                     # verdict, fused per-cluster confidence, and semantic
+                     # instance IDs/pixel counts under each detector mask
     trajectory.npy   # (T,3) float32 pose array
     rgb/             # raw observations; 000000.jpg is the reset frame,
                      # 00000N.jpg is step N in steps.jsonl
@@ -106,6 +109,13 @@ with the record, labels target and non-target candidates, and marks the first
 FSM `SEARCH_OBJECT` frame as `TARGET COMMIT`. If available, the earlier fused
 confidence-gate crossing is marked separately.
 
+At a target commit, the recorder compares Habitat semantic instance IDs under
+the selected detector mask with `episode.goals[*].object_id`. This exact
+instance evidence, rather than a map-centroid distance, assigns `false positive`
+(a different instance) or `last mile nav failure` (the goal instance was selected
+but success radius was not reached). Offline replay repeats and prints this check
+for old records whose masks were saved.
+
 To render MP4 instead, disable GIF output and enable MP4 output:
 
 ```
@@ -117,10 +127,15 @@ MP4 uses baseline H.264 (`avc1`)/yuv420p for compatibility with Electron-based
 VS Code and web players. Its speed comes from `visualization.mp4.fps`; it is
 written as `episode.mp4` by default.
 
-For false-positive records, replay also saves the annotated target-decision
+For false-positive and last-mile-navigation-failure records, replay also saves the annotated target-decision
 frame separately as `decision_frame.jpg` beside the GIF and RGB directory. Set
 `visualization.decision_frame.only_false_positive=false` to save it for every
 record with a decision signal.
+
+Each replay also writes `committed_target_confidence.png`: the fused-confidence
+history of the specific cluster chosen at the first target commit. The green
+line marks that cluster becoming confident and the magenta line marks the
+planner commit.
 
 To replay every false-positive record in one batch, pass the category directory:
 

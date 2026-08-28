@@ -75,6 +75,7 @@ public:
   ~ExplorationManager();  // Explicit destructor declaration for shared_ptr with forward declaration
 
   void initialize(rclcpp::Node::SharedPtr node);
+  void reset();
 
   int planNextBestPoint(const Vector3d& pos, const double& yaw);
   bool planTrajectory(const Eigen::VectorXd& start, const Eigen::VectorXd& end, const Vector3d& ctrl);

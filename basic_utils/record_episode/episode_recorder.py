@@ -27,6 +27,7 @@ import time
 import cv2
 import numpy as np
 
+from basic_utils.eval.habitat_utils import semantic_goal_overlap
 from params import RESULT_TYPES, result_dirname
 
 
@@ -72,7 +73,13 @@ def _jsonable(value):
     return value
 
 
-def _planner_commit_snapshot(object_fusion, detections):
+def _planner_commit_snapshot(
+    object_fusion,
+    detections,
+    ground_truth_goals=(),
+    ground_truth_match_distance_m=1.0,
+    ground_truth_semantic_overlap=0.5,
+):
     """Return the primary cluster the planner will try first, if any.
 
     ObjectMap2D orders confident primary-label clusters by confidence. Save
@@ -122,6 +129,38 @@ def _planner_commit_snapshot(object_fusion, detections):
             (float(detection["world_centroid"][axis]) - commit["centroid"][axis]) ** 2
             for axis in range(2)
         ) ** 0.5, 3)
+        goal_ids = [
+            goal.get("object_id") for goal in ground_truth_goals
+            if goal.get("object_id") is not None
+        ]
+        instance_evidence = semantic_goal_overlap(
+            detection.get("semantic_instances"),
+            goal_ids,
+            ground_truth_semantic_overlap,
+        )
+        if instance_evidence is not None:
+            commit["ground_truth_instance"] = instance_evidence
+    if ground_truth_goals:
+        goal = min(
+            ground_truth_goals,
+            key=lambda item: sum(
+                (float(item["planner_position"][axis]) - commit["centroid"][axis]) ** 2
+                for axis in range(2)
+            ),
+        )
+        distance_m = sum(
+            (float(goal["planner_position"][axis]) - commit["centroid"][axis]) ** 2
+            for axis in range(2)
+        ) ** 0.5
+        # This is useful for map debugging, but it cannot establish semantic
+        # identity: ObjectNav goal coordinates may reference a different part
+        # of a large object.  Classification uses ground_truth_instance above.
+        commit["ground_truth_geometry"] = {
+            "nearest_goal_index": int(goal["goal_index"]),
+            "nearest_goal_distance_m": round(distance_m, 3),
+            "match_threshold_m": float(ground_truth_match_distance_m),
+            "is_correct_instance": distance_m <= ground_truth_match_distance_m,
+        }
     return commit
 
 
@@ -150,12 +189,20 @@ class EpisodeRecorder:
         self.jpeg_quality = int(_get("jpeg_quality", 85))
         self.max_buffered_steps = int(_get("max_buffered_steps", 600))
         self.summary_file = str(_get("summary_file", "episodes.jsonl"))
+        self.ground_truth_match_distance_m = float(
+            _get("ground_truth_match_distance_m", 1.0)
+        )
+        self.ground_truth_semantic_overlap = float(
+            _get("ground_truth_semantic_overlap", 0.5)
+        )
 
         self.output_root = output_root
         self.records_dir = os.path.join(output_root, "records")
         self.summary_path = os.path.join(output_root, self.summary_file)
 
-        self.flush_on = self._parse_flush_on(_get("flush_on", ["false positive"]))
+        self.flush_on = self._parse_flush_on(
+            _get("flush_on", ["false positive", "last mile nav failure"])
+        )
 
         self.git_commit = _git_commit()
         self.dataset = None
@@ -222,6 +269,7 @@ class EpisodeRecorder:
         fusion_threshold,
         detector_cfg,
         start_pose,
+        ground_truth_goals=None,
         start_rgb=None,
     ):
         """Begin buffering a new episode. Any previous buffer is discarded."""
@@ -243,6 +291,9 @@ class EpisodeRecorder:
             "detector": _jsonable(detector_cfg),
             "dataset": self.dataset,
             "git_commit": self.git_commit,
+            "ground_truth_goals": _jsonable(ground_truth_goals or []),
+            "ground_truth_match_distance_m": self.ground_truth_match_distance_m,
+            "ground_truth_semantic_overlap": self.ground_truth_semantic_overlap,
         }
         self._poses.append(tuple(float(v) for v in start_pose))
         self._append_frames(start_rgb, None)
@@ -264,6 +315,7 @@ class EpisodeRecorder:
         object_fusion=None,
         object_masks=None,
         detection_world_centroids=None,
+        detection_semantic_instances=None,
     ):
         """Record one simulator step. Cheap enough to call unconditionally."""
         if not self._active:
@@ -283,6 +335,9 @@ class EpisodeRecorder:
         for index, centroid in enumerate(detection_world_centroids or []):
             if index < len(detections) and centroid is not None:
                 detections[index]["world_centroid"] = [float(value) for value in centroid]
+        for index, instances in enumerate(detection_semantic_instances or []):
+            if index < len(detections) and instances is not None:
+                detections[index]["semantic_instances"] = _jsonable(instances)
         for idx, name in enumerate(mask_names):
             if idx < len(detections):
                 detections[idx]["mask"] = name
@@ -290,7 +345,13 @@ class EpisodeRecorder:
         # SEARCH_OBJECT marks the moment the FSM commits to a target. Keep its
         # selected cluster and visual mask linkage as replayable evidence.
         planner_commit = (
-            _planner_commit_snapshot(object_fusion, detections)
+            _planner_commit_snapshot(
+                object_fusion,
+                detections,
+                self._header.get("ground_truth_goals", []),
+                self.ground_truth_match_distance_m,
+                self.ground_truth_semantic_overlap,
+            )
             if final_state == 1
             else None
         )
@@ -319,6 +380,20 @@ class EpisodeRecorder:
         )
         self._poses.append(tuple(float(v) for v in pose))
         self._append_frames(rgb_raw, rgb_annotated)
+
+    def latest_commit_ground_truth(self):
+        """Return exact semantic evidence for the most recent commitment.
+
+        Geometry-only records intentionally return ``None`` here: treating a
+        nearby centroid as instance identity caused the mislabeled episode
+        that motivated this recorder extension.
+        """
+        for entry in reversed(self._steps):
+            commit = entry.get("planner_commit") or {}
+            ground_truth = commit.get("ground_truth_instance")
+            if ground_truth:
+                return ground_truth
+        return None
 
     def _encode_masks(self, step, masks):
         """PNG-encode this step's detector masks, returning their filenames."""
@@ -415,6 +490,17 @@ class EpisodeRecorder:
         ):
             if key in metrics:
                 summary[key] = _jsonable(metrics[key])
+        commits = [entry.get("planner_commit") for entry in self._steps]
+        instance_commits = [
+            commit for commit in commits if commit and commit.get("ground_truth_instance")
+        ]
+        if instance_commits:
+            summary["commit_ground_truth"] = instance_commits[-1]["ground_truth_instance"]
+        geometry_commits = [
+            commit for commit in commits if commit and commit.get("ground_truth_geometry")
+        ]
+        if geometry_commits:
+            summary["commit_ground_truth_geometry"] = geometry_commits[-1]["ground_truth_geometry"]
         return summary
 
     def _append_summary(self, summary):

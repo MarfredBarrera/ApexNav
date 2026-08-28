@@ -38,6 +38,22 @@ void MapROS::setNode(rclcpp::Node::SharedPtr node)
   node_ = node;
 }
 
+void MapROS::reset()
+{
+  local_updated_ = false;
+  esdf_need_update_ = false;
+  camera_pos_.setZero();
+  camera_q_ = Eigen::Quaterniond::Identity();
+  depth_image_.reset(new cv::Mat);
+  std::fill(proj_points_.begin(), proj_points_.end(), Eigen::Vector3d::Zero());
+  proj_points_cnt_ = 0;
+  depth_cloud_->points.resize(640 * 480 / (skip_pixel_ * skip_pixel_));
+  filtered_depth_cloud2d_->clear();
+  continue_over_depth_count_ = -1;
+  itm_score_ = -1.0;
+  map_start_time_ = node_->get_clock()->now();
+}
+
 void MapROS::init()
 {
   // Load camera intrinsic parameters from ROS2 parameter server

@@ -14,15 +14,26 @@ void ExplorationFSM::init(rclcpp::Node::SharedPtr node)
   fp_.reset(new FSMParam);
   fd_.reset(new FSMData);
 
-  /* Initialize main modules */
-  expl_manager_.reset(new ExplorationManager);
-  expl_manager_->initialize(node_);
-  visualization_.reset(new PlanningVisualization(node_));
+  // ROS entities must outlive every episode. Recreating this manager destroyed
+  // MapROS subscriptions/timers while the executor could still reference them.
+  if (first_init) {
+    expl_manager_.reset(new ExplorationManager);
+    expl_manager_->initialize(node_);
+    visualization_.reset(new PlanningVisualization(node_));
+  }
+  else {
+    exec_timer_->cancel();
+    expl_manager_->reset();
+    object_fusion_seq_ = 0;
+  }
   fp_->vis_scale_ = expl_manager_->sdf_map_->getResolution() * FSMConstants::VIS_SCALE_FACTOR;
 
   state_ = ROS_STATE::INIT;
 
-  if (!first_init) return;  // Skip timer/sub/pub creation on re-init (episode reset)
+  if (!first_init) {
+    exec_timer_->reset();
+    return;
+  }
 
   /* ROS2 Timer */
   exec_timer_ = node_->create_wall_timer(

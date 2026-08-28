@@ -4,8 +4,8 @@ Summarize an evaluation run from its episodes.jsonl stream.
 The record.txt written during a run only holds running averages, so per-episode
 outcomes cannot be recovered from it. EpisodeRecorder appends one structured
 line per episode instead; this script turns that stream into a breakdown by
-result category and lists the false positives with the commands to reproduce
-them.
+result category and lists target-commit failures with the commands to
+reproduce them.
 
 Usage:
     python -m basic_utils.failure_check.summarize_run videos/test_hm3dv2_val
@@ -175,14 +175,14 @@ def main():
         "--category",
         action="append",
         default=None,
-        help="result category to list in detail (repeatable, default: false positive)",
+        help="result category to list in detail (repeatable; defaults to target-commit failures)",
     )
     parser.add_argument(
         "--dataset", default="hm3dv2", help="dataset name used in replay commands"
     )
     args = parser.parse_args()
 
-    categories = args.category or ["false positive"]
+    categories = args.category or ["false positive", "last mile nav failure"]
 
     episodes = load_episodes(os.path.join(args.run_dir, args.summary_file))
     stats = summarize(episodes)
@@ -245,6 +245,20 @@ def main():
                 f"final_state={entry.get('final_state')}  "
                 f"expl_result={entry.get('expl_result')}"
             )
+            ground_truth = entry.get("commit_ground_truth") or {}
+            if ground_truth:
+                verdict = "correct instance" if ground_truth.get("is_correct_instance") else "wrong instance"
+                print(
+                    f"    commitment={verdict}  "
+                    f"semantic overlap={ground_truth.get('goal_overlap_fraction')}  "
+                    f"goal ids={ground_truth.get('goal_object_ids')}"
+                )
+            geometry = entry.get("commit_ground_truth_geometry") or {}
+            if geometry:
+                print(
+                    f"    commitment geometry: d(nearest goal)="
+                    f"{geometry.get('nearest_goal_distance_m')}m"
+                )
             print(f"    record: {record_dir}{exists}")
             print_commit_point(record_dir)
             print(

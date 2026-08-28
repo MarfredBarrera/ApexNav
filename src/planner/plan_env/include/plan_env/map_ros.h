@@ -61,6 +61,7 @@ public:
   void setMap(SDFMap2D* map);
   void setNode(rclcpp::Node::SharedPtr node);
   void init();
+  void reset();
 
 private:
   // ROS2 callback functions

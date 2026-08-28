@@ -54,8 +54,10 @@ from plan_env.msg import MultipleMasksWithConfidence
 # Local project imports
 from basic_utils.eval.habitat_utils import (
     agent_world_pose,
+    episode_goal_positions_in_planner_frame,
     load_category_mapping,
     resolve_label,
+    semantic_instances_for_masks,
     slugify_label,
 )
 from basic_utils.eval.reporting import RunTotals
@@ -72,7 +74,7 @@ from basic_utils.object_point_cloud_utils.object_point_cloud import (
 from basic_utils.record_episode.episode_recorder import EpisodeRecorder
 from habitat2ros.eval_node import HabitatEvalNode, query_planner_fusion_config
 from llm.answer_reader.answer_reader import read_answer
-from params import HABITAT_STATE, ACTION, result_dirname
+from params import HABITAT_STATE, ACTION, EXPL_RESULT, FINAL_RESULT, result_dirname
 from vlm.utils.get_itm_message import get_itm_message_cosine
 from vlm.utils.get_object_utils import get_object
 
@@ -165,6 +167,9 @@ def run_episode(env, node, ctx, label, llm_answer, room):
         observations["rgb"], score_list, object_masks_list, label_list = get_object(
             label, observations["rgb"], ctx["detector_cfg"], llm_answer
         )
+        detection_semantic_instances = semantic_instances_for_masks(
+            observations.get("semantic"), object_masks_list
+        )
 
         # Publish habitat observations to ROS
         observations["camera_pitch"] = camera_pitch
@@ -204,6 +209,7 @@ def run_episode(env, node, ctx, label, llm_answer, room):
             object_fusion=node.object_fusion,
             object_masks=object_masks_list,
             detection_world_centroids=detection_world_centroids,
+            detection_semantic_instances=detection_semantic_instances,
         )
         ctx["video"].capture(
             observations, info, itm_score=cosine, step=count_steps, target=label
@@ -294,6 +300,8 @@ def main(
 
         # Initialize episode variables
         node.global_action = None
+        node.final_state = FINAL_RESULT.EXPLORE
+        node.expl_result = EXPL_RESULT.EXPLORATION
         # Drop the previous episode's fusion snapshot; the planner re-inits its
         # object map on EPISODE_FINISH but the latch here would otherwise persist
         node.object_fusion = None
@@ -324,6 +332,9 @@ def main(
             fusion_threshold=node.fusion_threshold,
             detector_cfg=detector_cfg_plain,
             start_pose=agent_world_pose(observations),
+            ground_truth_goals=episode_goal_positions_in_planner_frame(
+                env.current_episode
+            ),
             start_rgb=observations["rgb"],
         )
 
@@ -370,6 +381,7 @@ def main(
                 max_episode_steps,
                 pass_object,
                 near_object,
+                recorder.latest_commit_ground_truth(),
             )
 
         # Flush the buffered episode. Done before the flag_once break below so

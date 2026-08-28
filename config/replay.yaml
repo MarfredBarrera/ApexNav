@@ -50,6 +50,10 @@ visualization:
     save: true
     only_false_positive: true
     filename: "decision_frame.jpg"
+  confidence_plot:
+    # Fused confidence for the cluster selected at the first target commitment.
+    save: true
+    filename: "committed_target_confidence.png"
 
 # Unprojection of depth into the planner's world frame. Off by default - the
 # depth frames above are the input to whatever projection you want to run.

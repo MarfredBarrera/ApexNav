@@ -170,6 +170,33 @@ void SDFMap2D::initMap(rclcpp::Node::SharedPtr node)
   caster_->setParams(mp_->resolution_, mp_->map_origin_);
 }
 
+void SDFMap2D::resetMap()
+{
+  std::fill(md_->occupancy_buffer_.begin(), md_->occupancy_buffer_.end(),
+      mp_->clamp_min_log_ - mp_->unknown_flag_);
+  std::fill(md_->occupancy_buffer_inflate_.begin(), md_->occupancy_buffer_inflate_.end(), 0);
+  std::fill(md_->count_hit_and_miss_.begin(), md_->count_hit_and_miss_.end(), 0);
+  std::fill(md_->count_hit_.begin(), md_->count_hit_.end(), 0);
+  std::fill(md_->count_miss_.begin(), md_->count_miss_.end(), 0);
+  std::fill(md_->flag_rayend_.begin(), md_->flag_rayend_.end(), -1);
+  std::fill(md_->distance_buffer_neg_.begin(), md_->distance_buffer_neg_.end(), mp_->default_dist_);
+  std::fill(md_->distance_buffer_.begin(), md_->distance_buffer_.end(), mp_->default_dist_);
+  std::fill(md_->tmp_buffer_.begin(), md_->tmp_buffer_.end(), 0.0);
+  std::fill(md_->virtual_ground_buffer_.begin(), md_->virtual_ground_buffer_.end(), 0);
+  md_->occupancy_need_clear_.clear();
+  std::queue<int> empty_cache;
+  md_->cache_voxel_.swap(empty_cache);
+  md_->raycast_num_ = 0;
+  md_->local_bound_min_ = md_->local_bound_max_ = Eigen::Vector2i(0, 0);
+  md_->local_update_min_ = md_->local_update_max_ = Eigen::Vector2i(0, 0);
+  md_->local_update_mind_ = md_->local_update_maxd_ = Eigen::Vector2d(0, 0);
+  md_->update_min_ = md_->update_max_ = Eigen::Vector2i(0, 0);
+  md_->update_mind_ = md_->update_maxd_ = Eigen::Vector2d(0, 0);
+  object_map2d_->reset();
+  value_map_->reset();
+  map_ros_->reset();
+}
+
 void SDFMap2D::setCacheOccupancy(const int& adr, const int& occ)
 {
   // Add to update queue if this voxel is being visited for the first time

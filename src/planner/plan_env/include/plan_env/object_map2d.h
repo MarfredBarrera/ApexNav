@@ -125,6 +125,7 @@ public:
   void inputObservationObjectsCloud(
       const vector<pcl::shared_ptr<pcl::PointCloud<pcl::PointXYZ>>> observation_clouds,
       const double& itm_score);
+  void reset();
   void setConfidenceThreshold(double val);
 
   void getAllConfidenceObjectClouds(pcl::shared_ptr<pcl::PointCloud<pcl::PointXYZ>>& object_clouds);

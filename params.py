@@ -28,6 +28,7 @@ RESULT_TYPES = [
     "infeasible",
     "no frontier",
     "false positive",
+    "last mile nav failure",
     "stepout true negative",
     "stepout feasible",
     "stucking",
@@ -43,6 +44,7 @@ RESULT_TYPES = [
 # in episodes.jsonl and matched by record.flush_on.
 RESULT_DIRNAMES = {
     "false positive": "false_positive",
+    "last mile nav failure": "last_mile_nav_failure",
 }
 
 

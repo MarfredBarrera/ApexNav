@@ -17,10 +17,17 @@ void ExplorationFSMReal::init(rclcpp::Node::SharedPtr node)
   fp_.reset(new FSMParam);
   fd_.reset(new FSMData);
 
-  /* Initialize main modules */
-  expl_manager_.reset(new ExplorationManager);
-  expl_manager_->initialize(node_);
-  visualization_.reset(new PlanningVisualization(node_));
+  // Preserve ROS entities across episode boundaries and reset only episode data.
+  if (first_init) {
+    expl_manager_.reset(new ExplorationManager);
+    expl_manager_->initialize(node_);
+    visualization_.reset(new PlanningVisualization(node_));
+  }
+  else {
+    exec_timer_->cancel();
+    safety_timer_->cancel();
+    expl_manager_->reset();
+  }
   fp_->vis_scale_ = expl_manager_->sdf_map_->getResolution() * FSMConstantsReal::VIS_SCALE_FACTOR;
 
   state_ = RealFSM::State::INIT;
@@ -44,7 +51,11 @@ void ExplorationFSMReal::init(rclcpp::Node::SharedPtr node)
   fp_->replan_frontier_change_delay_ = node_->get_parameter("fsm/replan_frontier_change_delay").as_double();
   fp_->replan_timeout_ = node_->get_parameter("fsm/replan_timeout").as_double();
 
-  if (!first_init) return;  // Skip timer/sub/pub creation on re-init (episode reset)
+  if (!first_init) {
+    exec_timer_->reset();
+    safety_timer_->reset();
+    return;
+  }
 
   /* ROS2 Timer */
   exec_timer_ = node_->create_wall_timer(
