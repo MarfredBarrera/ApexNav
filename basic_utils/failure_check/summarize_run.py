@@ -20,7 +20,7 @@ import shlex
 
 from prettytable import PrettyTable
 
-from params import RESULT_TYPES
+from params import RESULT_TYPES, result_dirname
 
 
 def load_episodes(summary_path):
@@ -225,7 +225,7 @@ def main():
             record_dir = os.path.join(
                 args.run_dir,
                 "records",
-                category,
+                result_dirname(category),
                 "epi{run}_{scene}_{eid}_{label}".format(
                     run=entry.get("run_index"),
                     scene=entry.get("scene"),

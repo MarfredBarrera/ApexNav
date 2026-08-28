@@ -27,7 +27,7 @@ import time
 import cv2
 import numpy as np
 
-from params import RESULT_TYPES
+from params import RESULT_TYPES, result_dirname
 
 
 def _git_commit():
@@ -70,6 +70,59 @@ def _jsonable(value):
     if isinstance(value, dict):
         return {k: _jsonable(v) for k, v in value.items()}
     return value
+
+
+def _planner_commit_snapshot(object_fusion, detections):
+    """Return the primary cluster the planner will try first, if any.
+
+    ObjectMap2D orders confident primary-label clusters by confidence. Save
+    that context with an episode, and link it to the nearest same-step target
+    mask when the detection is visible, so replay does not need the live map.
+    """
+    fusion = object_fusion or {}
+    candidates = [
+        cluster for cluster in fusion.get("clusters", [])
+        if cluster.get("is_confident") and cluster.get("best_label") == 0
+    ]
+    if not candidates:
+        return None
+    cluster = min(
+        candidates,
+        key=lambda item: (
+            -float(item.get("confidence", 0.0)),
+            -int(item.get("observation_num", 0)),
+            int(item.get("id", 0)),
+        ),
+    )
+    commit = {
+        "cluster_id": int(cluster["id"]),
+        "label_idx": int(cluster["best_label"]),
+        "confidence": float(cluster["confidence"]),
+        "observation_num": int(cluster["observation_num"]),
+        "centroid": [float(value) for value in cluster["centroid"]],
+        "fusion_update_seq": fusion.get("update_seq"),
+        "min_confidence": fusion.get("min_confidence"),
+        "min_observation_num": fusion.get("min_observation_num"),
+        "selection": "highest_confident_primary_cluster",
+    }
+    visible_targets = [
+        (index, detection) for index, detection in enumerate(detections)
+        if detection.get("label_idx") == 0 and detection.get("world_centroid") is not None
+    ]
+    if visible_targets:
+        index, detection = min(
+            visible_targets,
+            key=lambda item: sum(
+                (float(item[1]["world_centroid"][axis]) - commit["centroid"][axis]) ** 2
+                for axis in range(2)
+            ),
+        )
+        commit["matched_detection_index"] = index
+        commit["match_distance_m"] = round(sum(
+            (float(detection["world_centroid"][axis]) - commit["centroid"][axis]) ** 2
+            for axis in range(2)
+        ) ** 0.5, 3)
+    return commit
 
 
 class EpisodeRecorder:
@@ -210,6 +263,7 @@ class EpisodeRecorder:
         expl_result=None,
         object_fusion=None,
         object_masks=None,
+        detection_world_centroids=None,
     ):
         """Record one simulator step. Cheap enough to call unconditionally."""
         if not self._active:
@@ -226,10 +280,20 @@ class EpisodeRecorder:
         detections = [
             {"score": float(s), "label_idx": int(l)} for s, l in zip(scores, labels)
         ]
+        for index, centroid in enumerate(detection_world_centroids or []):
+            if index < len(detections) and centroid is not None:
+                detections[index]["world_centroid"] = [float(value) for value in centroid]
         for idx, name in enumerate(mask_names):
             if idx < len(detections):
                 detections[idx]["mask"] = name
 
+        # SEARCH_OBJECT marks the moment the FSM commits to a target. Keep its
+        # selected cluster and visual mask linkage as replayable evidence.
+        planner_commit = (
+            _planner_commit_snapshot(object_fusion, detections)
+            if final_state == 1
+            else None
+        )
         self._steps.append(
             {
                 "step": int(step),
@@ -250,6 +314,7 @@ class EpisodeRecorder:
                 # Fused per-cluster confidence from the planner's object map,
                 # alongside the acceptance gate that applied to it
                 "object_fusion": object_fusion,
+                "planner_commit": planner_commit,
             }
         )
         self._poses.append(tuple(float(v) for v in pose))
@@ -367,7 +432,7 @@ class EpisodeRecorder:
             eid=self._header["episode_id"],
             label=_slug(self._header["target_label"]),
         )
-        return os.path.join(self.records_dir, result_text, name)
+        return os.path.join(self.records_dir, result_dirname(result_text), name)
 
     def _write_record(self, summary, metrics):
         record_dir = self._record_dir(summary["result"])

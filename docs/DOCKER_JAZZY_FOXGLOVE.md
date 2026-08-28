@@ -73,10 +73,12 @@ the only place per-episode metrics exist; `record.txt` stores running averages.
 
 Episodes whose result category is listed in `record.flush_on` (default `["false positive"]`)
 additionally get a full artifact directory, enough to reconstruct what the agent saw before
-it stopped at the wrong object:
+it stopped at the wrong object. The category keeps its space as a *value* - that is what
+`flush_on` matches and what `episodes.jsonl` stores - but on disk it is written
+`false_positive`, so record paths need no shell quoting (`params.RESULT_DIRNAMES`):
 
 ```
-videos/test_hm3dv2_val/records/false positive/epi<N>_<scene>_<episode_id>_<label>/
+videos/test_hm3dv2_val/records/false_positive/epi<N>_<scene>_<episode_id>_<label>/
     meta.json        # episode identity, LLM answer + threshold, detector and fusion
                      # config, final metrics, replay commands
     steps.jsonl      # per step: action, pose, camera pitch, ITM score,
@@ -91,6 +93,50 @@ videos/test_hm3dv2_val/records/false positive/epi<N>_<scene>_<episode_id>_<label
 
 `trajectory.npy` follows the same indexing: row 0 is the pose after `env.reset()`, row N
 the pose after step N, so it has one more row than `steps.jsonl` has lines.
+
+To create a forensic GIF while replaying, enable the visualization override:
+
+```
+python -m basic_utils.record_episode.replay_episode <record_dir> \
+    visualization.gif.save=true
+```
+
+The GIF uses replay-generated RGBs, overlays the lossless detector masks stored
+with the record, labels target and non-target candidates, and marks the first
+FSM `SEARCH_OBJECT` frame as `TARGET COMMIT`. If available, the earlier fused
+confidence-gate crossing is marked separately.
+
+To render MP4 instead, disable GIF output and enable MP4 output:
+
+```
+python -m basic_utils.record_episode.replay_episode <record_dir> \
+    visualization.gif.save=false visualization.mp4.save=true
+```
+
+MP4 uses baseline H.264 (`avc1`)/yuv420p for compatibility with Electron-based
+VS Code and web players. Its speed comes from `visualization.mp4.fps`; it is
+written as `episode.mp4` by default.
+
+For false-positive records, replay also saves the annotated target-decision
+frame separately as `decision_frame.jpg` beside the GIF and RGB directory. Set
+`visualization.decision_frame.only_false_positive=false` to save it for every
+record with a decision signal.
+
+To replay every false-positive record in one batch, pass the category directory:
+
+```
+python -m basic_utils.record_episode.replay_episode \
+    videos/test_hm3dv2_val/records/false_positive
+```
+
+By default, an empty `visualization.gif.target_episodes` selects every episode.
+Filter to specific run indices, episode IDs, or record directory names with:
+
+```
+python -m basic_utils.record_episode.replay_episode \
+    videos/test_hm3dv2_val/records/false_positive \
+    visualization.gif.target_episodes=[12,18]
+```
 
 #### Pinpointing where the algorithm committed
 

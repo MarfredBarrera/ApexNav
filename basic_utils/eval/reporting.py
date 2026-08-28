@@ -14,7 +14,7 @@ from prettytable import PrettyTable
 from basic_utils.failure_check.count_files import count_files_in_directory
 from basic_utils.record_episode.read_record import read_record
 from basic_utils.record_episode.write_record import write_record
-from params import RESULT_TYPES
+from params import RESULT_TYPES, result_dirname
 
 
 class RunTotals:
@@ -102,7 +102,7 @@ class RunTotals:
         """
         for i, folder in enumerate(RESULT_TYPES):
             self.result_counts[i] = count_files_in_directory(
-                os.path.join(self.output_path, folder)
+                os.path.join(self.output_path, result_dirname(folder))
             )
         return self.result_counts
 

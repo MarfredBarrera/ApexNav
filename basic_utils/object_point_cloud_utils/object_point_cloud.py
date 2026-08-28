@@ -22,7 +22,9 @@ def get_current_time_msg(node=None):
         return Time(sec=0, nanosec=0)
 
 
-def get_object_point_cloud(cfg, observations, object_masks_list, node=None):
+def get_object_point_cloud(
+    cfg, observations, object_masks_list, node=None, return_centroids=False
+):
     """
     Extract 3D point clouds for detected objects from sensor observations
 
@@ -36,9 +38,14 @@ def get_object_point_cloud(cfg, observations, object_masks_list, node=None):
         node: Optional ROS2 node for getting current time
 
     Returns:
-        list: List of ROS PointCloud2 messages for each object
+        list: List of ROS PointCloud2 messages for each object. When
+            ``return_centroids`` is true, returns ``(point_clouds, centroids)``
+            where each centroid is a world-frame ``[x, y]`` pair or ``None``
+            for an empty detection. This keeps a recorded detector mask tied
+            to the planner's world-frame object map.
     """
     obj_point_cloud_list = []
+    centroids = []
     depth = observations["depth"]
     y = observations["gps"][0]
     x = observations["gps"][2]
@@ -61,6 +68,7 @@ def get_object_point_cloud(cfg, observations, object_masks_list, node=None):
 
         if len(local_cloud) == 0:
             obj_point_cloud_list.append(PointCloud2())
+            centroids.append(None)
             continue
         if too_offset(object_mask):
             within_range = np.ones_like(local_cloud[:, 0]) * np.random.rand()
@@ -71,11 +79,17 @@ def get_object_point_cloud(cfg, observations, object_masks_list, node=None):
             within_range = within_range.astype(np.float32)
             within_range[within_range == 0] = np.random.rand()
         obj_point_cloud = transform_points(tf_camera_to_episodic, local_cloud)
+        centroids.append([
+            float(np.mean(obj_point_cloud[:, 0])),
+            float(np.mean(obj_point_cloud[:, 1])),
+        ])
         obj_point_cloud = np.concatenate(
             (obj_point_cloud, within_range[:, None]), axis=1
         )
         pc2 = convert_to_pointcloud2(obj_point_cloud, node)
         obj_point_cloud_list.append(pc2)
+    if return_centroids:
+        return obj_point_cloud_list, centroids
     return obj_point_cloud_list
 
 

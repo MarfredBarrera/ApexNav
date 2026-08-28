@@ -72,7 +72,7 @@ from basic_utils.object_point_cloud_utils.object_point_cloud import (
 from basic_utils.record_episode.episode_recorder import EpisodeRecorder
 from habitat2ros.eval_node import HabitatEvalNode, query_planner_fusion_config
 from llm.answer_reader.answer_reader import read_answer
-from params import HABITAT_STATE, ACTION
+from params import HABITAT_STATE, ACTION, result_dirname
 from vlm.utils.get_itm_message import get_itm_message_cosine
 from vlm.utils.get_object_utils import get_object
 
@@ -173,8 +173,12 @@ def run_episode(env, node, ctx, label, llm_answer, room):
         node.ros_pub.habitat_publish_ros_topic(node.msg_observations)
 
         # Generate and publish object point clouds
-        cld_with_score_msg.point_clouds = get_object_point_cloud(
-            ctx["cfg"], observations, object_masks_list, node
+        (
+            cld_with_score_msg.point_clouds,
+            detection_world_centroids,
+        ) = get_object_point_cloud(
+            ctx["cfg"], observations, object_masks_list, node,
+            return_centroids=True,
         )
         cld_with_score_msg.confidence_scores = score_list
         cld_with_score_msg.label_indices = label_list
@@ -199,6 +203,7 @@ def run_episode(env, node, ctx, label, llm_answer, room):
             expl_result=node.expl_result,
             object_fusion=node.object_fusion,
             object_masks=object_masks_list,
+            detection_world_centroids=detection_world_centroids,
         )
         ctx["video"].capture(
             observations, info, itm_score=cosine, step=count_steps, target=label
@@ -395,7 +400,9 @@ def main(
         # written to the record file - rather than the dataset episode id,
         # which repeats across episodes and would overwrite clips
         video_dir = (
-            "videos" if flag_once else os.path.join(video_output_path, result_text)
+            "videos"
+            if flag_once
+            else os.path.join(video_output_path, result_dirname(result_text))
         )
         video.save(video_dir, f"epi{totals.num_total}_{slugify_label(label)}")
 

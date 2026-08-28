@@ -36,6 +36,20 @@ RESULT_TYPES = [
     "[stepout] false negative",
 ]
 
+# Result categories double as directory names under videos/<run>/. "false positive"
+# is the one that gets typed into shell commands constantly - replay_episode takes a
+# record path - and the space forces quoting every time, so it is spelled with an
+# underscore on disk. The category string itself is unchanged: it is the value stored
+# in episodes.jsonl and matched by record.flush_on.
+RESULT_DIRNAMES = {
+    "false positive": "false_positive",
+}
+
+
+def result_dirname(result_text):
+    """On-disk directory name for a result category (see RESULT_DIRNAMES)."""
+    return RESULT_DIRNAMES.get(result_text, result_text)
+
 
 class FINAL_RESULT:
     EXPLORE = 0

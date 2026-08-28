@@ -139,6 +139,45 @@ def load_record(record_dir):
     return meta, steps
 
 
+def discover_record_dirs(path):
+    """Return record directories represented by ``path``.
+
+    A path containing ``meta.json`` is treated as one episode. Otherwise the
+    immediate child directories containing ``meta.json`` are treated as a
+    category batch, such as ``records/false_positive``.
+    """
+    path = os.path.abspath(path)
+    if os.path.isfile(os.path.join(path, "meta.json")):
+        return [path]
+    if not os.path.isdir(path):
+        raise FileNotFoundError(f"Record directory does not exist: {path}")
+    record_dirs = []
+    for name in sorted(os.listdir(path)):
+        candidate = os.path.join(path, name)
+        if os.path.isdir(candidate) and os.path.isfile(os.path.join(candidate, "meta.json")):
+            record_dirs.append(candidate)
+    if not record_dirs:
+        raise FileNotFoundError(
+            f"No episode records (directories containing meta.json) found in {path}"
+        )
+    return record_dirs
+
+
+def record_matches_target(record_dir, target_episodes):
+    """Match a record against configured run index, episode ID, or dirname."""
+    selectors = [str(value) for value in (target_episodes or [])]
+    if not selectors or "all" in {value.lower() for value in selectors}:
+        return True
+    with open(os.path.join(record_dir, "meta.json"), "r", encoding="utf-8") as handle:
+        meta = json.load(handle)
+    candidates = {
+        os.path.basename(record_dir),
+        str(meta.get("episode_id", "")),
+        str(meta.get("run_index", "")),
+    }
+    return any(selector in candidates for selector in selectors)
+
+
 def replay(record_dir, cfg):
     """Replay the recorded actions and regenerate the requested artifacts.
 
@@ -202,7 +241,12 @@ def replay(record_dir, cfg):
     }
 
     out_root = str(cfg.output_dir).format(record=os.path.basename(record_dir.rstrip("/")))
-    save_rgb = os.path.join(out_root, "rgb") if cfg.rgb.save else None
+    gif_save = bool(cfg.visualization.gif.save)
+    mp4_save = bool(cfg.visualization.mp4.save)
+    decision_save = bool(cfg.visualization.decision_frame.save)
+    if bool(cfg.visualization.decision_frame.only_false_positive):
+        decision_save = decision_save and meta.get("result") == "false positive"
+    save_rgb = os.path.join(out_root, "rgb") if (cfg.rgb.save or gif_save or mp4_save or decision_save) else None
     save_depth = os.path.join(out_root, "depth") if cfg.depth.save else None
     dump_clouds = os.path.join(out_root, "clouds") if cfg.clouds.save else None
     for path in (save_rgb, save_depth, dump_clouds):
@@ -211,6 +255,18 @@ def replay(record_dir, cfg):
     if any((save_rgb, save_depth, dump_clouds)):
         print(f"Writing artifacts under {out_root}")
 
+    rgb_written = 0
+    # The reset observation is frame zero, matching the recorder's on-disk
+    # convention and giving the GIF a useful starting frame.
+    if save_rgb:
+        import cv2
+
+        cv2.imwrite(
+            os.path.join(save_rgb, "000000.jpg"),
+            np.asarray(observations["rgb"])[:, :, ::-1],
+        )
+        rgb_written += 1
+
     sensor_cfg = habitat_cfg.habitat.simulator.agents.main_agent.sim_sensors.depth_sensor
     params = depth_sensor_params(sensor_cfg)
     camera_height = float(sensor_cfg["position"][1])
@@ -218,12 +274,16 @@ def replay(record_dir, cfg):
     # Pitch is not observable from habitat's observations, so it comes from the
     # recording, which tracked it across look_up / look_down actions
     pitch_by_step = {int(e["step"]): float(e.get("camera_pitch") or 0.0) for e in steps}
+    decision_step = None
+    if decision_save:
+        from basic_utils.record_episode.episode_visualization import find_target_decision_step
+
+        decision_step = find_target_decision_step(steps)
 
     poses = [agent_world_pose(observations)]
     max_error = 0.0
     depth_written = 0
     clouds_written = 0
-    rgb_written = 0
 
     for entry in steps:
         action = entry["action"]
@@ -245,8 +305,9 @@ def replay(record_dir, cfg):
         # A plain `continue` here would skip the episode_over check below, so
         # gate the writes instead of the loop body
         want_artifacts = entry["step"] % step_stride == 0
+        want_decision_frame = decision_step is not None and entry["step"] == decision_step
 
-        if save_rgb and want_artifacts:
+        if save_rgb and (want_artifacts or want_decision_frame):
             import cv2
 
             cv2.imwrite(
@@ -295,6 +356,55 @@ def replay(record_dir, cfg):
             f"{rgb_written} rgb frames"
         )
 
+    if cfg.visualization.gif.save:
+        from basic_utils.record_episode.episode_visualization import create_episode_gif
+
+        gif_path = os.path.join(
+            out_root, str(cfg.visualization.gif.filename)
+        )
+        _, gif_frames, decision_step, gate_step = create_episode_gif(
+            record_dir,
+            save_rgb or os.path.join(out_root, "rgb"),
+            gif_path,
+            steps=steps,
+            fps=int(cfg.visualization.gif.fps),
+        )
+        print(
+            f"Wrote episode GIF: {gif_path} ({gif_frames} frames, "
+            f"FSM decision step={decision_step}, gate step={gate_step})"
+        )
+
+    if mp4_save:
+        from basic_utils.record_episode.episode_visualization import create_episode_mp4
+
+        mp4_path = os.path.join(out_root, str(cfg.visualization.mp4.filename))
+        _, mp4_frames, decision_step, gate_step = create_episode_mp4(
+            record_dir,
+            save_rgb or os.path.join(out_root, "rgb"),
+            mp4_path,
+            steps=steps,
+            fps=float(cfg.visualization.mp4.fps),
+        )
+        print(
+            f"Wrote episode MP4: {mp4_path} ({mp4_frames} frames, "
+            f"FSM decision step={decision_step}, gate step={gate_step})"
+        )
+
+    if decision_save:
+        from basic_utils.record_episode.episode_visualization import create_decision_frame
+
+        decision_output = os.path.join(
+            out_root, str(cfg.visualization.decision_frame.filename)
+        )
+        decision_result = create_decision_frame(
+            record_dir, save_rgb or os.path.join(out_root, "rgb"), decision_output, steps=steps
+        )
+        if decision_result:
+            _, saved_step = decision_result
+            print(f"Wrote target decision frame: {decision_output} (step {saved_step})")
+        else:
+            print("No target decision signal recorded; decision frame not written")
+
     recorded_traj = np.load(os.path.join(record_dir, "trajectory.npy"))
     replayed_traj = np.asarray(poses, dtype=np.float32)
     if recorded_traj.shape == replayed_traj.shape:
@@ -316,7 +426,10 @@ def main():
                     "config/replay.yaml; pass hydra-style key=value overrides.",
         add_help=True,
     )
-    parser.add_argument("record_dir", help="directory written by EpisodeRecorder")
+    parser.add_argument(
+        "record_dir",
+        help="one episode directory or a category directory such as records/false_positive",
+    )
     # Keep unknown args so hydra-style overrides pass through, matching how
     # habitat_evaluation.py handles its own config
     args, overrides = parser.parse_known_args()
@@ -331,7 +444,22 @@ def main():
     ):
         cfg = compose(config_name="replay", overrides=overrides)
 
-    replay(args.record_dir, cfg)
+    record_dirs = discover_record_dirs(args.record_dir)
+    target_episodes = list(cfg.visualization.gif.target_episodes)
+    selected = [
+        record_dir
+        for record_dir in record_dirs
+        if record_matches_target(record_dir, target_episodes)
+    ]
+    if not selected:
+        raise SystemExit(
+            "No episode records matched visualization.gif.target_episodes="
+            f"{target_episodes}"
+        )
+    if len(selected) > 1:
+        print(f"Replaying {len(selected)} episode records")
+    for record_dir in selected:
+        replay(record_dir, cfg)
 
 
 if __name__ == "__main__":

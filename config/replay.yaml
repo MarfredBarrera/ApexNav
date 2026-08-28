@@ -30,6 +30,27 @@ depth:
 rgb:
   save: false
 
+# Build a forensic GIF from replay-generated RGBs and the masks stored with the
+# episode. Enable with: visualization.gif.save=true
+visualization:
+  gif:
+    save: true
+    fps: 2
+    filename: "episode.gif"
+    # Empty means every record when record_dir is a category directory.
+    # Entries may be run indices, episode IDs, or full record directory names.
+    target_episodes: []
+  mp4:
+    # Set mp4.save=true and gif.save=false to render MP4 instead of GIF.
+    save: true
+    fps: 2
+    filename: "episode.mp4"
+  decision_frame:
+    # Save the first target decision frame for false-positive records.
+    save: true
+    only_false_positive: true
+    filename: "decision_frame.jpg"
+
 # Unprojection of depth into the planner's world frame. Off by default - the
 # depth frames above are the input to whatever projection you want to run.
 clouds:
