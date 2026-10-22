@@ -22,9 +22,9 @@ def mask(size):
     return m
 
 
-def request(cluster_id=3, centroid=(2.0, 0.0), seq=1):
+def request(cluster_id=3, centroid=(2.0, 0.0), seq=1, at_stop=False):
     return {"seq": seq, "cluster_id": cluster_id, "centroid_x": centroid[0], "centroid_y": centroid[1],
-            "confidence": 0.6, "observation_num": 3, "expl_result": 1}
+            "confidence": 0.6, "observation_num": 3, "expl_result": 1, "at_stop": at_stop}
 
 
 class GateTests(unittest.TestCase):
@@ -33,14 +33,16 @@ class GateTests(unittest.TestCase):
         self.folder = tempfile.mkdtemp()
 
         def verify(url, rgb, m, target, input_elevation=0.0, request_id=None, timeout=None):
-            self.calls.append({"target": target, "area": int(m.sum()), "elevation": input_elevation})
+            self.calls.append({"target": target, "area": int(m.sum()), "elevation": input_elevation,
+                               "request_id": request_id})
             if self.server_down:
                 raise TimeoutError("timed out")
             return {"ok": True, "view_image": None,
                     "verdict": {"accepted": self.accept, "label": target if self.accept else "picture"}}
 
         self.gate = VerificationGate({"enabled": True, "log_dir": self.folder + "/{video_output_path}"}, "v",
-                                     verify=verify, ping=lambda url: {"ok": True, "settings": {"selector": "vqf"}})
+                                     verify=verify, camera={"hfov": 79, "width": 64, "height": 48},
+                                     ping=lambda url, timeout: {"ok": True, "settings": {"selector": "vqf"}})
         self.gate.start_episode(7, "scene", "ep", "potted_plant", goal_object_ids=["42"])
 
     def observe(self, step, size, centroid, camera=(0.0, 0.0), instances=None, fusion=None):
@@ -72,11 +74,13 @@ class GateTests(unittest.TestCase):
         self.assertEqual(self.calls[-1]["target"], "potted plant")
         self.assertAlmostEqual(self.calls[-1]["elevation"], 30.0)
         self.accept = True
-        self.assertEqual(self.gate.handle(request(cluster_id=4, seq=2), step=2), 1)
+        self.observe(2, 16, (5.0, 0.0))
+        self.assertEqual(self.gate.handle(request(cluster_id=4, centroid=(5.0, 0.0), seq=2), step=2), 1)
         lines = [json.loads(line) for line in open(os.path.join(self.folder, "v", "decisions.jsonl"))]
         self.assertEqual([line["state"] for line in lines], [-1, 1])
         self.assertTrue(lines[0]["ground_truth"]["is_correct_instance"])
         self.assertEqual(lines[0]["server"], {"selector": "vqf"})
+        self.assertEqual(lines[0]["camera"], {"hfov": 79, "width": 64, "height": 48})
         self.assertTrue(os.path.isfile(os.path.join(self.folder, "v", "epi7_potted_plant", "c3_s1", "input.jpg")))
         self.assertEqual(self.gate.finish_episode()["rejected"], 1)
 
@@ -109,6 +113,65 @@ class GateTests(unittest.TestCase):
         self.gate.handle(request(seq=3), step=62)
         self.gate.cfg["max_checks"] = 3
         self.assertEqual(self.observe(100, 16, (2.0, 0.0), camera=(3.0, -2.0)), [])
+
+    def test_eviction_keeps_other_objects(self):
+        # The reviewer's case: 69 readable views of A, then one small view of B.
+        for step in range(1, 70):
+            self.observe(step, 16, (2.0 + 0.01 * (step % 5), 0.0))
+        self.observe(70, 2, (6.0, 1.0))
+        self.assertLessEqual(len(self.gate.evidence), 8 + 1 + 1)
+        self.gate.handle(request(cluster_id=9, centroid=(6.0, 1.0)), step=71)
+        self.assertEqual((len(self.calls), self.calls[-1]["area"]), (1, 4))  # B's own view
+        self.assertEqual(self.gate.finish_episode()["no_evidence"], 0)
+        # The newest view of a cell survives even when it is the least readable
+        self.observe(72, 2, (2.0, 0.0))
+        self.assertIn(72, [e["step"] for e in self.gate.evidence])
+
+    def test_evidence_bound(self):
+        self.gate.evidence.max_total = 20
+        for step in range(1, 200):
+            self.observe(step, 16, (0.8 * (step % 40), 0.0))
+        self.assertLessEqual(len(self.gate.evidence), 40)  # one per cell at worst, never zero
+        self.assertEqual(len(self.gate.evidence.cells), 40)
+
+    def test_cached_and_inherited_verdicts(self):
+        self.observe(1, 16, (2.0, 0.0))
+        self.assertEqual(self.gate.handle(request(cluster_id=3), step=2), REJECTED)
+        # A re-spawned cluster at the same place inherits the rejection (no server call)
+        self.assertEqual(self.gate.handle(request(cluster_id=8, centroid=(2.3, 0.1), seq=2), step=3), REJECTED)
+        self.assertEqual(self.gate.clusters[8]["checks"], 1)
+        # A different cluster whose best view was already judged reuses that verdict
+        self.gate.clusters[3]["state"] = UNVERIFIED  # (e.g. reopened) so nothing is inherited
+        del self.gate.clusters[8]
+        self.accept = True
+        self.assertEqual(self.gate.handle(request(cluster_id=11, centroid=(2.6, 0.0), seq=3), step=4), REJECTED)
+        self.assertEqual(len(self.calls), 1)
+        counts = self.gate.finish_episode()
+        self.assertEqual((counts["inherited"], counts["cached"]), (1, 1))
+
+    def test_position_request(self):
+        self.observe(1, 16, (4.0, 4.0))
+        self.accept = True
+        self.assertEqual(self.gate.handle(request(cluster_id=-1, centroid=(4.2, 4.0), at_stop=True), step=2), 1)
+        self.assertEqual(len(self.calls), 1)
+        self.assertNotIn(-1, self.gate.clusters)
+        line = json.loads(open(os.path.join(self.folder, "v", "decisions.jsonl")).readline())
+        self.assertTrue(line["at_stop"])
+
+    def test_consecutive_errors_abort(self):
+        self.server_down = True
+        for step in range(1, 3):
+            self.observe(step, 16, (2.0 * step, 0.0))
+            self.assertEqual(self.gate.handle(request(cluster_id=step, centroid=(2.0 * step, 0.0)), step=step), 1)
+        self.observe(3, 16, (6.0, 0.0))
+        with self.assertRaises(RuntimeError):
+            self.gate.handle(request(cluster_id=3, centroid=(6.0, 0.0)), step=3)
+        # A success in between resets the count
+        self.gate.consecutive_errors = 0
+        self.server_down = False
+        self.observe(4, 16, (8.0, 0.0))
+        self.gate.handle(request(cluster_id=4, centroid=(8.0, 0.0)), step=4)
+        self.assertEqual(self.gate.consecutive_errors, 0)
 
     def test_off(self):
         gate = VerificationGate({"enabled": False}, "v")

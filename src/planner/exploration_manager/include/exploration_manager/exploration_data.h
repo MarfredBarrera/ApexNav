@@ -55,6 +55,9 @@ struct FSMData {
     skip_stuck_check_once_ = false;
     verify_seq_ = 0;
     verify_start_ = 0.0;
+    verify_cluster_id_ = -1;
+    verify_pos_ = Eigen::Vector2d(0, 0);
+    verify_at_stop_ = false;
     last_expl_result_ = -1;
   }
   // FSM data
@@ -95,6 +98,9 @@ struct FSMData {
   uint32_t verify_seq_;  // seq of the pending VerificationRequest
   int last_expl_result_;  // EXPL_RESULT of the latest planNextBestPoint
   double verify_start_;  // node clock (s) when it was sent
+  int verify_cluster_id_;  // cluster it asks about; -1: a bare position (stop backstop)
+  Eigen::Vector2d verify_pos_;
+  bool verify_at_stop_;  // sent by the stop backstop
 };
 
 struct FSMParam {
@@ -138,6 +144,7 @@ struct ExplorationData {
     next_best_path_.clear();
     tsp_tour_.clear();
     target_cluster_id_ = -1;
+    target_object_pos_ = Eigen::Vector2d(0, 0);
   }
   std::vector<std::vector<Eigen::Vector2d>> frontiers_, dormant_frontiers_;
   std::vector<Eigen::Vector2d> frontier_averages_, dormant_frontier_averages_;
@@ -151,6 +158,9 @@ struct ExplorationData {
   // Object cluster the last SEARCH_* result navigates to; -1 for exploration,
   // over-depth targets and the extreme "others" cloud
   int target_cluster_id_;
+  // Nearest point of the target object (next_pos_ is the approach point 0.5-0.85 m
+  // away); the stop backstop verifies what is there
+  Eigen::Vector2d target_object_pos_;
 };
 
 struct ExplorationParam {

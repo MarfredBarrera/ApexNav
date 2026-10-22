@@ -7,13 +7,23 @@ Per episode:
     state = gate.handle(request, fusion, step)               # on /object/verification_request
     counts = gate.finish_episode()
 
-``observe`` buffers every target-class (label 0) detection as evidence and keeps
-the ``max_evidence`` most readable views (``_view_quality``). ``handle`` verifies
-the best view of the requested cluster with ``perception.Verifier`` over HTTP
-and returns the cluster state for the planner: 1 accepted, -1 rejected.
+``observe`` stores every target-class (label 0) detection as evidence, per
+0.75 m cell of its world centroid (``evidence.EvidenceStore``: the most readable
+views of each place plus its newest). ``handle`` verifies the best view of the
+requested cluster with ``perception.Verifier`` over HTTP and returns the state
+for the planner: 1 accepted, -1 rejected. A request with ``cluster_id`` -1 is
+the stop backstop asking about a position that no cluster covers (e.g. an
+over-depth target); it is verified from the evidence nearest that position.
+
+Verdicts are cached by evidence view: a cluster whose best view was already
+judged reuses that verdict without a server call, and a new cluster within
+``match_distance_m`` of a rejected one inherits the rejection (with its check
+count and cooldown), so a re-spawned cluster cannot slip through.
 
 Failure policy (fail open by default): a server error or timeout applies
-``on_error``, a cluster without a stored view ``on_no_evidence``; both are logged.
+``on_error``, a cluster without a stored view ``on_no_evidence``; both are
+logged. ``max_consecutive_errors`` server errors in a row raise, which aborts
+the run, so a run never goes on silently ungated.
 
 Re-check: a rejected cluster is reopened (``observe`` returns its id; the caller
 publishes state 0, so the planner's next selection of it requests a new check)
@@ -23,9 +33,11 @@ before or looks at it from a direction ``recheck_min_angle_deg`` apart, and
 fewer than ``max_checks`` checks so far.
 
 Logs: ``<log_dir>/decisions.jsonl`` (one line per decision, with the server
-settings and the semantic-instance ground truth) and, with ``save_images``,
-``<log_dir>/epi<run>_<label>/c<id>_s<step>/{input.jpg, mask.png, view.png, decision.json}``.
+settings, camera intrinsics and the semantic-instance ground truth) and, with
+``save_images``, ``<log_dir>/epi<run>_<label>/c<id>_s<step>/{input.jpg, mask.png,
+view.png, decision.json}``.
 """
+import copy
 import json
 import math
 import os
@@ -35,27 +47,26 @@ import cv2
 import numpy as np
 
 from basic_utils.eval.habitat_utils import semantic_goal_overlap, slugify_label
-from basic_utils.record_episode.episode_visualization import (
-    COMMIT_MATCH_DISTANCE_M,
-    _mask_touches_border,
-    _view_quality,
-)
 from perception_gate import client
+from perception_gate.evidence import MATCH_DISTANCE_M, EvidenceStore, mask_touches_border, view_quality
 
 DEFAULTS = {
     "enabled": False,
     "url": "http://3dawareverification-dev-1:8770",
     "timeout_s": 120.0,
+    "ping_timeout_s": 60.0,          # long enough to wait out one in-flight verification
     "on_error": "accept",
     "on_no_evidence": "accept",
+    "max_consecutive_errors": 3,
     "max_checks": 3,
     "recheck_cooldown_steps": 25,
     "recheck_min_distance_m": 1.0,
     "recheck_min_angle_deg": 45.0,
-    "match_distance_m": COMMIT_MATCH_DISTANCE_M,
+    "match_distance_m": MATCH_DISTANCE_M,
     "log_dir": "{video_output_path}/verification",
     "save_images": True,
-    "max_evidence": 64,
+    "evidence_per_cell": 8,
+    "max_evidence": 256,
     "ground_truth_semantic_overlap": 0.5,
 }
 POLICIES = ("accept", "reject")
@@ -80,7 +91,9 @@ def _angle_between(a, b):
 
 
 class VerificationGate:
-    def __init__(self, cfg=None, video_output_path=".", verify=None, ping=None):
+    """``camera``: intrinsics logged with every decision, e.g. {hfov, width, height}."""
+
+    def __init__(self, cfg=None, video_output_path=".", verify=None, ping=None, camera=None):
         unknown = set(cfg or {}) - set(DEFAULTS)
         if unknown:
             raise ValueError(f"unknown verification settings: {sorted(unknown)}")
@@ -90,13 +103,14 @@ class VerificationGate:
                 raise ValueError(f"verification.{key} must be one of {POLICIES}")
         self.enabled = bool(self.cfg["enabled"])
         self.log_dir = str(self.cfg["log_dir"]).format(video_output_path=video_output_path)
+        self.camera = camera
         self._verify = verify or client.verify
         self.server = None
-        self.episode = {}
-        self.evidence, self.clusters, self.events, self.counts = [], {}, [], {}
+        self.consecutive_errors = 0
+        self.start_episode(-1, "", "", "")
         if self.enabled:
-            # A wrong URL or protocol is a setup error, not a per-request failure.
-            self.server = (ping or client.ping)(self.cfg["url"])
+            # A wrong URL, protocol or dead worker is a setup error, not a per-request failure.
+            self.server = (ping or client.ping)(self.cfg["url"], timeout=float(self.cfg["ping_timeout_s"]))
             os.makedirs(self.log_dir, exist_ok=True)
             print(f"[verification] gate ON: {self.cfg['url']} {json.dumps(self.server.get('settings'))}")
 
@@ -108,9 +122,11 @@ class VerificationGate:
         self.episode = {"run_index": int(run_index), "scene": str(scene), "episode_id": str(episode_id),
                         "label": str(label), "target": target_name(label),
                         "goal_object_ids": [str(i) for i in goal_object_ids if i is not None]}
-        self.evidence, self.clusters, self.events = [], {}, []
+        self.evidence = EvidenceStore(self.cfg["match_distance_m"], self.cfg["evidence_per_cell"],
+                                      self.cfg["max_evidence"])
+        self.clusters, self.verdicts, self.events = {}, {}, []
         self.counts = {"requests": 0, "accepted": 0, "rejected": 0, "errors": 0, "no_evidence": 0,
-                       "reopened": 0}
+                       "cached": 0, "inherited": 0, "reopened": 0}
 
     def finish_episode(self):
         """Per-episode counts (None when the gate is off)."""
@@ -127,7 +143,7 @@ class VerificationGate:
 
     def observe(self, step, rgb, masks, labels, scores, centroids, semantic_instances, pose,
                 camera_pitch, fusion=None):
-        """Buffer this step's target detections; returns rejected cluster ids to reopen."""
+        """Store this step's target detections; returns rejected cluster ids to reopen."""
         if not self.enabled:
             return []
         snapshot = {int(c["id"]): tuple(c["centroid"]) for c in (fusion or {}).get("clusters", [])}
@@ -144,17 +160,14 @@ class VerificationGate:
             score = float(scores[index]) if scores is not None and index < len(scores) else None
             item = {"step": int(step), "index": index, "rgb": rgb, "mask": mask, "score": score,
                     "area_fraction": area / float(mask.size),
-                    "quality": _view_quality(score, area / float(mask.size), _mask_touches_border(mask)),
+                    "quality": view_quality(score, area / float(mask.size), mask_touches_border(mask)),
                     "centroid": (float(centroids[index][0]), float(centroids[index][1])),
                     "camera": (float(pose[0]), float(pose[1])), "pitch": float(camera_pitch),
                     "semantic_instances": (semantic_instances[index] if semantic_instances is not None
                                            and index < len(semantic_instances) else None),
                     "clusters": snapshot}
             new.append(item)
-        self.evidence.extend(new)
-        if len(self.evidence) > self.cfg["max_evidence"]:
-            self.evidence.sort(key=lambda e: -e["quality"])
-            del self.evidence[self.cfg["max_evidence"]:]
+            self.evidence.add(item)
         return self._reopen(step, new, snapshot)
 
     def _novel(self, item, used):
@@ -165,9 +178,10 @@ class VerificationGate:
                    or math.degrees(_angle_between(bearing, u["bearing"])) >= self.cfg["recheck_min_angle_deg"]
                    for u in used)
 
-    def _matches(self, item, cluster_id, centroid):
-        reference = item["clusters"].get(cluster_id, centroid)
-        return reference is not None and _distance(item["centroid"], reference) <= self.cfg["match_distance_m"]
+    def _reference(self, item, cluster_id, centroid):
+        """Where ``item`` should be for ``cluster_id``: the cluster's centroid at the item's step
+        (clusters drift as they grow), else ``centroid``. Position requests (-1) use ``centroid``."""
+        return item["clusters"].get(cluster_id, centroid) if cluster_id >= 0 else centroid
 
     def _reopen(self, step, new, snapshot):
         reopened = []
@@ -176,7 +190,8 @@ class VerificationGate:
                     or step - state["last_step"] < self.cfg["recheck_cooldown_steps"]):
                 continue
             centroid = snapshot.get(cluster_id, state["centroid"])
-            if any(self._matches(item, cluster_id, centroid) and self._novel(item, state["used"]) for item in new):
+            if any(_distance(item["centroid"], self._reference(item, cluster_id, centroid))
+                   <= self.cfg["match_distance_m"] and self._novel(item, state["used"]) for item in new):
                 state["state"] = UNVERIFIED
                 reopened.append(cluster_id)
                 self.counts["reopened"] += 1
@@ -185,17 +200,16 @@ class VerificationGate:
         return reopened
 
     def select_evidence(self, cluster_id, centroid):
-        """(evidence, match distance) for a cluster: the most readable view within
-        ``match_distance_m``, else the nearest within twice that, else (None, None).
-        A re-check prefers views that are new by the re-check rule."""
+        """(evidence, match distance) for a cluster (or a position, ``cluster_id`` -1): the
+        most readable view within ``match_distance_m``, else the nearest within twice that,
+        else (None, None). A re-check prefers views that are new by the re-check rule."""
         used = self.clusters.get(cluster_id, {}).get("used", [])
-        pool = self.evidence
+        pool = list(self.evidence)
         if used:
-            pool = [e for e in self.evidence if self._novel(e, used)] or self.evidence
+            pool = [e for e in pool if self._novel(e, used)] or pool
 
         def distance(item):
-            reference = item["clusters"].get(cluster_id, centroid)
-            return _distance(item["centroid"], reference)
+            return _distance(item["centroid"], self._reference(item, cluster_id, centroid))
 
         matched = [e for e in pool if distance(e) <= self.cfg["match_distance_m"]]
         if matched:
@@ -207,6 +221,16 @@ class VerificationGate:
             return best, distance(best)
         return None, None
 
+    def _rejected_neighbour(self, cluster_id, centroid, fusion):
+        """A rejected cluster within ``match_distance_m`` of ``centroid`` (a re-spawn of it)."""
+        snapshot = {int(c["id"]): tuple(c["centroid"]) for c in (fusion or {}).get("clusters", [])}
+        for other, state in self.clusters.items():
+            if other == cluster_id or state["state"] != REJECTED:
+                continue
+            if _distance(snapshot.get(other, state["centroid"]), centroid) <= self.cfg["match_distance_m"]:
+                return other
+        return None
+
     # ------------------------------------------------------------------
     # Verification
     # ------------------------------------------------------------------
@@ -215,64 +239,103 @@ class VerificationGate:
         """Verify the requested cluster; returns 1 (accept) or -1 (reject) for the planner.
 
         ``request``: dict with seq, cluster_id, centroid_x/y, confidence, observation_num,
-        expl_result (the VerificationRequest message)."""
+        expl_result, at_stop (the VerificationRequest message)."""
         cluster_id = int(request["cluster_id"])
         centroid = (float(request["centroid_x"]), float(request["centroid_y"]))
-        state = self.clusters.setdefault(cluster_id, {"state": UNVERIFIED, "checks": 0, "last_step": step,
-                                                      "used": [], "centroid": centroid})
-        state.update(checks=state["checks"] + 1, last_step=int(step), centroid=centroid)
         self.counts["requests"] += 1
-        evidence, match = self.select_evidence(cluster_id, centroid)
         record = {**{k: self.episode.get(k) for k in ("run_index", "scene", "episode_id", "label", "target")},
                   "step": int(step), "seq": int(request.get("seq", 0)),
                   "cluster": {"id": cluster_id, "centroid": list(centroid),
                               "confidence": float(request.get("confidence", 0.0)),
-                              "observation_num": int(request.get("observation_num", 0)),
-                              "check": state["checks"]},
+                              "observation_num": int(request.get("observation_num", 0))},
                   "expl_result": int(request.get("expl_result", -1)),
+                  "at_stop": bool(request.get("at_stop", False)),
                   "server": None if self.server is None else self.server.get("settings"),
-                  "evidence": None, "verdict": None, "latency_s": None, "error": None, "policy": None,
-                  "ground_truth": None}
-        reply, start = None, time.time()
+                  "camera": self.camera, "evidence": None, "verdict": None, "latency_s": None,
+                  "error": None, "policy": None, "source": "server", "ground_truth": None}
+
+        # Position requests (stop backstop, no cluster) carry no per-cluster state.
+        state = None
+        if cluster_id >= 0:
+            state = self.clusters.get(cluster_id)
+            neighbour = self._rejected_neighbour(cluster_id, centroid, fusion) if state is None else None
+            if neighbour is not None:
+                # A re-spawn of a rejected cluster: same rejection, check count and cooldown.
+                inherited = self.clusters[cluster_id] = copy.deepcopy(self.clusters[neighbour])
+                inherited["centroid"] = centroid
+                record.update(source=f"inherited from cluster {neighbour}", policy="respawn")
+                record["cluster"]["check"] = inherited["checks"]
+                self.counts["inherited"] += 1
+                return self._decide(record, REJECTED, None, None, None)
+            if state is None:
+                state = self.clusters[cluster_id] = {"state": UNVERIFIED, "checks": 0, "last_step": int(step),
+                                                     "used": [], "centroid": centroid}
+            state.update(checks=state["checks"] + 1, last_step=int(step), centroid=centroid)
+            record["cluster"]["check"] = state["checks"]
+
+        evidence, match = self.select_evidence(cluster_id, centroid)
         if evidence is None:
-            accepted = self.cfg["on_no_evidence"] == "accept"
-            record["policy"] = f"on_no_evidence={self.cfg['on_no_evidence']}"
             self.counts["no_evidence"] += 1
-        else:
-            elevation = -math.degrees(evidence["pitch"])  # Habitat pitch is negative looking down
-            record["evidence"] = {"step": evidence["step"], "index": evidence["index"], "score": evidence["score"],
-                                  "area_fraction": round(evidence["area_fraction"], 5),
-                                  "match_distance_m": round(match, 3), "camera": list(evidence["camera"]),
-                                  "centroid": list(evidence["centroid"]), "pitch": evidence["pitch"],
-                                  "input_elevation": elevation}
-            record["ground_truth"] = semantic_goal_overlap(
-                evidence["semantic_instances"], self.episode.get("goal_object_ids", []),
-                self.cfg["ground_truth_semantic_overlap"])
-            try:
-                reply = self._verify(self.cfg["url"], evidence["rgb"], evidence["mask"], self.episode["target"],
-                                     input_elevation=elevation,
-                                     request_id=f"epi{self.episode.get('run_index')}_c{cluster_id}_s{step}",
-                                     timeout=float(self.cfg["timeout_s"]))
-                record["verdict"] = reply["verdict"]
-                accepted = bool(reply["verdict"]["accepted"])
-            except Exception as error:  # fail open (or closed) per on_error, always logged
-                accepted = self.cfg["on_error"] == "accept"
-                record["error"] = f"{type(error).__name__}: {error}"
-                record["policy"] = f"on_error={self.cfg['on_error']}"
-                self.counts["errors"] += 1
+            record["policy"] = f"on_no_evidence={self.cfg['on_no_evidence']}"
+            return self._decide(record, ACCEPTED if self.cfg["on_no_evidence"] == "accept" else REJECTED,
+                                None, None, state)
+
+        elevation = -math.degrees(evidence["pitch"])  # Habitat pitch is negative looking down
+        record["evidence"] = {"step": evidence["step"], "index": evidence["index"], "score": evidence["score"],
+                              "area_fraction": round(evidence["area_fraction"], 5),
+                              "match_distance_m": round(match, 3), "camera": list(evidence["camera"]),
+                              "centroid": list(evidence["centroid"]), "pitch": evidence["pitch"],
+                              "input_elevation": elevation}
+        record["ground_truth"] = semantic_goal_overlap(
+            evidence["semantic_instances"], self.episode.get("goal_object_ids", []),
+            self.cfg["ground_truth_semantic_overlap"])
+        if state is not None:
             state["used"].append({"camera": evidence["camera"],
                                   "bearing": _bearing(evidence["camera"], evidence["centroid"])})
-        record["latency_s"] = round(time.time() - start, 3)
-        state["state"] = ACCEPTED if accepted else REJECTED
-        record["state"] = state["state"]
-        self.counts["accepted" if accepted else "rejected"] += 1
+        key = (evidence["step"], evidence["index"])
+        if key in self.verdicts:  # this exact view was already judged (for another cluster)
+            self.counts["cached"] += 1
+            record.update(source="cached", verdict=self.verdicts[key]["verdict"])
+            return self._decide(record, self.verdicts[key]["state"], evidence, None, state)
+
+        start = time.time()
+        try:
+            reply = self._verify(self.cfg["url"], evidence["rgb"], evidence["mask"], self.episode["target"],
+                                 input_elevation=elevation,
+                                 request_id=f"epi{self.episode.get('run_index')}_c{cluster_id}_s{step}",
+                                 timeout=float(self.cfg["timeout_s"]))
+            verdict = reply["verdict"]
+        except Exception as error:  # fail open (or closed) per on_error, always logged
+            self.consecutive_errors += 1
+            self.counts["errors"] += 1
+            record.update(error=f"{type(error).__name__}: {error}", policy=f"on_error={self.cfg['on_error']}",
+                          latency_s=round(time.time() - start, 3))
+            decided = self._decide(record, ACCEPTED if self.cfg["on_error"] == "accept" else REJECTED,
+                                   evidence, None, state)
+            if self.consecutive_errors >= self.cfg["max_consecutive_errors"]:
+                raise RuntimeError(f"perception server failed {self.consecutive_errors} times in a row "
+                                   f"(last: {record['error']}); aborting rather than running ungated")
+            return decided
+        self.consecutive_errors = 0
+        record.update(verdict=verdict, latency_s=round(time.time() - start, 3))
+        decided = ACCEPTED if verdict["accepted"] else REJECTED
+        self.verdicts[key] = {"state": decided, "verdict": verdict}
+        return self._decide(record, decided, evidence, reply, state)
+
+    def _decide(self, record, decided, evidence, reply, state):
+        if state is not None:
+            state["state"] = decided
+        record["state"] = decided
+        self.counts["accepted" if decided == ACCEPTED else "rejected"] += 1
         self._log(record, evidence, reply)
-        self.events.append({"event": "decision", "cluster_id": cluster_id, "state": state["state"],
-                            "label": (record["verdict"] or {}).get("label"), "error": record["error"]})
-        print(f"[verification] cluster {cluster_id} {'ACCEPTED' if accepted else 'REJECTED'}: "
-              f"label {(record['verdict'] or {}).get('label')!r} for {self.episode.get('target')!r} "
-              f"({record['policy'] or 'verdict'}, {record['latency_s']:.1f} s)")
-        return state["state"]
+        label = (record["verdict"] or {}).get("label")
+        self.events.append({"event": "decision", "cluster_id": record["cluster"]["id"], "state": decided,
+                            "label": label, "source": record["source"], "error": record["error"]})
+        print(f"[verification] {'position' if record['cluster']['id'] < 0 else 'cluster'} "
+              f"{record['cluster']['id']} {'ACCEPTED' if decided == ACCEPTED else 'REJECTED'}: label {label!r} "
+              f"for {self.episode.get('target')!r} ({record['policy'] or record['source']}, "
+              f"{record['latency_s'] or 0.0:.1f} s)")
+        return decided
 
     def _log(self, record, evidence, reply):
         if not self.log_dir:
@@ -280,14 +343,13 @@ class VerificationGate:
         os.makedirs(self.log_dir, exist_ok=True)
         with open(os.path.join(self.log_dir, "decisions.jsonl"), "a", encoding="utf-8") as stream:
             stream.write(json.dumps(record) + "\n")
-        if not self.cfg["save_images"]:
+        if not self.cfg["save_images"] or evidence is None:
             return
         folder = os.path.join(self.log_dir, f"epi{record['run_index']}_{slugify_label(record['label'])}",
                               f"c{record['cluster']['id']}_s{record['step']}")
         os.makedirs(folder, exist_ok=True)
-        if evidence is not None:
-            cv2.imwrite(os.path.join(folder, "input.jpg"), cv2.cvtColor(evidence["rgb"], cv2.COLOR_RGB2BGR))
-            cv2.imwrite(os.path.join(folder, "mask.png"), evidence["mask"] * 255)
+        cv2.imwrite(os.path.join(folder, "input.jpg"), cv2.cvtColor(evidence["rgb"], cv2.COLOR_RGB2BGR))
+        cv2.imwrite(os.path.join(folder, "mask.png"), evidence["mask"] * 255)
         if reply and reply.get("view_image"):
             cv2.imwrite(os.path.join(folder, "view.png"),
                         cv2.cvtColor(client.decode_png(reply["view_image"]), cv2.COLOR_RGB2BGR))

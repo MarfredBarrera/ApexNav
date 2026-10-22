@@ -138,6 +138,18 @@ public:
       bool limited_confidence = true, bool extreme = false, vector<int>* ids = nullptr);
   bool setVerification(int id, int state);
   int getVerification(int id) const;
+  // Perception gate. With it on, the extreme "others" cloud (all clusters,
+  // mostly other classes) is never a target
+  void setVerificationEnabled(bool enabled) { verification_enabled_ = enabled; }
+  // Nearest non-rejected cluster with a cell within max_dist of pos, else -1
+  int nearestCluster(const Vector2d& pos, double max_dist) const;
+  // Positions verified without a cluster (stop backstop): accepted ones need no
+  // second check, rejected ones are cut out of over-depth target clouds
+  void acceptPosition(const Vector2d& pos) { accepted_positions_.push_back(pos); }
+  bool isAcceptedPosition(const Vector2d& pos, double radius) const;
+  void suppressPosition(const Vector2d& pos) { suppressed_positions_.push_back(pos); }
+  pcl::shared_ptr<pcl::PointCloud<pcl::PointXYZ>> withoutSuppressed(
+      const pcl::shared_ptr<pcl::PointCloud<pcl::PointXYZ>>& cloud, double radius) const;
   void getObjects(
       vector<vector<Vector2d>>& clusters, vector<Vector2d>& averages, vector<int>& labels);
   void getObjectConfidences(
@@ -205,6 +217,10 @@ private:
   double min_confidence_;    ///< Minimum confidence threshold for object acceptance
   double resolution_;        ///< Grid resolution in meters
   double leaf_size_;         ///< Voxel size for point cloud downsampling
+
+  // Perception gate
+  bool verification_enabled_ = false;
+  vector<Vector2d> accepted_positions_, suppressed_positions_;  ///< reset per episode
 
   // System integration
   SDFMap2D* sdf_map_;

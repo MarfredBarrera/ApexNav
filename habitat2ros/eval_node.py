@@ -49,8 +49,11 @@ class HabitatEvalNode(Node):
         self.fusion_threshold = 0.0
         self.object_fusion = None
         self.pub_timer = None
-        # Latest /object/verification_request (perception gate), as a dict
+        # Latest /object/verification_request (perception gate), as a dict.
+        # Requests with seq <= verification_seq_floor are from an earlier episode
         self.verification_request = None
+        self.last_verification_seq = 0
+        self.verification_seq_floor = 0
 
         # Publishers
         self.obj_point_cloud_pub = self.create_publisher(
@@ -124,8 +127,13 @@ class HabitatEvalNode(Node):
         """Latch the planner's request to verify a target cluster (perception gate).
 
         The FSM waits in WAIT_VERIFICATION until publish_verification_result
-        answers with the same seq.
+        answers with the same seq. The planner's seq never resets, so a request
+        from before the current episode began is recognized and dropped.
         """
+        if msg.seq <= self.verification_seq_floor:
+            print(f"[verification] dropping stale request seq={msg.seq}")
+            return
+        self.last_verification_seq = max(self.last_verification_seq, int(msg.seq))
         self.verification_request = {
             "seq": int(msg.seq),
             "cluster_id": int(msg.cluster_id),
@@ -134,7 +142,13 @@ class HabitatEvalNode(Node):
             "confidence": float(msg.confidence),
             "observation_num": int(msg.observation_num),
             "expl_result": int(msg.expl_result),
+            "at_stop": bool(msg.at_stop),
         }
+
+    def start_verification_episode(self):
+        """Forget requests from earlier episodes (call once the planner is ready)."""
+        self.verification_request = None
+        self.verification_seq_floor = self.last_verification_seq
 
     def publish_verification_result(self, seq, cluster_id, state):
         """Answer a request (state 1 accept, -1 reject) or reopen a cluster (state 0)."""

@@ -87,6 +87,9 @@ record:
 # cluster, its best stored view must pass 3DAwareVerification's
 # perception.Verifier, served by `python -m perception.server` in that repo's
 # container (docker network connect 3dawareverification_default apexnav).
+# The planner also verifies at the stop itself (any target an accepted cluster
+# does not cover, e.g. over-depth ones). perception_gate is imported only when
+# enabled.
 # Launch the planner with verification_gate:=true (VERIFICATION_GATE=true
 # ./scripts/start_session.sh) when enabling it. Selector, ensemble filter and
 # threshold are server flags, copied from /health into every decision line.
@@ -96,6 +99,8 @@ verification:
   timeout_s: 120
   on_error: accept              # server error/timeout: accept (fail open) or reject
   on_no_evidence: accept        # no stored view of the cluster
+  max_consecutive_errors: 3     # then abort the run: never run silently ungated
+  ping_timeout_s: 60            # startup /health; tolerates one in-flight verification
   max_checks: 3                 # per cluster, including re-checks
   recheck_cooldown_steps: 25    # a rejected cluster may be re-checked after this many steps
   recheck_min_distance_m: 1.0   # ... from a camera this far from every view used before

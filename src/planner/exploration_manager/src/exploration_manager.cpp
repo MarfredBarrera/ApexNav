@@ -93,6 +93,10 @@ void ExplorationManager::reset()
   ed_.reset(new ExplorationData);
 }
 
+// Over-depth target points this close to a position the perception gate
+// rejected are dropped (the match distance of perception_gate)
+static constexpr double SUPPRESS_RADIUS = 0.75;
+
 int ExplorationManager::planNextBestPoint(const Vector3d& pos, const double& yaw)
 {
   Vector2d pos2d = Vector2d(pos(0), pos(1));
@@ -103,6 +107,12 @@ int ExplorationManager::planNextBestPoint(const Vector3d& pos, const double& yaw
   ed_->tsp_tour_.clear();
   ed_->next_best_path_.clear();
   ed_->target_cluster_id_ = -1;  // cluster each SEARCH_* return below heads to
+  // Record the target of a SEARCH_* return: its cluster (-1: none) and nearest point
+  auto setTarget = [&](int id, const pcl::shared_ptr<pcl::PointCloud<pcl::PointXYZ>>& cloud) {
+    ed_->target_cluster_id_ = id;
+    Vector2d object_pos = findNearestObjectPoint(pos, cloud);
+    ed_->target_object_pos_ = object_pos.x() < -999.0 ? ed_->next_pos_ : object_pos;
+  };
   vector<pcl::shared_ptr<pcl::PointCloud<pcl::PointXYZ>>> object_clouds;
   vector<int> object_ids;
   sdf_map_->object_map2d_->getTopConfidenceObjectCloud(object_clouds, true, false, &object_ids);
@@ -114,18 +124,22 @@ int ExplorationManager::planNextBestPoint(const Vector3d& pos, const double& yaw
     // Try to find path to each detected object in order of confidence
     for (size_t i = 0; i < object_clouds.size(); ++i) {
       if (searchObjectPath(pos, object_clouds[i], ed_->next_pos_, ed_->next_best_path_)) {
-        ed_->target_cluster_id_ = object_ids[i];
+        setTarget(object_ids[i], object_clouds[i]);
         return SEARCH_BEST_OBJECT;
       }
     }
   }
 
   // ==================== Navigation Mode: Over-Depth Objects ====================
-  if (!object_map2d_->over_depth_object_cloud_->points.empty()) {
+  // (minus positions the perception gate rejected; the cloud itself when none)
+  auto over_depth_cloud = object_map2d_->withoutSuppressed(
+      object_map2d_->over_depth_object_cloud_, SUPPRESS_RADIUS);
+  if (!over_depth_cloud->points.empty()) {
     RCLCPP_WARN(node_->get_logger(), "[Navigation Mode (Over Depth)] Get over depth object cloud");
-    if (searchObjectPath(
-            pos, object_map2d_->over_depth_object_cloud_, ed_->next_pos_, ed_->next_best_path_))
+    if (searchObjectPath(pos, over_depth_cloud, ed_->next_pos_, ed_->next_best_path_)) {
+      setTarget(-1, over_depth_cloud);
       return SEARCH_OVER_DEPTH_OBJECT;
+    }
   }
 
   // ==================== Exploration Mode: Frontier-Based Planning ====================
@@ -150,7 +164,7 @@ int ExplorationManager::planNextBestPoint(const Vector3d& pos, const double& yaw
     // Try suspicious objects as backup
     if (!top_object_cloud->points.empty() &&
         searchObjectPath(pos, top_object_cloud, ed_->next_pos_, ed_->next_best_path_)) {
-      ed_->target_cluster_id_ = top_object_id;
+      setTarget(top_object_id, top_object_cloud);
       return SEARCH_SUSPICIOUS_OBJECT;
     }
     else
@@ -166,7 +180,7 @@ int ExplorationManager::planNextBestPoint(const Vector3d& pos, const double& yaw
       for (size_t i = 0; i < object_clouds.size(); ++i) {
         if (!object_clouds[i]->points.empty() &&
             searchObjectPathExtreme(pos, object_clouds[i], ed_->next_pos_, ed_->next_best_path_)) {
-          ed_->target_cluster_id_ = object_ids[i];
+          setTarget(object_ids[i], object_clouds[i]);
           return SEARCH_EXTREME;
         }
       }
@@ -176,7 +190,7 @@ int ExplorationManager::planNextBestPoint(const Vector3d& pos, const double& yaw
       for (size_t i = 0; i < object_clouds.size(); ++i) {
         if (!object_clouds[i]->points.empty() &&
             searchObjectPathExtreme(pos, object_clouds[i], ed_->next_pos_, ed_->next_best_path_)) {
-          ed_->target_cluster_id_ = object_ids[i];
+          setTarget(object_ids[i], object_clouds[i]);
           return SEARCH_EXTREME;
         }
       }
@@ -186,9 +200,10 @@ int ExplorationManager::planNextBestPoint(const Vector3d& pos, const double& yaw
       if (!object_map2d_->over_depth_object_cloud_->points.empty())
         last_over_depth_object_cloud = object_map2d_->over_depth_object_cloud_;
 
-      if (!last_over_depth_object_cloud->points.empty() &&
-          searchObjectPathExtreme(
-              pos, last_over_depth_object_cloud, ed_->next_pos_, ed_->next_best_path_)) {
+      auto last_over_depth = object_map2d_->withoutSuppressed(last_over_depth_object_cloud, SUPPRESS_RADIUS);
+      if (!last_over_depth->points.empty() &&
+          searchObjectPathExtreme(pos, last_over_depth, ed_->next_pos_, ed_->next_best_path_)) {
+        setTarget(-1, last_over_depth);
         return SEARCH_EXTREME;
       }
     }

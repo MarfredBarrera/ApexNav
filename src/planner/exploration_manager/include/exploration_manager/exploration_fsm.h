@@ -50,6 +50,7 @@ constexpr double LOCAL_DISTANCE = 0.80;          // local target lookahead
 constexpr double FORWARD_DISTANCE = 0.15;        // min clearance for marking obstacles
 constexpr double FORCE_DORMANT_DISTANCE = 0.35;  // force dormant frontier if very close
 constexpr double MIN_SAFE_DISTANCE = 0.15;       // min safe distance to obstacles
+constexpr double STOP_MATCH_DISTANCE = 0.75;     // perception gate: stop target <-> cluster cell
 
 // Counters / thresholds
 constexpr int MAX_STUCKING_COUNT = 25;           // max consecutive stuck actions -> stop
@@ -129,7 +130,8 @@ private:
   void publishObjectFusionState();
   void finishPlanning();
   bool needsVerification();
-  void requestVerification();
+  bool needsStopVerification(int& cluster_id, Vector2d& pos);
+  void requestVerification(int cluster_id, const Vector2d& pos, bool at_stop);
   void finishVerification(int state, bool timed_out);
   void transitState(ROS_STATE new_state, string pos_call);
   void wrapAngle(double& angle);

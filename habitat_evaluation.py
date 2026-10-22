@@ -76,7 +76,6 @@ from basic_utils.record_episode.episode_recorder import EpisodeRecorder
 from habitat2ros.eval_node import HabitatEvalNode, query_planner_fusion_config
 from llm.answer_reader.answer_reader import read_answer
 from params import HABITAT_STATE, ACTION, EXPL_RESULT, FINAL_RESULT, result_dirname
-from perception_gate import VerificationGate
 from vlm.utils.get_itm_message import get_itm_message_cosine
 from vlm.utils.get_object_utils import get_object
 
@@ -102,6 +101,29 @@ def episode_is_feasible(episode):
     )
 
 
+def build_verification_gate(cfg, video_output_path):
+    """The perception gate, or None when verification.enabled is off.
+
+    perception_gate is imported only here, so a baseline run has no new
+    dependency. Raises when the perception server is unreachable.
+    """
+    verification_cfg = cfg.get("verification", {})
+    if not verification_cfg or not verification_cfg.get("enabled", False):
+        return None
+    from perception_gate import VerificationGate
+
+    rgb_sensor = OmegaConf.select(
+        cfg, "habitat.simulator.agents.main_agent.sim_sensors.rgb_sensor"
+    )
+    camera = None
+    if rgb_sensor is not None:
+        camera = {
+            key: rgb_sensor.get(key) for key in ("hfov", "width", "height", "position")
+        }
+        camera = OmegaConf.to_container(OmegaConf.create(camera), resolve=True)
+    return VerificationGate(verification_cfg, video_output_path, camera=camera)
+
+
 def run_episode(env, node, ctx, label, llm_answer, room):
     """Drive one episode to completion.
 
@@ -123,7 +145,7 @@ def run_episode(env, node, ctx, label, llm_answer, room):
             request, node.verification_request = node.verification_request, None
             # A gate-off run never gets here (main() checks the planner flag);
             # accepting keeps a mismatched planner from waiting for its timeout
-            state = gate.handle(request, node.object_fusion, count_steps) if gate.enabled else 1
+            state = gate.handle(request, node.object_fusion, count_steps) if gate else 1
             node.publish_verification_result(request["seq"], request["cluster_id"], state)
             continue
 
@@ -170,7 +192,7 @@ def run_episode(env, node, ctx, label, llm_answer, room):
             else None
         )
         rgb_gate = None
-        if gate.enabled:
+        if gate:
             rgb_gate = rgb_raw if rgb_raw is not None else observations["rgb"].copy()
 
         # Calculate ITM cosine similarity score
@@ -212,7 +234,7 @@ def run_episode(env, node, ctx, label, llm_answer, room):
             count_steps, rgb_gate, object_masks_list, label_list, score_list,
             detection_world_centroids, detection_semantic_instances, step_pose,
             camera_pitch, node.object_fusion,
-        ):
+        ) if gate else ():
             node.publish_verification_result(0, cluster_id, 0)
 
         info = env.get_metrics()
@@ -235,7 +257,7 @@ def run_episode(env, node, ctx, label, llm_answer, room):
             object_masks=object_masks_list,
             detection_world_centroids=detection_world_centroids,
             detection_semantic_instances=detection_semantic_instances,
-            verification=gate.pop_events(),
+            verification=gate.pop_events() if gate else None,
         )
         ctx["video"].capture(
             observations, info, itm_score=cosine, step=count_steps, target=label
@@ -288,7 +310,7 @@ def main(
     planner_cfg_read = False
 
     video = EpisodeVideo(cfg)
-    gate = VerificationGate(cfg.get("verification", {}), video_output_path)
+    gate = build_verification_gate(cfg, video_output_path)
     totals = RunTotals(
         video_output_path, cfg.record_file_name, cfg.continue_file_name, flag_once
     )
@@ -366,15 +388,16 @@ def main(
             ),
             start_rgb=observations["rgb"],
         )
-        gate.start_episode(
-            run_index=env_num_once if flag_once else totals.num_total,
-            scene=env.current_episode.scene_id,
-            episode_id=env.current_episode.episode_id,
-            label=label,
-            goal_object_ids=[
-                getattr(goal, "object_id", None) for goal in env.current_episode.goals
-            ],
-        )
+        if gate:
+            gate.start_episode(
+                run_index=env_num_once if flag_once else totals.num_total,
+                scene=env.current_episode.scene_id,
+                episode_id=env.current_episode.episode_id,
+                label=label,
+                goal_object_ids=[
+                    getattr(goal, "object_id", None) for goal in env.current_episode.goals
+                ],
+            )
 
         video.start_episode(observations)
         video.capture(observations, env.get_metrics(), step=0, target=label)
@@ -384,20 +407,23 @@ def main(
         print("Agent is waiting in the environment!!!")
         node.wait_for_planner_ready()
         node.stop_observation_timer()
+        # Requests latched before the planner reset belong to the last episode
+        node.start_verification_episode()
 
         # The planner is alive by now, so its fusion arm can be read back once
         # and stamped into every record produced by this run
-        if (recorder.enabled or gate.enabled) and not planner_cfg_read:
+        gate_on = gate is not None
+        if (recorder.enabled or gate_on) and not planner_cfg_read:
             planner_cfg = query_planner_fusion_config(node)
             recorder.set_context(planner_cfg=planner_cfg)
             planner_cfg_read = True
             # Both halves of the gate must agree, or the planner either never
             # asks or waits for answers that never come
             planner_gate = (planner_cfg or {}).get("verification.enabled")
-            if (planner_cfg is not None or gate.enabled) and bool(planner_gate) != gate.enabled:
+            if (planner_cfg is not None or gate_on) and bool(planner_gate) != gate_on:
                 raise RuntimeError(
-                    f"verification.enabled is {gate.enabled} here but {planner_gate} in "
-                    "the planner; launch it with verification_gate:=" + str(gate.enabled).lower()
+                    f"verification.enabled is {gate_on} here but {planner_gate} in "
+                    "the planner; launch it with verification_gate:=" + str(gate_on).lower()
                 )
 
         print("Agent is ready to go!!!!")
@@ -446,7 +472,7 @@ def main(
                 "final_state": node.final_state,
                 "expl_result": node.expl_result,
                 "task_number": totals.num_total + 1,
-                **({"verification": gate.finish_episode()} if gate.enabled else {}),
+                **({"verification": gate.finish_episode()} if gate else {}),
             },
         )
         if record_dir:

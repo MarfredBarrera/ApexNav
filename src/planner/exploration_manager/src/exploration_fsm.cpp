@@ -42,6 +42,7 @@ void ExplorationFSM::init(rclcpp::Node::SharedPtr node)
     node_->declare_parameter("verification.timeout_s", 300.0);
   verification_enabled_ = node_->get_parameter("verification.enabled").as_bool();
   verification_timeout_s_ = node_->get_parameter("verification.timeout_s").as_double();
+  expl_manager_->object_map2d_->setVerificationEnabled(verification_enabled_);
   RCLCPP_INFO(node_->get_logger(), "[Verification] gate %s (timeout %.0f s)",
       verification_enabled_ ? "ON" : "off", verification_timeout_s_);
 
@@ -151,8 +152,13 @@ void ExplorationFSM::FSMCallback()
 
         // An unverified target cluster must pass the perception gate before
         // the agent heads for it (and could stop at it); the action stays held
+        int stop_cluster = -1;
+        Vector2d stop_pos;
         if (needsVerification())
-          requestVerification();
+          requestVerification(expl_manager_->ed_->target_cluster_id_,
+              expl_manager_->ed_->target_object_pos_, false);
+        else if (needsStopVerification(stop_cluster, stop_pos))
+          requestVerification(stop_cluster, stop_pos, true);
         else
           finishPlanning();
       }
@@ -205,19 +211,40 @@ bool ExplorationFSM::needsVerification()
          expl_manager_->object_map2d_->getVerification(id) == 0;
 }
 
-void ExplorationFSM::requestVerification()
+// Backstop at the stop itself: every stop path (incl. over-depth targets, which
+// have no cluster) must end at something the gate accepted. Returns false when
+// the stop is covered; otherwise sets cluster_id (the nearest non-rejected
+// cluster to the target object, or -1 for a bare position) and pos
+bool ExplorationFSM::needsStopVerification(int& cluster_id, Vector2d& pos)
 {
-  int id = expl_manager_->ed_->target_cluster_id_;
+  if (!verification_enabled_ || fd_->final_result_ != FINAL_RESULT::REACH_OBJECT)
+    return false;
+  auto ed = expl_manager_->ed_;
+  auto obj_map = expl_manager_->object_map2d_;
+  if (ed->target_cluster_id_ >= 0 && obj_map->getVerification(ed->target_cluster_id_) == 1)
+    return false;  // the usual path: the target cluster was verified before the approach
+  pos = ed->target_object_pos_;
+  cluster_id = obj_map->nearestCluster(pos, FSMConstants::STOP_MATCH_DISTANCE);
+  if (cluster_id >= 0)
+    return obj_map->getVerification(cluster_id) != 1;
+  return !obj_map->isAcceptedPosition(pos, FSMConstants::STOP_MATCH_DISTANCE);
+}
+
+void ExplorationFSM::requestVerification(int cluster_id, const Vector2d& pos, bool at_stop)
+{
   plan_env::msg::VerificationRequest msg;
   msg.seq = ++verification_seq_;
-  msg.cluster_id = id;
+  msg.cluster_id = cluster_id;
   msg.expl_result = fd_->last_expl_result_;
+  msg.at_stop = at_stop;
+  msg.centroid_x = static_cast<float>(pos(0));
+  msg.centroid_y = static_cast<float>(pos(1));
   vector<ObjectConfidenceInfo> infos;
   double min_confidence = 0.0;
   int min_observation_num = 0;
   expl_manager_->object_map2d_->getObjectConfidences(infos, min_confidence, min_observation_num);
   for (const auto& info : infos) {
-    if (info.id != id)
+    if (info.id != cluster_id)
       continue;
     msg.centroid_x = static_cast<float>(info.average(0));
     msg.centroid_y = static_cast<float>(info.average(1));
@@ -226,26 +253,38 @@ void ExplorationFSM::requestVerification()
   }
   fd_->verify_seq_ = msg.seq;
   fd_->verify_start_ = node_->get_clock()->now().seconds();
-  RCLCPP_WARN(node_->get_logger(), "[Verification] request seq=%u cluster=%d (%.2f, %.2f) conf=%.3f",
-      msg.seq, id, msg.centroid_x, msg.centroid_y, msg.confidence);
+  fd_->verify_cluster_id_ = cluster_id;
+  fd_->verify_pos_ = pos;
+  fd_->verify_at_stop_ = at_stop;
+  RCLCPP_WARN(node_->get_logger(),
+      "[Verification] request seq=%u cluster=%d (%.2f, %.2f) conf=%.3f%s", msg.seq, cluster_id,
+      msg.centroid_x, msg.centroid_y, msg.confidence, at_stop ? " [at stop]" : "");
   verify_request_pub_->publish(msg);
   transitState(ROS_STATE::WAIT_VERIFICATION, "FSM");
 }
 
 // Apply a verdict on the pending request. Accepted (or fail-open): carry out the
-// action already planned for this cluster. Rejected: drop the cluster and
-// replan from the same pose as if it had never been detected
+// action already planned (approach, or the stop). Rejected: drop the cluster (or
+// cut the position out of over-depth targets) and replan from the same pose as
+// if it had never been detected
 void ExplorationFSM::finishVerification(int state, bool timed_out)
 {
-  int id = expl_manager_->ed_->target_cluster_id_;
-  expl_manager_->object_map2d_->setVerification(id, state);
+  int id = fd_->verify_cluster_id_;
+  auto obj_map = expl_manager_->object_map2d_;
+  if (id >= 0)
+    obj_map->setVerification(id, state);
+  else if (state == 1)
+    obj_map->acceptPosition(fd_->verify_pos_);
+  // A rejected stop must not be re-targeted through the over-depth cloud either
+  if (state != 1 && (id < 0 || fd_->verify_at_stop_))
+    obj_map->suppressPosition(fd_->verify_pos_);
   if (timed_out)
     RCLCPP_ERROR(node_->get_logger(),
         "[Verification] no verdict for cluster %d within %.0f s: fail open (accepted)", id,
         verification_timeout_s_);
   else
-    RCLCPP_WARN(node_->get_logger(), "[Verification] cluster %d %s", id,
-        state == 1 ? "ACCEPTED" : "REJECTED");
+    RCLCPP_WARN(node_->get_logger(), "[Verification] cluster %d %s%s", id,
+        state == 1 ? "ACCEPTED" : "REJECTED", fd_->verify_at_stop_ ? " [at stop]" : "");
   publishObjectFusionState();
   if (state == 1) {
     finishPlanning();
@@ -272,7 +311,7 @@ void ExplorationFSM::verificationResultCallback(
     return;
   }
   if (state_ != ROS_STATE::WAIT_VERIFICATION || msg->seq != fd_->verify_seq_ ||
-      msg->cluster_id != expl_manager_->ed_->target_cluster_id_) {
+      msg->cluster_id != fd_->verify_cluster_id_) {
     RCLCPP_WARN(node_->get_logger(), "[Verification] ignoring stale result seq=%u cluster=%d", msg->seq,
         msg->cluster_id);
     return;

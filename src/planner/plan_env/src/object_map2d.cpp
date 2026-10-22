@@ -65,6 +65,8 @@ void ObjectMap2D::reset()
   std::fill(object_buffer_.begin(), object_buffer_.end(), 0);
   std::fill(object_indexs_.begin(), object_indexs_.end(), -1);
   objects_.clear();
+  accepted_positions_.clear();
+  suppressed_positions_.clear();
   all_object_clouds_->clear();
   over_depth_object_cloud_->clear();
 }
@@ -648,8 +650,10 @@ void ObjectMap2D::getTopConfidenceObjectCloud(
         ids->push_back(top_obj.id_);
     }
 
-    // Fallback for extreme mode when no high-confidence objects exist
-    if (extreme && top_object_clouds.empty()) {
+    // Fallback for extreme mode when no high-confidence objects exist. Skipped
+    // with the perception gate on: it would send the agent to other-class
+    // objects that no verification request can name
+    if (extreme && top_object_clouds.empty() && !verification_enabled_) {
       pcl::shared_ptr<pcl::PointCloud<pcl::PointXYZ>> others_object_cloud;
       others_object_cloud.reset(new pcl::PointCloud<pcl::PointXYZ>());
 
@@ -739,6 +743,49 @@ int ObjectMap2D::getVerification(int id) const
   if (id < 0 || id >= (int)objects_.size())
     return 0;
   return objects_[id].verification_;
+}
+
+int ObjectMap2D::nearestCluster(const Vector2d& pos, double max_dist) const
+{
+  int best = -1;
+  double best_dist = max_dist;
+  for (const auto& object : objects_) {
+    if (object.verification_ == -1)
+      continue;
+    for (const auto& cell : object.cells_) {
+      double dist = (cell - pos).norm();
+      if (dist <= best_dist) {
+        best_dist = dist;
+        best = object.id_;
+      }
+    }
+  }
+  return best;
+}
+
+bool ObjectMap2D::isAcceptedPosition(const Vector2d& pos, double radius) const
+{
+  for (const auto& accepted : accepted_positions_)
+    if ((accepted - pos).norm() <= radius)
+      return true;
+  return false;
+}
+
+pcl::shared_ptr<pcl::PointCloud<pcl::PointXYZ>> ObjectMap2D::withoutSuppressed(
+    const pcl::shared_ptr<pcl::PointCloud<pcl::PointXYZ>>& cloud, double radius) const
+{
+  if (suppressed_positions_.empty() || !cloud)
+    return cloud;  // the gate never rejected a position: the cloud itself
+  pcl::shared_ptr<pcl::PointCloud<pcl::PointXYZ>> kept(new pcl::PointCloud<pcl::PointXYZ>());
+  for (const auto& point : cloud->points) {
+    Vector2d p(point.x, point.y);
+    bool suppressed = false;
+    for (const auto& s : suppressed_positions_)
+      suppressed |= (s - p).norm() <= radius;
+    if (!suppressed)
+      kept->push_back(point);
+  }
+  return kept;
 }
 
 }  // namespace apexnav_planner
