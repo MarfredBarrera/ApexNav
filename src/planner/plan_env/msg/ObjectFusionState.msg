@@ -26,3 +26,4 @@ int32[] observation_nums    # frames the target class was observed in
 float32[] centroids_x
 float32[] centroids_y
 bool[] is_confident         # passes both halves of the acceptance gate
+int8[] verification         # perception gate: -1 rejected, 0 unverified, 1 accepted

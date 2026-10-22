@@ -548,6 +548,7 @@ void ObjectMap2D::getObjectConfidences(
     info.observation_num = object.observation_nums_[0];
     info.average = object.average_;
     info.is_confident = isConfidenceObject(object);
+    info.verification = object.verification_;
     infos.push_back(info);
   }
   min_confidence = min_confidence_;
@@ -605,16 +606,21 @@ void ObjectMap2D::getAllConfidenceObjectClouds(
 
 void ObjectMap2D::getTopConfidenceObjectCloud(
     vector<pcl::shared_ptr<pcl::PointCloud<pcl::PointXYZ>>>& top_object_clouds,
-    bool limited_confidence, bool extreme)
+    bool limited_confidence, bool extreme, vector<int>* ids)
 {
   top_object_clouds.clear();
+  if (ids)
+    ids->clear();
   vector<ObjectCluster> top_objects;
 
   // Confidence filtering strategy
   // TODO: May need logic adjustment for relaxed no limited_confidence conditions
   if (!limited_confidence) {
-    // Include all objects without confidence filtering
-    for (auto object : objects_) top_objects.push_back(object);
+    // Include all objects without confidence filtering, except those the
+    // perception gate rejected
+    for (auto object : objects_)
+      if (object.verification_ != -1)
+        top_objects.push_back(object);
 
     // Sort by confidence score in descending order
     std::sort(
@@ -638,6 +644,8 @@ void ObjectMap2D::getTopConfidenceObjectCloud(
         top_object_cloud->push_back(point);
       }
       top_object_clouds.push_back(top_object_cloud);
+      if (ids)
+        ids->push_back(top_obj.id_);
     }
 
     // Fallback for extreme mode when no high-confidence objects exist
@@ -647,6 +655,8 @@ void ObjectMap2D::getTopConfidenceObjectCloud(
 
       // Include all object cells regardless of confidence
       for (auto object : objects_) {
+        if (object.verification_ == -1)
+          continue;
         for (auto cell : object.cells_) {
           pcl::PointXYZ point;
           point.x = cell(0);
@@ -656,6 +666,8 @@ void ObjectMap2D::getTopConfidenceObjectCloud(
         }
       }
       top_object_clouds.push_back(others_object_cloud);
+      if (ids)
+        ids->push_back(-1);
     }
   }
   else {
@@ -697,16 +709,36 @@ void ObjectMap2D::getTopConfidenceObjectCloud(
         top_object_cloud->push_back(point);
       }
       top_object_clouds.push_back(top_object_cloud);
+      if (ids)
+        ids->push_back(top_obj.id_);
     }
   }
 }
 
 bool ObjectMap2D::isConfidenceObject(const ObjectCluster& obj)
 {
-  if (obj.confidence_scores_[0] >= min_confidence_ &&
+  // A cluster the perception gate rejected is never a confident target
+  if (obj.verification_ != -1 && obj.confidence_scores_[0] >= min_confidence_ &&
       obj.observation_nums_[0] >= min_observation_num_)
     return true;
   return false;
+}
+
+// Perception gate verdict of one cluster (see VerificationResult.msg). Cluster
+// ids index objects_ and are stable within an episode
+bool ObjectMap2D::setVerification(int id, int state)
+{
+  if (id < 0 || id >= (int)objects_.size())
+    return false;
+  objects_[id].verification_ = state;
+  return true;
+}
+
+int ObjectMap2D::getVerification(int id) const
+{
+  if (id < 0 || id >= (int)objects_.size())
+    return 0;
+  return objects_[id].verification_;
 }
 
 }  // namespace apexnav_planner

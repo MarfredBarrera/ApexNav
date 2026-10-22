@@ -316,8 +316,13 @@ class EpisodeRecorder:
         object_masks=None,
         detection_world_centroids=None,
         detection_semantic_instances=None,
+        verification=None,
     ):
-        """Record one simulator step. Cheap enough to call unconditionally."""
+        """Record one simulator step. Cheap enough to call unconditionally.
+
+        ``verification``: perception-gate decisions and reopens since the last
+        step (perception_gate.VerificationGate.pop_events), or None.
+        """
         if not self._active:
             return
 
@@ -376,6 +381,7 @@ class EpisodeRecorder:
                 # alongside the acceptance gate that applied to it
                 "object_fusion": object_fusion,
                 "planner_commit": planner_commit,
+                "verification": _jsonable(verification),
             }
         )
         self._poses.append(tuple(float(v) for v in pose))
@@ -487,6 +493,7 @@ class EpisodeRecorder:
             "near_object",
             "final_state",
             "expl_result",
+            "verification",
         ):
             if key in metrics:
                 summary[key] = _jsonable(metrics[key])

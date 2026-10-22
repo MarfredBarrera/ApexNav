@@ -35,6 +35,16 @@ void ExplorationFSM::init(rclcpp::Node::SharedPtr node)
     return;
   }
 
+  /* Perception gate (off = exact baseline) */
+  if (!node_->has_parameter("verification.enabled"))
+    node_->declare_parameter("verification.enabled", false);
+  if (!node_->has_parameter("verification.timeout_s"))
+    node_->declare_parameter("verification.timeout_s", 300.0);
+  verification_enabled_ = node_->get_parameter("verification.enabled").as_bool();
+  verification_timeout_s_ = node_->get_parameter("verification.timeout_s").as_double();
+  RCLCPP_INFO(node_->get_logger(), "[Verification] gate %s (timeout %.0f s)",
+      verification_enabled_ ? "ON" : "off", verification_timeout_s_);
+
   /* ROS2 Timer */
   exec_timer_ = node_->create_wall_timer(
       std::chrono::duration<double>(FSMConstants::EXEC_TIMER_DURATION),
@@ -56,6 +66,9 @@ void ExplorationFSM::init(rclcpp::Node::SharedPtr node)
   confidence_threshold_sub_ = node_->create_subscription<std_msgs::msg::Float64>(
       "/detector/confidence_threshold", 10,
       std::bind(&ExplorationFSM::confidenceThresholdCallback, this, std::placeholders::_1));
+  verify_result_sub_ = node_->create_subscription<plan_env::msg::VerificationResult>(
+      "/object/verification_result", 10,
+      std::bind(&ExplorationFSM::verificationResultCallback, this, std::placeholders::_1));
 
   /* ROS2 Publisher */
   ros_state_pub_ = node_->create_publisher<std_msgs::msg::Int32>("/ros/state", 10);
@@ -65,6 +78,8 @@ void ExplorationFSM::init(rclcpp::Node::SharedPtr node)
   object_fusion_pub_ =
       node_->create_publisher<plan_env::msg::ObjectFusionState>("/object/fusion_state", 10);
   robot_marker_pub_ = node_->create_publisher<visualization_msgs::msg::Marker>("/robot", 10);
+  verify_request_pub_ = node_->create_publisher<plan_env::msg::VerificationRequest>(
+      "/object/verification_request", 10);
 }
 
 // FSM between ROS and Habitat for action planning and execution
@@ -134,14 +149,12 @@ void ExplorationFSM::FSMCallback()
         RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 10000,
             "[Calculating Time] Planning process time = %.3f s", call_action_planner_time);
 
-        std_msgs::msg::Int32 expl_state_msg;
-        expl_state_msg.data = fd_->final_result_;
-        expl_state_pub_->publish(expl_state_msg);
-        if (fd_->final_result_ == FINAL_RESULT::EXPLORE ||
-            fd_->final_result_ == FINAL_RESULT::SEARCH_OBJECT)
-          transitState(ROS_STATE::PUB_ACTION, "FSM");
+        // An unverified target cluster must pass the perception gate before
+        // the agent heads for it (and could stop at it); the action stays held
+        if (needsVerification())
+          requestVerification();
         else
-          transitState(ROS_STATE::FINISH, "FSM");
+          finishPlanning();
       }
       visualize();
       break;
@@ -159,8 +172,112 @@ void ExplorationFSM::FSMCallback()
       exec_timer_->reset();
       break;
     }
+
+    case ROS_STATE::WAIT_VERIFICATION: {
+      // Nothing is published and the simulator does not step until the
+      // verdict arrives (verificationResultCallback). Fail open on timeout
+      double waited = node_->get_clock()->now().seconds() - fd_->verify_start_;
+      if (waited > verification_timeout_s_)
+        finishVerification(1, true);
+      break;
+    }
   }
   exec_timer_->reset();
+}
+
+// Publish the planning verdict and move on: act, or end the episode
+void ExplorationFSM::finishPlanning()
+{
+  std_msgs::msg::Int32 expl_state_msg;
+  expl_state_msg.data = fd_->final_result_;
+  expl_state_pub_->publish(expl_state_msg);
+  if (fd_->final_result_ == FINAL_RESULT::EXPLORE ||
+      fd_->final_result_ == FINAL_RESULT::SEARCH_OBJECT)
+    transitState(ROS_STATE::PUB_ACTION, "FSM");
+  else
+    transitState(ROS_STATE::FINISH, "FSM");
+}
+
+bool ExplorationFSM::needsVerification()
+{
+  int id = expl_manager_->ed_->target_cluster_id_;
+  return verification_enabled_ && fd_->final_result_ == FINAL_RESULT::SEARCH_OBJECT && id >= 0 &&
+         expl_manager_->object_map2d_->getVerification(id) == 0;
+}
+
+void ExplorationFSM::requestVerification()
+{
+  int id = expl_manager_->ed_->target_cluster_id_;
+  plan_env::msg::VerificationRequest msg;
+  msg.seq = ++verification_seq_;
+  msg.cluster_id = id;
+  msg.expl_result = fd_->last_expl_result_;
+  vector<ObjectConfidenceInfo> infos;
+  double min_confidence = 0.0;
+  int min_observation_num = 0;
+  expl_manager_->object_map2d_->getObjectConfidences(infos, min_confidence, min_observation_num);
+  for (const auto& info : infos) {
+    if (info.id != id)
+      continue;
+    msg.centroid_x = static_cast<float>(info.average(0));
+    msg.centroid_y = static_cast<float>(info.average(1));
+    msg.confidence = static_cast<float>(info.confidence);
+    msg.observation_num = info.observation_num;
+  }
+  fd_->verify_seq_ = msg.seq;
+  fd_->verify_start_ = node_->get_clock()->now().seconds();
+  RCLCPP_WARN(node_->get_logger(), "[Verification] request seq=%u cluster=%d (%.2f, %.2f) conf=%.3f",
+      msg.seq, id, msg.centroid_x, msg.centroid_y, msg.confidence);
+  verify_request_pub_->publish(msg);
+  transitState(ROS_STATE::WAIT_VERIFICATION, "FSM");
+}
+
+// Apply a verdict on the pending request. Accepted (or fail-open): carry out the
+// action already planned for this cluster. Rejected: drop the cluster and
+// replan from the same pose as if it had never been detected
+void ExplorationFSM::finishVerification(int state, bool timed_out)
+{
+  int id = expl_manager_->ed_->target_cluster_id_;
+  expl_manager_->object_map2d_->setVerification(id, state);
+  if (timed_out)
+    RCLCPP_ERROR(node_->get_logger(),
+        "[Verification] no verdict for cluster %d within %.0f s: fail open (accepted)", id,
+        verification_timeout_s_);
+  else
+    RCLCPP_WARN(node_->get_logger(), "[Verification] cluster %d %s", id,
+        state == 1 ? "ACCEPTED" : "REJECTED");
+  publishObjectFusionState();
+  if (state == 1) {
+    finishPlanning();
+    return;
+  }
+  // Without this the reach check in callActionPlanner could stop at the
+  // rejected cluster's next_pos_
+  fd_->final_result_ = FINAL_RESULT::EXPLORE;
+  fd_->skip_stuck_check_once_ = true;
+  transitState(ROS_STATE::PLAN_ACTION, "Verification");
+}
+
+void ExplorationFSM::verificationResultCallback(
+    const plan_env::msg::VerificationResult::SharedPtr msg)
+{
+  auto obj_map = expl_manager_->object_map2d_;
+  // state 0 reopens a rejected cluster (Python's re-check cooldown passed)
+  if (msg->state == 0) {
+    if (obj_map->getVerification(msg->cluster_id) == -1) {
+      obj_map->setVerification(msg->cluster_id, 0);
+      RCLCPP_WARN(node_->get_logger(), "[Verification] cluster %d reopened", msg->cluster_id);
+      publishObjectFusionState();
+    }
+    return;
+  }
+  if (state_ != ROS_STATE::WAIT_VERIFICATION || msg->seq != fd_->verify_seq_ ||
+      msg->cluster_id != expl_manager_->ed_->target_cluster_id_) {
+    RCLCPP_WARN(node_->get_logger(), "[Verification] ignoring stale result seq=%u cluster=%d", msg->seq,
+        msg->cluster_id);
+    return;
+  }
+  finishVerification(msg->state > 0 ? 1 : -1, false);
 }
 
 /**
@@ -183,6 +300,10 @@ int ExplorationFSM::callActionPlanner()
   Eigen::Vector2d last_pos = Eigen::Vector2d(fd_->last_start_pos_(0), fd_->last_start_pos_(1));
   double current_yaw = fd_->start_yaw_(0);
   fd_->last_start_pos_ = fd_->start_pt_;
+  // Replanning after a rejected target: the pose did not change, which the
+  // stuck detectors below must not count as a failed step
+  bool after_rejection = fd_->skip_stuck_check_once_;
+  fd_->skip_stuck_check_once_ = false;
 
   // Reach the object - check if close enough to target object
   if (fd_->final_result_ == FINAL_RESULT::SEARCH_OBJECT &&
@@ -195,8 +316,8 @@ int ExplorationFSM::callActionPlanner()
   /*******  Escape-from-stuck logic START *******/
   // Detect if robot is stuck and initiate escape sequence
   int last_action = fd_->newest_action_;
-  if (!fd_->escape_stucking_flag_ && (current_pos - last_pos).norm() < stucking_distance &&
-      last_action == ACTION::MOVE_FORWARD) {
+  if (!after_rejection && !fd_->escape_stucking_flag_ &&
+      (current_pos - last_pos).norm() < stucking_distance && last_action == ACTION::MOVE_FORWARD) {
     if (fd_->final_result_ == FINAL_RESULT::SEARCH_OBJECT &&
         (current_pos - expl_manager_->ed_->next_pos_).norm() < soft_reach_distance) {
       RCLCPP_ERROR(node_->get_logger(), "Reach the object successfully!!!");
@@ -285,10 +406,11 @@ int ExplorationFSM::callActionPlanner()
     fd_->replan_flag_ = true;
     fd_->dormant_frontier_flag_ = false;
   }
-  else if (fd_->final_result_ == FINAL_RESULT::EXPLORE && !frontier_change_flag)
-    fd_->replan_flag_ = false;
+  else if (fd_->final_result_ == FINAL_RESULT::EXPLORE && !frontier_change_flag && !after_rejection)
+    fd_->replan_flag_ = false;  // (after a rejection the kept path would lead to the rejected cluster)
 
   expl_res = expl_manager_->planNextBestPoint(fd_->start_pt_, fd_->start_yaw_(0));
+  fd_->last_expl_result_ = expl_res;
 
   if (expl_res != EXPL_RESULT::EXPLORATION) {
     fd_->replan_flag_ = true;
@@ -336,7 +458,10 @@ int ExplorationFSM::callActionPlanner()
     }
 
     // Count consecutive times with same target position while stuck
-    if ((end_pos - last_end_pos).norm() < 1e-3 &&
+    if (after_rejection) {
+      // replan after a rejected target: no step was taken
+    }
+    else if ((end_pos - last_end_pos).norm() < 1e-3 &&
         (current_pos - last_pos).norm() < stucking_distance) {
       fd_->stucking_next_pos_count_++;
       if (fd_->stucking_next_pos_count_ > 8) {
@@ -358,7 +483,10 @@ int ExplorationFSM::callActionPlanner()
   }
 
   // Track consecutive stuck actions globally
-  if ((current_pos - last_pos).norm() < stucking_distance) {
+  if (after_rejection) {
+    // replan after a rejected target: no step was taken
+  }
+  else if ((current_pos - last_pos).norm() < stucking_distance) {
     fd_->stucking_action_count_++;
     if (fd_->stucking_action_count_ > 15) {
       RCLCPP_ERROR(node_->get_logger(), "Stucking action count = %d",
@@ -648,6 +776,7 @@ void ExplorationFSM::publishObjectFusionState()
     msg.centroids_x.push_back(static_cast<float>(info.average(0)));
     msg.centroids_y.push_back(static_cast<float>(info.average(1)));
     msg.is_confident.push_back(info.is_confident);
+    msg.verification.push_back(static_cast<int8_t>(info.verification));
   }
 
   object_fusion_pub_->publish(msg);

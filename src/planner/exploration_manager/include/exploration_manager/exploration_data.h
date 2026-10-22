@@ -2,6 +2,7 @@
 #define _EXPL_DATA_H_
 
 #include <Eigen/Eigen>
+#include <cstdint>
 #include <iostream>
 #include <vector>
 #include <trajectory_manager/optimizer.h>
@@ -24,7 +25,7 @@ struct FSMData {
     have_finished_ = false;
     static_state_ = true;
     state_str_ = { "INIT", "WAIT_TRIGGER", "PLAN_ACTION", "WAIT_ACTION_FINISH", "PUB_ACTION",
-      "FINISH" };
+      "FINISH", "WAIT_VERIFICATION" };
 
     odom_pos_ = Eigen::Vector3d::Zero();
     odom_vel_ = Eigen::Vector3d::Zero();
@@ -50,6 +51,11 @@ struct FSMData {
     stucking_points_.clear();
 
     local_pos_ = Eigen::Vector2d(0, 0);
+
+    skip_stuck_check_once_ = false;
+    verify_seq_ = 0;
+    verify_start_ = 0.0;
+    last_expl_result_ = -1;
   }
   // FSM data
   bool trigger_, have_odom_, have_confidence_;
@@ -81,6 +87,14 @@ struct FSMData {
 
   Eigen::Vector2d local_pos_;
   LocalTrajectory newest_traj_;  // Store latest planned trajectory
+
+  // Perception gate (verification.enabled). A replan right after a verdict
+  // happens at the same pose, which the stuck detectors would read as a
+  // failed forward step, so they are skipped once
+  bool skip_stuck_check_once_;
+  uint32_t verify_seq_;  // seq of the pending VerificationRequest
+  int last_expl_result_;  // EXPL_RESULT of the latest planNextBestPoint
+  double verify_start_;  // node clock (s) when it was sent
 };
 
 struct FSMParam {
@@ -123,6 +137,7 @@ struct ExplorationData {
     next_pos_ = Eigen::Vector2d(0, 0);
     next_best_path_.clear();
     tsp_tour_.clear();
+    target_cluster_id_ = -1;
   }
   std::vector<std::vector<Eigen::Vector2d>> frontiers_, dormant_frontiers_;
   std::vector<Eigen::Vector2d> frontier_averages_, dormant_frontier_averages_;
@@ -133,6 +148,9 @@ struct ExplorationData {
   Eigen::Vector2d next_local_pos_;  // Local target position along path
   std::vector<Eigen::Vector2d> next_best_path_;
   std::vector<Eigen::Vector2d> tsp_tour_;
+  // Object cluster the last SEARCH_* result navigates to; -1 for exploration,
+  // over-depth targets and the extreme "others" cloud
+  int target_cluster_id_;
 };
 
 struct ExplorationParam {

@@ -19,6 +19,9 @@
 # Indices are host GPU indices as `nvidia-smi` reports them. From the host, pass them
 # through explicitly - `exec` does not forward your shell's environment:
 #   docker compose exec -e VLM_GPU=3 apexnav ./scripts/start_session.sh
+#
+# VERIFICATION_GATE=true launches the planner with the perception gate on
+# (perception_gate/; run habitat_evaluation.py with verification.enabled=true too).
 
 set -euo pipefail
 
@@ -100,7 +103,7 @@ tmux split-window -t "${SESSION}:ros" -v -c "${WS}"
 # Foxglove replaces rviz.launch.py here. Both panes are C++ nodes - no CUDA.
 run "${SESSION}:ros.0" use_core - "ros2 launch exploration_manager foxglove.launch.py"
 # Give the models a head start; the planner is cheap to restart if you need to.
-run "${SESSION}:ros.1" use_core - "sleep 20 && ros2 launch exploration_manager exploration.launch.py"
+run "${SESSION}:ros.1" use_core - "sleep 20 && ros2 launch exploration_manager exploration.launch.py verification_gate:=${VERIFICATION_GATE:-false}"
 
 # --- window 2: the evaluation shell (Env A) -----------------------------------
 # Exported rather than prefixed, so re-runs and any other command typed in this pane

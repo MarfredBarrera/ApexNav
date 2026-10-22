@@ -20,6 +20,8 @@
 #include <std_msgs/msg/int32.hpp>
 #include <visualization_msgs/msg/marker.hpp>
 #include <plan_env/msg/object_fusion_state.hpp>
+#include <plan_env/msg/verification_request.hpp>
+#include <plan_env/msg/verification_result.hpp>
 
 using Eigen::Vector2d;
 using Eigen::Vector3d;
@@ -72,7 +74,7 @@ class PlanningVisualization;
 struct FSMParam;
 struct FSMData;
 
-enum ROS_STATE { INIT, WAIT_TRIGGER, PLAN_ACTION, WAIT_ACTION_FINISH, PUB_ACTION, FINISH };
+enum ROS_STATE { INIT, WAIT_TRIGGER, PLAN_ACTION, WAIT_ACTION_FINISH, PUB_ACTION, FINISH, WAIT_VERIFICATION };
 enum ACTION { STOP, MOVE_FORWARD, TURN_LEFT, TURN_RIGHT, TURN_DOWN, TURN_UP };
 enum HABITAT_STATE { READY, ACTION_EXEC, ACTION_FINISH, EPISODE_FINISH };
 
@@ -100,6 +102,13 @@ private:
   rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr expl_result_pub_;
   rclcpp::Publisher<plan_env::msg::ObjectFusionState>::SharedPtr object_fusion_pub_;
   uint32_t object_fusion_seq_ = 0;
+
+  /* Perception gate: verify a target cluster before the agent may stop at it */
+  bool verification_enabled_ = false;
+  double verification_timeout_s_ = 300.0;
+  uint32_t verification_seq_ = 0;  // never reset, so a stale reply cannot match
+  rclcpp::Publisher<plan_env::msg::VerificationRequest>::SharedPtr verify_request_pub_;
+  rclcpp::Subscription<plan_env::msg::VerificationResult>::SharedPtr verify_result_sub_;
   rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr robot_marker_pub_;
 
   /* Action Planner */
@@ -118,6 +127,10 @@ private:
   /* Helper functions */
   bool updateFrontierAndObject();
   void publishObjectFusionState();
+  void finishPlanning();
+  bool needsVerification();
+  void requestVerification();
+  void finishVerification(int state, bool timed_out);
   void transitState(ROS_STATE new_state, string pos_call);
   void wrapAngle(double& angle);
   void publishRobotMarker();
@@ -131,6 +144,7 @@ private:
   void odometryCallback(const nav_msgs::msg::Odometry::SharedPtr msg);
   void habitatStateCallback(const std_msgs::msg::Int32::SharedPtr msg);
   void confidenceThresholdCallback(const std_msgs::msg::Float64::SharedPtr msg);
+  void verificationResultCallback(const plan_env::msg::VerificationResult::SharedPtr msg);
 
 public:
   ExplorationFSM() = default;

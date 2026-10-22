@@ -83,6 +83,26 @@ record:
   jpeg_quality: 85
   max_buffered_steps: 600
   summary_file: "episodes.jsonl"
+# Perception gate (perception_gate/): before the planner may stop at a target
+# cluster, its best stored view must pass 3DAwareVerification's
+# perception.Verifier, served by `python -m perception.server` in that repo's
+# container (docker network connect 3dawareverification_default apexnav).
+# Launch the planner with verification_gate:=true (VERIFICATION_GATE=true
+# ./scripts/start_session.sh) when enabling it. Selector, ensemble filter and
+# threshold are server flags, copied from /health into every decision line.
+verification:
+  enabled: false
+  url: http://3dawareverification-dev-1:8770
+  timeout_s: 120
+  on_error: accept              # server error/timeout: accept (fail open) or reject
+  on_no_evidence: accept        # no stored view of the cluster
+  max_checks: 3                 # per cluster, including re-checks
+  recheck_cooldown_steps: 25    # a rejected cluster may be re-checked after this many steps
+  recheck_min_distance_m: 1.0   # ... from a camera this far from every view used before
+  recheck_min_angle_deg: 45     # ... or looking at it from this different a direction
+  match_distance_m: 0.75        # evidence detection to cluster centroid
+  log_dir: "{video_output_path}/verification"
+  save_images: true
 need_video: false
 video_output_path: "videos/test_mp3d_{split}"
 test_epi_num: -1

@@ -102,17 +102,21 @@ int ExplorationManager::planNextBestPoint(const Vector3d& pos, const double& yaw
   // Clear previous planning results
   ed_->tsp_tour_.clear();
   ed_->next_best_path_.clear();
+  ed_->target_cluster_id_ = -1;  // cluster each SEARCH_* return below heads to
   vector<pcl::shared_ptr<pcl::PointCloud<pcl::PointXYZ>>> object_clouds;
-  sdf_map_->object_map2d_->getTopConfidenceObjectCloud(object_clouds);
+  vector<int> object_ids;
+  sdf_map_->object_map2d_->getTopConfidenceObjectCloud(object_clouds, true, false, &object_ids);
 
   // ==================== Navigation Mode: High-Confidence Objects ====================
   if (!object_clouds.empty()) {
     RCLCPP_WARN(node_->get_logger(), "[Navigation Mode] Get object_cloud num = %ld", object_clouds.size());
 
     // Try to find path to each detected object in order of confidence
-    for (auto object_cloud : object_clouds) {
-      if (searchObjectPath(pos, object_cloud, ed_->next_pos_, ed_->next_best_path_))
+    for (size_t i = 0; i < object_clouds.size(); ++i) {
+      if (searchObjectPath(pos, object_clouds[i], ed_->next_pos_, ed_->next_best_path_)) {
+        ed_->target_cluster_id_ = object_ids[i];
         return SEARCH_BEST_OBJECT;
+      }
     }
   }
 
@@ -125,11 +129,14 @@ int ExplorationManager::planNextBestPoint(const Vector3d& pos, const double& yaw
   }
 
   // ==================== Exploration Mode: Frontier-Based Planning ====================
-  sdf_map_->object_map2d_->getTopConfidenceObjectCloud(object_clouds, false);
+  sdf_map_->object_map2d_->getTopConfidenceObjectCloud(object_clouds, false, false, &object_ids);
   pcl::shared_ptr<pcl::PointCloud<pcl::PointXYZ>> top_object_cloud(
       new pcl::PointCloud<pcl::PointXYZ>);
-  if (object_clouds.size() >= 1)
+  int top_object_id = -1;
+  if (object_clouds.size() >= 1) {
     top_object_cloud = object_clouds[0];
+    top_object_id = object_ids[0];
+  }
 
   // Apply selected exploration policy to choose next frontier
   Eigen::Vector2d next_best_pos;
@@ -142,8 +149,10 @@ int ExplorationManager::planNextBestPoint(const Vector3d& pos, const double& yaw
 
     // Try suspicious objects as backup
     if (!top_object_cloud->points.empty() &&
-        searchObjectPath(pos, top_object_cloud, ed_->next_pos_, ed_->next_best_path_))
+        searchObjectPath(pos, top_object_cloud, ed_->next_pos_, ed_->next_best_path_)) {
+      ed_->target_cluster_id_ = top_object_id;
       return SEARCH_SUSPICIOUS_OBJECT;
+    }
     else
       // Try dormant frontiers as last resort
       chooseExplorationPolicy(
@@ -154,18 +163,22 @@ int ExplorationManager::planNextBestPoint(const Vector3d& pos, const double& yaw
       RCLCPP_ERROR(node_->get_logger(), "search exterme case!!!");
 
       // Try extreme object search with relaxed constraints
-      for (auto object_cloud : object_clouds) {
-        if (!object_cloud->points.empty() &&
-            searchObjectPathExtreme(pos, object_cloud, ed_->next_pos_, ed_->next_best_path_))
+      for (size_t i = 0; i < object_clouds.size(); ++i) {
+        if (!object_clouds[i]->points.empty() &&
+            searchObjectPathExtreme(pos, object_clouds[i], ed_->next_pos_, ed_->next_best_path_)) {
+          ed_->target_cluster_id_ = object_ids[i];
           return SEARCH_EXTREME;
+        }
       }
 
       // Include lower confidence objects in extreme search
-      sdf_map_->object_map2d_->getTopConfidenceObjectCloud(object_clouds, false, true);
-      for (auto object_cloud : object_clouds) {
-        if (!object_cloud->points.empty() &&
-            searchObjectPathExtreme(pos, object_cloud, ed_->next_pos_, ed_->next_best_path_))
+      sdf_map_->object_map2d_->getTopConfidenceObjectCloud(object_clouds, false, true, &object_ids);
+      for (size_t i = 0; i < object_clouds.size(); ++i) {
+        if (!object_clouds[i]->points.empty() &&
+            searchObjectPathExtreme(pos, object_clouds[i], ed_->next_pos_, ed_->next_best_path_)) {
+          ed_->target_cluster_id_ = object_ids[i];
           return SEARCH_EXTREME;
+        }
       }
 
       // Try cached over-depth objects as final option

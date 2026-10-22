@@ -36,6 +36,19 @@ def object_fusion_params(context):
     }
 
 
+def verification_params(context):
+    """Resolve the verification_gate argument (perception_gate; off = baseline)."""
+    raw = LaunchConfiguration('verification_gate').perform(context).strip().lower()
+    if raw not in ('true', 'false', '1', '0'):
+        raise RuntimeError(
+            f"verification_gate must be true or false, got '{raw}'"
+        )
+    return {
+        'verification.enabled': raw in ('true', '1'),
+        'verification.timeout_s': 300.0,
+    }
+
+
 def launch_setup(context, *args, **kwargs):
     """Build the exploration node once the launch arguments can be resolved."""
     trajectory_manager_share = get_package_share_directory('trajectory_manager')
@@ -122,6 +135,7 @@ def launch_setup(context, *args, **kwargs):
                 'astar.resolution_astar': 0.1,
 
                 **object_fusion_params(context),
+                **verification_params(context),
             }
         ],
         remappings=[
@@ -164,6 +178,14 @@ def generate_launch_description():
             description=(
                 'true = ApexNav multi-view confidence fusion; '
                 'false = single-frame detector confidence only'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'verification_gate',
+            default_value='false',
+            description=(
+                'true = a target cluster must pass perception.Verifier '
+                '(perception_gate) before the agent may stop at it'
             ),
         ),
         # Nodes

@@ -12,6 +12,7 @@ class ROS_STATE:
     WAIT_ACTION_FINISH = 3
     PUB_ACTION = 4
     FINISH = 5
+    WAIT_VERIFICATION = 6  # perception gate: planner waits for a verdict
 
 
 class ACTION:

@@ -32,6 +32,8 @@ find_package(OpenCV REQUIRED)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/MultipleMasksWithConfidence.msg"
   "msg/ObjectFusionState.msg"
+  "msg/VerificationRequest.msg"
+  "msg/VerificationResult.msg"
   DEPENDENCIES std_msgs sensor_msgs
 )
 

@@ -18,7 +18,12 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from sensor_msgs.msg import PointCloud2
 from std_msgs.msg import Int32, Int32MultiArray, Float32MultiArray, Float64
 
-from plan_env.msg import MultipleMasksWithConfidence, ObjectFusionState
+from plan_env.msg import (
+    MultipleMasksWithConfidence,
+    ObjectFusionState,
+    VerificationRequest,
+    VerificationResult,
+)
 
 from habitat2ros.habitat_publisher import ROSPublisherNonNode
 from params import ROS_STATE
@@ -44,6 +49,8 @@ class HabitatEvalNode(Node):
         self.fusion_threshold = 0.0
         self.object_fusion = None
         self.pub_timer = None
+        # Latest /object/verification_request (perception gate), as a dict
+        self.verification_request = None
 
         # Publishers
         self.obj_point_cloud_pub = self.create_publisher(
@@ -57,6 +64,8 @@ class HabitatEvalNode(Node):
             MultipleMasksWithConfidence, "/detector/clouds_with_scores", qos)
         self.progress_pub = self.create_publisher(Int32MultiArray, "/habitat/progress", qos)
         self.record_pub = self.create_publisher(Float32MultiArray, "/habitat/record", qos)
+        self.verification_result_pub = self.create_publisher(
+            VerificationResult, "/object/verification_result", qos)
 
         # ROS Publisher for habitat topics
         self.ros_pub = ROSPublisherNonNode(self)
@@ -68,6 +77,9 @@ class HabitatEvalNode(Node):
         self.create_subscription(Int32, "/ros/expl_result", self.ros_expl_result_callback, qos)
         self.create_subscription(
             ObjectFusionState, "/object/fusion_state", self.object_fusion_callback, qos)
+        self.create_subscription(
+            VerificationRequest, "/object/verification_request",
+            self.verification_request_callback, qos)
 
     def ros_action_callback(self, msg):
         self.global_action = msg.data
@@ -100,10 +112,37 @@ class HabitatEvalNode(Node):
                     "observation_num": int(msg.observation_nums[i]),
                     "centroid": [float(msg.centroids_x[i]), float(msg.centroids_y[i])],
                     "is_confident": bool(msg.is_confident[i]),
+                    "verification": (
+                        int(msg.verification[i]) if i < len(msg.verification) else 0
+                    ),
                 }
                 for i in range(len(msg.ids))
             ],
         }
+
+    def verification_request_callback(self, msg):
+        """Latch the planner's request to verify a target cluster (perception gate).
+
+        The FSM waits in WAIT_VERIFICATION until publish_verification_result
+        answers with the same seq.
+        """
+        self.verification_request = {
+            "seq": int(msg.seq),
+            "cluster_id": int(msg.cluster_id),
+            "centroid_x": float(msg.centroid_x),
+            "centroid_y": float(msg.centroid_y),
+            "confidence": float(msg.confidence),
+            "observation_num": int(msg.observation_num),
+            "expl_result": int(msg.expl_result),
+        }
+
+    def publish_verification_result(self, seq, cluster_id, state):
+        """Answer a request (state 1 accept, -1 reject) or reopen a cluster (state 0)."""
+        msg = VerificationResult()
+        msg.seq = int(seq)
+        msg.cluster_id = int(cluster_id)
+        msg.state = int(state)
+        self.verification_result_pub.publish(msg)
 
     def publish_int32(self, publisher, data):
         msg = Int32()
@@ -183,6 +222,7 @@ def query_planner_fusion_config(node, timeout=5.0):
         "object.fusion_type",
         "object.min_observation_num",
         "object.use_observation",
+        "verification.enabled",
     ]
     try:
         client = AsyncParameterClient(node, "exploration_node")
