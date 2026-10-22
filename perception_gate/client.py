@@ -32,8 +32,10 @@ def _call(url, path, payload=None, timeout=10.0):
 def ping(url, timeout=10.0):
     """The server's /health; raises when it is down or speaks another protocol."""
     reply = _call(url, "/health", timeout=timeout)
-    if not reply.get("ok") or reply.get("protocol") != PROTOCOL:
+    if reply.get("protocol") != PROTOCOL:
         raise RuntimeError(f"perception server at {url}: protocol {reply.get('protocol')} != {PROTOCOL}")
+    if not reply.get("ok"):
+        raise RuntimeError(f"perception server at {url}: model worker died {reply.get('workers')}")
     return reply
 
 

@@ -15,10 +15,12 @@ for the planner: 1 accepted, -1 rejected. A request with ``cluster_id`` -1 is
 the stop backstop asking about a position that no cluster covers (e.g. an
 over-depth target); it is verified from the evidence nearest that position.
 
-Verdicts are cached by evidence view: a cluster whose best view was already
-judged reuses that verdict without a server call, and a new cluster within
-``match_distance_m`` of a rejected one inherits the rejection (with its check
-count and cooldown), so a re-spawned cluster cannot slip through.
+Verdicts are cached by evidence view (step, index): a cluster whose selected
+view was already judged (a re-spawn of a judged cluster) reuses that verdict
+without a server call. A distinct nearby object is judged on its own views: a
+view closer to another cluster (as clusters stood at that step) is not
+evidence for this one, and ties prefer the nearest view. ``at_stop`` requests
+match evidence to the stop position the planner sends.
 
 Failure policy (fail open by default): a server error or timeout applies
 ``on_error``, a cluster without a stored view ``on_no_evidence``; both are
@@ -37,7 +39,6 @@ settings, camera intrinsics and the semantic-instance ground truth) and, with
 ``save_images``, ``<log_dir>/epi<run>_<label>/c<id>_s<step>/{input.jpg, mask.png,
 view.png, decision.json}``.
 """
-import copy
 import json
 import math
 import os
@@ -126,7 +127,7 @@ class VerificationGate:
                                       self.cfg["max_evidence"])
         self.clusters, self.verdicts, self.events = {}, {}, []
         self.counts = {"requests": 0, "accepted": 0, "rejected": 0, "errors": 0, "no_evidence": 0,
-                       "cached": 0, "inherited": 0, "reopened": 0}
+                       "cached": 0, "reopened": 0}
 
     def finish_episode(self):
         """Per-episode counts (None when the gate is off)."""
@@ -178,10 +179,18 @@ class VerificationGate:
                    or math.degrees(_angle_between(bearing, u["bearing"])) >= self.cfg["recheck_min_angle_deg"]
                    for u in used)
 
-    def _reference(self, item, cluster_id, centroid):
+    def _reference(self, item, cluster_id, centroid, by_position=False):
         """Where ``item`` should be for ``cluster_id``: the cluster's centroid at the item's step
-        (clusters drift as they grow), else ``centroid``. Position requests (-1) use ``centroid``."""
-        return item["clusters"].get(cluster_id, centroid) if cluster_id >= 0 else centroid
+        (clusters drift as they grow), else ``centroid``. Position requests (-1, at_stop) use
+        ``centroid``."""
+        if cluster_id < 0 or by_position:
+            return centroid
+        return item["clusters"].get(cluster_id, centroid)
+
+    def _closer_to_other(self, item, cluster_id, distance):
+        """True when another cluster (as of the item's step) is nearer the item than ``distance``."""
+        return any(other != cluster_id and _distance(item["centroid"], c) < distance
+                   for other, c in item["clusters"].items())
 
     def _reopen(self, step, new, snapshot):
         reopened = []
@@ -199,37 +208,30 @@ class VerificationGate:
                 print(f"[verification] cluster {cluster_id} reopened at step {step} (new view)")
         return reopened
 
-    def select_evidence(self, cluster_id, centroid):
-        """(evidence, match distance) for a cluster (or a position, ``cluster_id`` -1): the
-        most readable view within ``match_distance_m``, else the nearest within twice that,
-        else (None, None). A re-check prefers views that are new by the re-check rule."""
+    def select_evidence(self, cluster_id, centroid, by_position=False):
+        """(evidence, match distance) for a cluster (or a position: ``cluster_id`` -1 or
+        ``by_position``): the most readable view within ``match_distance_m`` (ties: nearest),
+        else the nearest within twice that, else (None, None). Views nearer another cluster do
+        not count for a cluster. A re-check prefers views that are new by the re-check rule."""
         used = self.clusters.get(cluster_id, {}).get("used", [])
         pool = list(self.evidence)
         if used:
             pool = [e for e in pool if self._novel(e, used)] or pool
 
         def distance(item):
-            return _distance(item["centroid"], self._reference(item, cluster_id, centroid))
+            return _distance(item["centroid"], self._reference(item, cluster_id, centroid, by_position))
 
+        if cluster_id >= 0 and not by_position:
+            pool = [e for e in pool if not self._closer_to_other(e, cluster_id, distance(e))]
         matched = [e for e in pool if distance(e) <= self.cfg["match_distance_m"]]
         if matched:
-            best = max(matched, key=lambda e: e["quality"])
+            best = max(matched, key=lambda e: (e["quality"], -distance(e)))
             return best, distance(best)
         near = [e for e in pool if distance(e) <= 2 * self.cfg["match_distance_m"]]
         if near:
             best = min(near, key=distance)
             return best, distance(best)
         return None, None
-
-    def _rejected_neighbour(self, cluster_id, centroid, fusion):
-        """A rejected cluster within ``match_distance_m`` of ``centroid`` (a re-spawn of it)."""
-        snapshot = {int(c["id"]): tuple(c["centroid"]) for c in (fusion or {}).get("clusters", [])}
-        for other, state in self.clusters.items():
-            if other == cluster_id or state["state"] != REJECTED:
-                continue
-            if _distance(snapshot.get(other, state["centroid"]), centroid) <= self.cfg["match_distance_m"]:
-                return other
-        return None
 
     # ------------------------------------------------------------------
     # Verification
@@ -256,24 +258,16 @@ class VerificationGate:
 
         # Position requests (stop backstop, no cluster) carry no per-cluster state.
         state = None
+        at_stop = bool(request.get("at_stop", False))
         if cluster_id >= 0:
             state = self.clusters.get(cluster_id)
-            neighbour = self._rejected_neighbour(cluster_id, centroid, fusion) if state is None else None
-            if neighbour is not None:
-                # A re-spawn of a rejected cluster: same rejection, check count and cooldown.
-                inherited = self.clusters[cluster_id] = copy.deepcopy(self.clusters[neighbour])
-                inherited["centroid"] = centroid
-                record.update(source=f"inherited from cluster {neighbour}", policy="respawn")
-                record["cluster"]["check"] = inherited["checks"]
-                self.counts["inherited"] += 1
-                return self._decide(record, REJECTED, None, None, None)
             if state is None:
                 state = self.clusters[cluster_id] = {"state": UNVERIFIED, "checks": 0, "last_step": int(step),
                                                      "used": [], "centroid": centroid}
             state.update(checks=state["checks"] + 1, last_step=int(step), centroid=centroid)
             record["cluster"]["check"] = state["checks"]
 
-        evidence, match = self.select_evidence(cluster_id, centroid)
+        evidence, match = self.select_evidence(cluster_id, centroid, by_position=at_stop)
         if evidence is None:
             self.counts["no_evidence"] += 1
             record["policy"] = f"on_no_evidence={self.cfg['on_no_evidence']}"

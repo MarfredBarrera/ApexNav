@@ -246,8 +246,12 @@ void ExplorationFSM::requestVerification(int cluster_id, const Vector2d& pos, bo
   for (const auto& info : infos) {
     if (info.id != cluster_id)
       continue;
-    msg.centroid_x = static_cast<float>(info.average(0));
-    msg.centroid_y = static_cast<float>(info.average(1));
+    // At the stop, keep the stop position: Python matches evidence to where the
+    // agent is about to stop, not to the (possibly large) cluster's average
+    if (!at_stop) {
+      msg.centroid_x = static_cast<float>(info.average(0));
+      msg.centroid_y = static_cast<float>(info.average(1));
+    }
     msg.confidence = static_cast<float>(info.confidence);
     msg.observation_num = info.observation_num;
   }

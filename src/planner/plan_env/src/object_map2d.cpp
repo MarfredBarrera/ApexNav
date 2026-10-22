@@ -750,7 +750,9 @@ int ObjectMap2D::nearestCluster(const Vector2d& pos, double max_dist) const
   int best = -1;
   double best_dist = max_dist;
   for (const auto& object : objects_) {
-    if (object.verification_ == -1)
+    // Rejected clusters, and clusters never seen as the target class, cannot
+    // stand for a target stop
+    if (object.verification_ == -1 || object.confidence_scores_[0] <= 0.0)
       continue;
     for (const auto& cell : object.cells_) {
       double dist = (cell - pos).norm();

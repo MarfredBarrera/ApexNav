@@ -141,7 +141,8 @@ public:
   // Perception gate. With it on, the extreme "others" cloud (all clusters,
   // mostly other classes) is never a target
   void setVerificationEnabled(bool enabled) { verification_enabled_ = enabled; }
-  // Nearest non-rejected cluster with a cell within max_dist of pos, else -1
+  // Nearest non-rejected cluster with target-label confidence > 0 and a cell
+  // within max_dist of pos, else -1
   int nearestCluster(const Vector2d& pos, double max_dist) const;
   // Positions verified without a cluster (stop backstop): accepted ones need no
   // second check, rejected ones are cut out of over-depth target clouds

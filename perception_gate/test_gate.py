@@ -134,20 +134,38 @@ class GateTests(unittest.TestCase):
         self.assertLessEqual(len(self.gate.evidence), 40)  # one per cell at worst, never zero
         self.assertEqual(len(self.gate.evidence.cells), 40)
 
-    def test_cached_and_inherited_verdicts(self):
+    def test_nearby_object_gets_its_own_check(self):
+        # Reviewer repro: a real chair B 0.6 m from a rejected false positive A
         self.observe(1, 16, (2.0, 0.0))
-        self.assertEqual(self.gate.handle(request(cluster_id=3), step=2), REJECTED)
-        # A re-spawned cluster at the same place inherits the rejection (no server call)
-        self.assertEqual(self.gate.handle(request(cluster_id=8, centroid=(2.3, 0.1), seq=2), step=3), REJECTED)
-        self.assertEqual(self.gate.clusters[8]["checks"], 1)
-        # A different cluster whose best view was already judged reuses that verdict
-        self.gate.clusters[3]["state"] = UNVERIFIED  # (e.g. reopened) so nothing is inherited
-        del self.gate.clusters[8]
+        self.assertEqual(self.gate.handle(request(cluster_id=3), step=1), REJECTED)
+        self.observe(5, 16, (2.6, 0.0))
         self.accept = True
-        self.assertEqual(self.gate.handle(request(cluster_id=11, centroid=(2.6, 0.0), seq=3), step=4), REJECTED)
-        self.assertEqual(len(self.calls), 1)
-        counts = self.gate.finish_episode()
-        self.assertEqual((counts["inherited"], counts["cached"]), (1, 1))
+        self.assertEqual(self.gate.handle(request(cluster_id=4, centroid=(2.6, 0.0), seq=2), step=5), 1)
+        self.assertEqual(len(self.calls), 2)
+        self.assertEqual(self.gate.clusters[4]["used"][0]["camera"], (0.0, 0.0))
+        self.assertEqual(self.gate.clusters[4]["checks"], 1)
+
+    def test_view_nearer_another_cluster_is_not_evidence(self):
+        fusion = {"clusters": [{"id": 3, "centroid": [2.0, 0.0]}]}
+        self.observe(1, 30, (2.0, 0.0), fusion=fusion)  # most readable, but A's
+        self.observe(2, 8, (2.6, 0.0), fusion=fusion)
+        evidence, _ = self.gate.select_evidence(4, (2.6, 0.0))
+        self.assertEqual(evidence["step"], 2)
+
+    def test_cached_verdict_for_respawn(self):
+        self.observe(1, 16, (2.0, 0.0))
+        self.assertEqual(self.gate.handle(request(cluster_id=3), step=1), REJECTED)
+        # A re-spawned cluster at the same place selects the same view: cached, no call
+        self.accept = True
+        self.assertEqual(self.gate.handle(request(cluster_id=8, centroid=(2.1, 0.0), seq=2), step=3), REJECTED)
+        self.assertEqual((len(self.calls), self.gate.finish_episode()["cached"]), (1, 1))
+
+    def test_at_stop_matches_the_stop_position(self):
+        # The cluster's centroid (as of the view) is far from the stop; the stop position decides
+        self.observe(1, 16, (6.0, 0.0), fusion={"clusters": [{"id": 5, "centroid": [3.0, 0.0]}]})
+        self.accept = True
+        self.assertEqual(self.gate.handle(request(cluster_id=5, centroid=(6.1, 0.0), at_stop=True), step=2), 1)
+        self.assertEqual((len(self.calls), self.gate.finish_episode()["no_evidence"]), (1, 0))
 
     def test_position_request(self):
         self.observe(1, 16, (4.0, 4.0))
