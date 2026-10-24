@@ -1,0 +1,37 @@
+# A recorded EpisodeRecorder directory. Set this before running
+# `python -m verification.main`, or provide the directory as a positional CLI argument.
+episode_dir: null
+
+# A SAM 3 text prompt. Leave null to use meta.json's recorded target_label.
+query: null
+
+# Directory collecting review runs. Each episode gets its own subdirectory
+# named after its record, so verifying several episodes builds a collection
+# instead of overwriting one GIF:
+#   verification/outputs/<record_dir_name>/sam3_verification_<query>.gif
+# Leave null to write <episode_dir>/sam3_verification_<query>.gif instead. A
+# path ending in .gif keeps that filename and uses its parent as the directory.
+# A relative path resolves against the repository root. Keep it relative: in
+# Docker the repo is bind-mounted at /workspace/ApexNav, so an absolute host
+# path like /home/<user>/codes/ApexNav/... writes into the container's own
+# filesystem instead and never appears on the host.
+output: verification/outputs
+
+# SAM 3 inference settings.
+device: cuda
+# SAM 3 only recognizes the generic "cuda" string. ObjectDetector uses
+# torch.cuda.set_device(gpu_id) before SAM 3 loads, selecting the GPU below.
+gpu_id: 0
+checkpoint_path: null
+# SAM 3's decoder always emits 200 object queries. This is the score below
+# which a query is discarded; 0.5 is SAM 3's own default. Setting it to 0
+# disables filtering entirely and every query is reported as an instance.
+confidence_threshold: 0.5
+# Hard cap on instances kept per frame, after thresholding and score sorting.
+# Keeps a review GIF legible when the threshold is lowered to inspect
+# marginal detections. null keeps every instance above the threshold.
+max_instances: 10
+
+# GIF settings. max_frames: null analyzes every recorded RGB frame.
+fps: 4.0
+max_frames: null

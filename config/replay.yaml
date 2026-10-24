@@ -46,10 +46,14 @@ visualization:
     fps: 2
     filename: "episode.mp4"
   decision_frame:
-    # Save the first target decision frame for false-positive records.
+    # Two-panel review of the committed target - the goal, the frame that best
+    # shows the committed mask, and a zoom of it - for false-positive records.
     save: true
     only_false_positive: true
     filename: "decision_frame.jpg"
+    # The same camera frame with no overlay and no text, saved alongside.
+    # Set to "" or null to skip it.
+    raw_filename: "decision_frame_raw.jpg"
   confidence_plot:
     # Fused confidence for the cluster selected at the first target commitment.
     save: true

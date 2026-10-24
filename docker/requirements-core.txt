@@ -51,6 +51,22 @@ flask==3.0.3
 ollama
 openai>=1.58.1
 
+# --- SAM 3 --------------------------------------------------------------------
+# SAM 3 itself is cloned at the pinned commit in the Dockerfile.  Its package
+# metadata omits torch/torchvision, which are installed from the CUDA wheel index
+# earlier in the image; the rest of its runtime dependencies live here.
+#
+# `timm==0.4.12` is intentionally confined to Env B for lavis.  SAM 3 requires
+# timm>=1.0.17 and runs only in this Python 3.12 core environment.
+timm>=1.0.17
+ftfy==6.1.1
+regex
+iopath>=0.1.10
+einops
+pycocotools
+typing_extensions
+huggingface_hub
+
 # --- ROS 2 side ---------------------------------------------------------------
 # habitat2ros/habitat_publisher.py uses tf_transformations (the ROS2 port's
 # replacement for ROS1's tf.transformations). The README says

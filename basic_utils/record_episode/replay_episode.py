@@ -342,11 +342,18 @@ def replay(record_dir, cfg):
     # Pitch is not observable from habitat's observations, so it comes from the
     # recording, which tracked it across look_up / look_down actions
     pitch_by_step = {int(e["step"]): float(e.get("camera_pitch") or 0.0) for e in steps}
-    decision_step = None
+    decision_frame_steps = set()
     if decision_save:
-        from basic_utils.record_episode.episode_visualization import find_target_decision_step
+        from basic_utils.record_episode.episode_visualization import find_commit_evidence
 
-        decision_step = find_target_decision_step(steps)
+        # The review panel is rendered from the frame that best shows the
+        # committed mask, which is usually well before the commit step, so both
+        # have to survive a strided replay.
+        commit_evidence = find_commit_evidence(record_dir, steps)
+        if commit_evidence:
+            decision_frame_steps = {
+                int(commit_evidence["commit_step"]), int(commit_evidence["step"])
+            }
 
     poses = [agent_world_pose(observations)]
     max_error = 0.0
@@ -387,7 +394,7 @@ def replay(record_dir, cfg):
         # A plain `continue` here would skip the episode_over check below, so
         # gate the writes instead of the loop body
         want_artifacts = entry["step"] % step_stride == 0
-        want_decision_frame = decision_step is not None and entry["step"] == decision_step
+        want_decision_frame = entry["step"] in decision_frame_steps
 
         if save_rgb and (want_artifacts or want_decision_frame):
             import cv2
@@ -511,14 +518,30 @@ def replay(record_dir, cfg):
         decision_output = os.path.join(
             out_root, str(cfg.visualization.decision_frame.filename)
         )
+        raw_name = cfg.visualization.decision_frame.get("raw_filename", None)
+        raw_output = os.path.join(out_root, str(raw_name)) if raw_name else None
         decision_result = create_decision_frame(
-            record_dir, save_rgb or os.path.join(out_root, "rgb"), decision_output, steps=steps
+            record_dir,
+            save_rgb or os.path.join(out_root, "rgb"),
+            decision_output,
+            steps=steps,
+            raw_output_path=raw_output,
         )
         if decision_result:
-            _, saved_step = decision_result
-            print(f"Wrote target decision frame: {decision_output} (step {saved_step})")
+            _, evidence = decision_result
+            print(
+                "Wrote committed-target review frame: {path} (commit step {commit}, "
+                "mask from step {step}, linked by {how})".format(
+                    path=decision_output,
+                    commit=evidence["commit_step"],
+                    step=evidence["step"],
+                    how=evidence["matched_by"],
+                )
+            )
+            if evidence.get("raw_path"):
+                print(f"Wrote unannotated decision frame: {evidence['raw_path']}")
         else:
-            print("No target decision signal recorded; decision frame not written")
+            print("No target commitment recorded; decision frame not written")
 
     if bool(cfg.visualization.confidence_plot.save):
         from basic_utils.record_episode.episode_visualization import create_commit_confidence_plot

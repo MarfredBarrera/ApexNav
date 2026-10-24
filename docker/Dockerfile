@@ -113,7 +113,26 @@ COPY requirements-core.txt /tmp/requirements-core.txt
 RUN ${APEX_CORE_VENV}/bin/pip install --no-cache-dir -r /tmp/requirements-core.txt
 
 # ---------------------------------------------------------------------------
-# 5. habitat-sim from source (the long one, ~30 min)
+# 5. SAM 3 (Segment Anything Model 3)
+# ---------------------------------------------------------------------------
+# SAM 3 runs inline in Env A alongside ROS 2 and Habitat.  Keep the source in
+# the image rather than the bind-mounted workspace, then install it normally
+# (not editable) so the runtime does not depend on a checkout in the project.
+#
+# The short SHA is a pinned upstream commit, not the moving `main` branch.  Bump
+# it deliberately together with any checkpoint/API changes.  SAM 3's optional
+# flash-attn-3 and cc_torch accelerators are intentionally omitted: base CUDA
+# PyTorch inference works without them, while those extensions need a separate
+# compatibility decision for the project's Torch/CUDA pair.
+ARG SAM3_COMMIT=96914d2
+RUN git clone https://github.com/facebookresearch/sam3.git /opt/sam3 \
+ && cd /opt/sam3 \
+ && git checkout --detach ${SAM3_COMMIT} \
+ && ${APEX_CORE_VENV}/bin/pip install --no-cache-dir --no-deps . \
+ && rm -rf /opt/sam3/.git
+
+# ---------------------------------------------------------------------------
+# 6. habitat-sim from source (the long one, ~30 min)
 # ---------------------------------------------------------------------------
 # v0.3.4 moved to scikit-build-core, so the README's and issue #36's
 # `python setup.py install --headless --bullet` no longer works - setup.py is now a
@@ -129,7 +148,7 @@ RUN git clone --branch ${HABITAT_SIM_TAG} --depth 1 --recursive \
  && rm -rf /opt/habitat-sim/build /opt/habitat-sim/.git
 
 # ---------------------------------------------------------------------------
-# 6. habitat-lab
+# 7. habitat-lab
 # ---------------------------------------------------------------------------
 ARG HABITAT_LAB_TAG=v0.3.4
 RUN git clone --branch ${HABITAT_LAB_TAG} --depth 1 \
@@ -138,7 +157,7 @@ RUN git clone --branch ${HABITAT_LAB_TAG} --depth 1 \
  && ${APEX_CORE_VENV}/bin/pip install --no-cache-dir -e /opt/habitat-lab/habitat-baselines
 
 # ---------------------------------------------------------------------------
-# 7. Env B - conda python 3.9 for the VLM servers
+# 8. Env B - conda python 3.9 for the VLM servers
 # ---------------------------------------------------------------------------
 # Miniforge, not the README's Miniconda: Miniconda's `defaults` channels now refuse
 # non-interactive use until Anaconda's Terms of Service are accepted
@@ -169,7 +188,7 @@ RUN ${APEX_VLM_ENV}/bin/pip install --no-cache-dir -r /tmp/requirements-vlm.txt
 RUN ${APEX_VLM_ENV}/bin/pip install --no-cache-dir --no-deps salesforce-lavis==1.0.2
 
 # ---------------------------------------------------------------------------
-# 8. External code checkouts (README section 1.3)
+# 9. External code checkouts (README section 1.3)
 # ---------------------------------------------------------------------------
 # Both are referenced by CWD-relative paths in the source
 # (sys.path.insert(0, "yolov7/") and "GroundingDINO/groundingdino/config/..."),
@@ -215,7 +234,7 @@ RUN echo "/opt/external/GroundingDINO" \
         > ${APEX_CORE_VENV}/lib/python3.12/site-packages/groundingdino_src.pth
 
 # ---------------------------------------------------------------------------
-# 9. ollama (optional LLM path; llm/answers ships pre-generated output)
+# 10. ollama (optional LLM path; llm/answers ships pre-generated output)
 # ---------------------------------------------------------------------------
 # Models land on the mounted data volume so the ~5 GB qwen3:8b stays out of the image.
 # zstd is installed here rather than with the other apt packages so this stays a late,
@@ -225,9 +244,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends zstd \
  && rm -rf /var/lib/apt/lists/* \
  && curl -fsSL https://ollama.com/install.sh | sh
 ENV OLLAMA_MODELS=/workspace/ApexNav/data/ollama
+# SAM 3 checkpoints are gated Hugging Face downloads.  Keeping their cache on
+# the mounted data volume makes authentication/checkpoints survive image rebuilds
+# without baking either into the image.
+ENV HF_HOME=/workspace/ApexNav/data/huggingface
 
 # ---------------------------------------------------------------------------
-# 10. User + shell environment
+# 11. User + shell environment
 # ---------------------------------------------------------------------------
 # Runs as container root by default, which is the correct choice under *rootless*
 # Docker (what this host uses): rootless maps container uid 0 to your host uid, so

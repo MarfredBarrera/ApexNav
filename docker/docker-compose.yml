@@ -26,6 +26,10 @@ services:
       EGL_PLATFORM: surfaceless
       ROS_DOMAIN_ID: "42"
       ROS_AUTOMATIC_DISCOVERY_RANGE: LOCALHOST
+      # Shared server: keep BLAS/OpenMP pools small.
+      OMP_NUM_THREADS: "${OMP_NUM_THREADS:-2}"
+      MKL_NUM_THREADS: "${MKL_NUM_THREADS:-2}"
+      OPENBLAS_NUM_THREADS: "${OPENBLAS_NUM_THREADS:-2}"
       # CUDA_VISIBLE_DEVICES is deliberately NOT set here: container env vars are fixed at
       # create time, so pinning a GPU here would need a --force-recreate to change. The
       # container sees every GPU (`gpus: all`) and each process picks its own device -
@@ -47,9 +51,21 @@ services:
 
     volumes:
       - ..:/workspace/ApexNav
-      - ${APEXNAV_DATA:-${HOME}/nas/apexnav_data}:/workspace/ApexNav/data
+      - ${APEXNAV_DATA:-/ICONAS/users/marfred/apexnav_data}:/workspace/ApexNav/data
 
     working_dir: /workspace/ApexNav
     stdin_open: true
     tty: true
     command: ["sleep", "infinity"]
+
+    networks:
+      - default
+      - verifier
+
+networks:
+  # The perception gate calls perception.server in the 3DAwareVerification container
+  # (http://3dawareverification-dev-1:8770), so join that compose project's network.
+  # Start it first: `docker compose up -d dev` in ~/codes/3DAwareVerification.
+  verifier:
+    name: 3dawareverification_default
+    external: true

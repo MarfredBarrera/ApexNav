@@ -127,10 +127,29 @@ MP4 uses baseline H.264 (`avc1`)/yuv420p for compatibility with Electron-based
 VS Code and web players. Its speed comes from `visualization.mp4.fps`; it is
 written as `episode.mp4` by default.
 
-For false-positive and last-mile-navigation-failure records, replay also saves the annotated target-decision
-frame separately as `decision_frame.jpg` beside the GIF and RGB directory. Set
+For false-positive and last-mile-navigation-failure records, replay also saves
+`decision_frame.jpg` beside the GIF and RGB directory: a two-panel review of the
+commitment, built to be judged at a glance. It states the goal in large type,
+shows the camera frame that best displays the mask of the committed cluster, and
+repeats that mask as a zoomed crop, so a mismatch between the goal and the object
+the planner drove to is visible without opening the record.
+
+The frame shown is normally *not* the step the FSM switched to SEARCH_OBJECT: the
+planner commits to a cluster fused from earlier views, so at that step the object
+is frequently off-camera and the frame carries no masks at all. Replay instead
+follows the commitment the episode was scored on (the last recorded
+`planner_commit`), walks the steps up to it, keeps the target detections whose
+world centroid matches that cluster, and renders the clearest of them - preferring
+large, unclipped masks over high scores on a handful of distant pixels. Records
+that stored no commit fall back to the clearest target detection at the point
+where the agent stopped, and the panel labels that weaker linkage. Set
 `visualization.decision_frame.only_false_positive=false` to save it for every
-record with a decision signal.
+record with a commitment.
+
+That same camera frame is also saved untouched - no overlay, no text - as
+`decision_frame_raw.jpg`, for write-ups or as input to another model. It is a
+byte copy of the replay RGB, not a re-encode. Clear
+`visualization.decision_frame.raw_filename` to skip it.
 
 Each replay also writes `committed_target_confidence.png`: the fused-confidence
 history of the specific cluster chosen at the first target commit. The green
@@ -337,7 +356,7 @@ Inside it there are two Python environments:
 | activate | `use_core` (default) | `use_vlm` |
 | path | `/opt/venv/apexnav` | `/opt/conda/envs/apexnav_vlm` |
 | python | 3.12 | 3.9 |
-| holds | ROS 2 Jazzy, habitat-sim 0.3.4, habitat-lab, CUDA torch | salesforce-lavis, GroundingDINO + CUDA ext, MobileSAM, YOLOv7 |
+| holds | ROS 2 Jazzy, habitat-sim 0.3.4, habitat-lab, SAM 3, CUDA torch | salesforce-lavis, GroundingDINO + CUDA ext, MobileSAM, YOLOv7 |
 | runs | `habitat_evaluation.py`, the C++ nodes, `foxglove_bridge` | the four `python -m vlm.*` servers |
 
 Both see the repo through `PYTHONPATH=/workspace/ApexNav` — the source tree is used
@@ -525,6 +544,27 @@ Rewriting `vlm/itm/blip2itm.py` against `transformers.Blip2ForImageTextRetrieval
 the same `Salesforce/blip2-itm-vit-g` checkpoint (~20 lines) collapses everything into
 one 3.12 env. Reproduce the paper's numbers first — that cosine score feeds the value
 map's thresholds.
+
+### SAM 3 in Env A
+
+SAM 3 is installed into Env A from the commit pinned by `SAM3_COMMIT` in
+`docker/Dockerfile`. Its source checkout lives at `/opt/sam3` inside the image, not in
+the bind-mounted ApexNav repository. The build deliberately omits SAM 3's optional
+`flash-attn-3` and `cc_torch` extensions; base CUDA PyTorch inference remains available
+without them.
+
+The image contains code only. Before loading a SAM 3 checkpoint, request access to the
+official Hugging Face repository, then authenticate in an Env A shell:
+
+```bash
+use_core
+hf auth login
+```
+
+`HF_HOME=/workspace/ApexNav/data/huggingface` keeps the token and downloaded checkpoints
+on the mounted data volume, outside the image. SAM 3 is not wired into the existing VLM
+HTTP servers yet; use it inline from the habitat/evaluation process or add a dedicated
+server when integrating it into detection fusion.
 
 ## Host specifics worth knowing
 

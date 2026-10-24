@@ -32,15 +32,16 @@ check() {  # label  command...
 }
 
 # ---------------------------------------------------------------------------
-section "Env A (python 3.12) - ROS 2 + Habitat in one interpreter"
+section "Env A (python 3.12) - ROS 2 + Habitat + SAM 3 in one interpreter"
 # ---------------------------------------------------------------------------
 # This is the check that matters most: upstream issue #36 is exactly the claim that
 # rclpy and habitat_sim cannot be imported together with the published packages.
 use_core
 check "python version" python -c "import sys; print('.'.join(map(str, sys.version_info[:3])))"
-check "rclpy + habitat_sim together" python -c "
-import rclpy, habitat_sim, habitat, numpy, torch
-print(f'habitat_sim={habitat_sim.__version__} numpy={numpy.__version__} torch={torch.__version__} cuda={torch.cuda.is_available()}')
+check "rclpy + habitat_sim + sam3 together" python -c "
+import rclpy, habitat_sim, habitat, numpy, sam3, torch
+from sam3.model_builder import build_sam3_image_model
+print(f'habitat_sim={habitat_sim.__version__} sam3={sam3.__version__} numpy={numpy.__version__} torch={torch.__version__} cuda={torch.cuda.is_available()}')
 "
 check "vlm client import chain" python -c "
 import vlm.utils.get_object_utils, vlm.utils.get_itm_message
