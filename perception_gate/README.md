@@ -131,9 +131,23 @@ SIM_GPU=0 ./scripts/run_gate_e2e.sh gate     0 1 2 3 4 5 6 7 8 9
 ```
 
 To repeat runs, set `OUT_ROOT=videos/gate_e2e_seed2` (any new folder) so earlier results aren't
-overwritten. Runs are not deterministic: under host load, two runs of the same episode can
-diverge before the first verification. Repeat each episode 2-3 times per mode before drawing
-conclusions.
+overwritten. In the original mode runs are not deterministic: under host load, two runs of the
+same episode can diverge before the first verification.
+
+**Deterministic runs (`sync_step`).** `SYNC_STEP=true ./scripts/run_gate_e2e.sh ...` launches the
+planner with `sync_step:=true` and runs `habitat_evaluation.py sync_step=true` (both must
+agree; the evaluator checks). Each executed step goes to the planner once, as one
+`plan_env/StepObservation` (step id, depth, camera pose, odom, ITM, object clouds, gate
+reopens; reliable QoS), integrated in a fixed order with a synchronous ESDF update; the FSM
+plans only after `/habitat/action_finish_step` k and step k is integrated, map and FSM
+callbacks share one MutuallyExclusive group, and actions come back as `StepAction` (step,
+fusion snapshot seq, FSM verdict). TSP waits without the 5 s cutoff, A* time budgets become
+node-expansion budgets (`ASTAR_EXPANSIONS_PER_S` in `algorithm.launch.py`, measured on the host
+in wall-clock mode), the planner is restarted per episode, and a gate error or timeout aborts
+instead of failing open. Two sync runs of the same episodes give identical steps.jsonl
+(`videos/sync_runs/compare_runs.py`). Not changed: the gate rules (section 7), detectors and
+planner decision rules. Sync and original mode are different map dynamics (no repeated
+integration), so compare strategies only within one mode.
 
 ## 5. Terminal 3 (optional): GPU guard
 
