@@ -52,7 +52,7 @@ def verification_params(context):
 # A* node expansions per second of planner wall time, measured on this host in the
 # original (wall-clock) mode; sync_step turns each A* time budget into this many
 # expansions per second of budget, so planning no longer depends on host load
-ASTAR_EXPANSIONS_PER_S = 1.0e6
+ASTAR_EXPANSIONS_PER_S = 4.0e5  # 398k measured 2026-10-25, 20 hm3dv2 episodes
 
 
 def sync_step_params(context):
