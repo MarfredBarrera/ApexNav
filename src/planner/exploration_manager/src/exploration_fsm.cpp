@@ -3,6 +3,8 @@
 #include <exploration_manager/exploration_fsm.h>
 #include <exploration_manager/exploration_data.h>
 #include <vis_utils/planning_visualization.h>
+#include <plan_env/map_ros.h>
+#include <cstdlib>
 
 using namespace std::chrono_literals;
 
@@ -29,6 +31,7 @@ void ExplorationFSM::init(rclcpp::Node::SharedPtr node)
   fp_->vis_scale_ = expl_manager_->sdf_map_->getResolution() * FSMConstants::VIS_SCALE_FACTOR;
 
   state_ = ROS_STATE::INIT;
+  awaited_step_ = 0;
 
   if (!first_init) {
     exec_timer_->reset();
@@ -46,30 +49,52 @@ void ExplorationFSM::init(rclcpp::Node::SharedPtr node)
   RCLCPP_INFO(node_->get_logger(), "[Verification] gate %s (timeout %.0f s)",
       verification_enabled_ ? "ON" : "off", verification_timeout_s_);
 
+  /* sync_step (declared by MapROS): map and FSM callbacks share one MutuallyExclusive
+     group, odometry comes with each StepObservation, actions carry their step id */
+  auto map_ros = expl_manager_->sdf_map_->mapROS();
+  sync_step_ = map_ros->syncStep();
+  rclcpp::CallbackGroup::SharedPtr group = sync_step_ ? map_ros->syncCallbackGroup() : nullptr;
+  rclcpp::SubscriptionOptions sub_options;
+  sub_options.callback_group = group;
+  RCLCPP_INFO(node_->get_logger(), "[sync_step] %s", sync_step_ ? "ON" : "off");
+
   /* ROS2 Timer */
   exec_timer_ = node_->create_wall_timer(
       std::chrono::duration<double>(FSMConstants::EXEC_TIMER_DURATION),
-      std::bind(&ExplorationFSM::FSMCallback, this));
+      std::bind(&ExplorationFSM::FSMCallback, this), group);
   frontier_timer_ = node_->create_wall_timer(
       std::chrono::duration<double>(FSMConstants::FRONTIER_TIMER_DURATION),
-      std::bind(&ExplorationFSM::frontierCallback, this));
+      std::bind(&ExplorationFSM::frontierCallback, this), group);
 
   /* ROS2 Subscriber */
   trigger_sub_ = node_->create_subscription<geometry_msgs::msg::PoseStamped>(
       "/move_base_simple/goal", 10,
-      std::bind(&ExplorationFSM::triggerCallback, this, std::placeholders::_1));
-  odom_sub_ = node_->create_subscription<nav_msgs::msg::Odometry>(
-      "/odom_world", 10,
-      std::bind(&ExplorationFSM::odometryCallback, this, std::placeholders::_1));
+      std::bind(&ExplorationFSM::triggerCallback, this, std::placeholders::_1), sub_options);
+  if (sync_step_) {
+    map_ros->setStepHook([this](const nav_msgs::msg::Odometry& odom, int) {
+      odometryCallback(std::make_shared<nav_msgs::msg::Odometry>(odom));
+    });
+    action_finish_step_sub_ = node_->create_subscription<std_msgs::msg::Int32>(
+        "/habitat/action_finish_step", rclcpp::QoS(rclcpp::KeepLast(10)).reliable(),
+        std::bind(&ExplorationFSM::actionFinishStepCallback, this, std::placeholders::_1),
+        sub_options);
+  }
+  else {
+    odom_sub_ = node_->create_subscription<nav_msgs::msg::Odometry>(
+        "/odom_world", 10,
+        std::bind(&ExplorationFSM::odometryCallback, this, std::placeholders::_1));
+  }
   habitat_state_sub_ = node_->create_subscription<std_msgs::msg::Int32>(
       "/habitat/state", 10,
-      std::bind(&ExplorationFSM::habitatStateCallback, this, std::placeholders::_1));
+      std::bind(&ExplorationFSM::habitatStateCallback, this, std::placeholders::_1), sub_options);
   confidence_threshold_sub_ = node_->create_subscription<std_msgs::msg::Float64>(
       "/detector/confidence_threshold", 10,
-      std::bind(&ExplorationFSM::confidenceThresholdCallback, this, std::placeholders::_1));
+      std::bind(&ExplorationFSM::confidenceThresholdCallback, this, std::placeholders::_1),
+      sub_options);
   verify_result_sub_ = node_->create_subscription<plan_env::msg::VerificationResult>(
       "/object/verification_result", 10,
-      std::bind(&ExplorationFSM::verificationResultCallback, this, std::placeholders::_1));
+      std::bind(&ExplorationFSM::verificationResultCallback, this, std::placeholders::_1),
+      sub_options);
 
   /* ROS2 Publisher */
   ros_state_pub_ = node_->create_publisher<std_msgs::msg::Int32>("/ros/state", 10);
@@ -81,6 +106,41 @@ void ExplorationFSM::init(rclcpp::Node::SharedPtr node)
   robot_marker_pub_ = node_->create_publisher<visualization_msgs::msg::Marker>("/robot", 10);
   verify_request_pub_ = node_->create_publisher<plan_env::msg::VerificationRequest>(
       "/object/verification_request", 10);
+  if (sync_step_)
+    step_action_pub_ = node_->create_publisher<plan_env::msg::StepAction>(
+        "/habitat/step_action", rclcpp::QoS(rclcpp::KeepLast(10)).reliable());
+}
+
+int ExplorationFSM::lastProcessedStep()
+{
+  return expl_manager_->sdf_map_->mapROS()->lastProcessedStep();
+}
+
+// The next action: an Int32 on /habitat/plan_action, or in sync_step mode a StepAction
+// tagged with the step it was planned from and the fusion snapshot published before it
+void ExplorationFSM::publishAction(int action)
+{
+  if (!sync_step_) {
+    std_msgs::msg::Int32 action_msg;
+    action_msg.data = action;
+    action_pub_->publish(action_msg);
+    return;
+  }
+  plan_env::msg::StepAction msg;
+  msg.action = action;
+  msg.step = lastProcessedStep();
+  msg.fusion_seq = object_fusion_seq_;
+  msg.final_state = fd_->final_result_;
+  msg.expl_result = fd_->last_expl_result_;
+  step_action_pub_->publish(msg);
+}
+
+void ExplorationFSM::actionFinishStepCallback(const std_msgs::msg::Int32::SharedPtr msg)
+{
+  if (state_ != ROS_STATE::WAIT_ACTION_FINISH)
+    return;
+  awaited_step_ = msg->data;
+  transitState(PLAN_ACTION, "Habitat Finish Action (sync)");
 }
 
 // FSM between ROS and Habitat for action planning and execution
@@ -90,6 +150,11 @@ void ExplorationFSM::FSMCallback()
   std_msgs::msg::Int32 ros_state_msg;
   ros_state_msg.data = state_;
   ros_state_pub_->publish(ros_state_msg);
+  // sync_step: plan only from a map that has integrated the step just finished
+  if (sync_step_ && state_ == ROS_STATE::PLAN_ACTION && lastProcessedStep() < awaited_step_) {
+    exec_timer_->reset();
+    return;
+  }
   switch (state_) {
     case ROS_STATE::INIT: {
       // Wait for odometry and target confidence threshold
@@ -115,9 +180,7 @@ void ExplorationFSM::FSMCallback()
       if (!fd_->have_finished_) {
         fd_->have_finished_ = true;
         clearVisMarker();
-        std_msgs::msg::Int32 action_msg;
-        action_msg.data = ACTION::STOP;
-        action_pub_->publish(action_msg);
+        publishAction(ACTION::STOP);
       }
       RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000, "Finish One Episode!!!");
       break;
@@ -167,9 +230,7 @@ void ExplorationFSM::FSMCallback()
     }
 
     case ROS_STATE::PUB_ACTION: {
-      std_msgs::msg::Int32 action_msg;
-      action_msg.data = fd_->newest_action_;
-      action_pub_->publish(action_msg);
+      publishAction(fd_->newest_action_);
       transitState(ROS_STATE::WAIT_ACTION_FINISH, "FSM");
       break;
     }
@@ -183,8 +244,16 @@ void ExplorationFSM::FSMCallback()
       // Nothing is published and the simulator does not step until the
       // verdict arrives (verificationResultCallback). Fail open on timeout
       double waited = node_->get_clock()->now().seconds() - fd_->verify_start_;
-      if (waited > verification_timeout_s_)
+      if (waited > verification_timeout_s_) {
+        // sync_step: timing must never decide a verdict, so no fail-open here
+        if (sync_step_) {
+          RCLCPP_FATAL(node_->get_logger(),
+              "[sync_step] no verdict within %.0f s: aborting instead of failing open",
+              verification_timeout_s_);
+          std::exit(1);
+        }
         finishVerification(1, true);
+      }
       break;
     }
   }
@@ -237,6 +306,7 @@ void ExplorationFSM::requestVerification(int cluster_id, const Vector2d& pos, bo
   msg.cluster_id = cluster_id;
   msg.expl_result = fd_->last_expl_result_;
   msg.at_stop = at_stop;
+  msg.fusion_seq = object_fusion_seq_;
   msg.centroid_x = static_cast<float>(pos(0));
   msg.centroid_y = static_cast<float>(pos(1));
   vector<ObjectConfidenceInfo> infos;
@@ -828,7 +898,9 @@ void ExplorationFSM::publishObjectFusionState()
 // Receive Habitat state messages
 void ExplorationFSM::habitatStateCallback(const std_msgs::msg::Int32::SharedPtr msg)
 {
-  if (msg->data == HABITAT_STATE::ACTION_FINISH && state_ == ROS_STATE::WAIT_ACTION_FINISH)
+  // sync_step: ACTION_FINISH comes with its step id on /habitat/action_finish_step
+  if (!sync_step_ && msg->data == HABITAT_STATE::ACTION_FINISH &&
+      state_ == ROS_STATE::WAIT_ACTION_FINISH)
     transitState(PLAN_ACTION, "Habitat Finish Action");
   if (msg->data == HABITAT_STATE::EPISODE_FINISH)
     init(node_);
@@ -838,6 +910,9 @@ void ExplorationFSM::habitatStateCallback(const std_msgs::msg::Int32::SharedPtr 
 // Periodically update frontiers and visualize in idle states
 void ExplorationFSM::frontierCallback()
 {
+  // sync_step: frontier updates only happen while planning, a fixed number of times
+  if (sync_step_)
+    return;
   if (state_ != ROS_STATE::WAIT_TRIGGER && state_ != ROS_STATE::FINISH)
     return;
 

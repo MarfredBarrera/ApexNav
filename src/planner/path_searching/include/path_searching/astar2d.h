@@ -45,6 +45,9 @@ public:
   void reset();
   int astarSearch(const Eigen::Vector2d& start_pt, const Eigen::Vector2d& end_pt,
       double success_dist = 0.1, double max_time = 0.01, int safety_mode = SAFETY_MODE::NORMAL);
+  // sync_step: replace the wall-clock budget max_time by max_time * expansions_per_s node
+  // expansions, so the search result never depends on host load (0 = wall clock)
+  double expansions_per_s_ = 0.0;
   void setResolution(const double& res);
   static double pathLength(const std::vector<Eigen::Vector2d>& path);
   std::vector<Eigen::Vector2d> generateSteps(Eigen::Vector2d pos);
@@ -56,6 +59,13 @@ public:
   double lambda_heu_;
 
 private:
+  int astarSearchImpl(const Eigen::Vector2d& start_pt, const Eigen::Vector2d& end_pt,
+      double success_dist, double max_time, int safety_mode);
+  rclcpp::Node::SharedPtr node_;
+  // Wall-clock mode: measured expansion rate (logged, to calibrate expansions_per_s_)
+  double stat_time_ = 0.0;
+  long stat_iters_ = 0;
+  long stat_searches_ = 0;
   void backtrack(const Node2DPtr& end_node, const Eigen::Vector2d& end);
   void posToIndex(const Eigen::Vector2d& pt, Eigen::Vector2i& idx);
   double getDiagHeu(const Eigen::Vector2d& x1, const Eigen::Vector2d& x2);

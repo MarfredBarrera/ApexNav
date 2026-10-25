@@ -15,6 +15,7 @@
 #include <path_searching/kino_astar.h>
 #include <trajectory_manager/optimizer.h>
 #include <cmath>
+#include <cstdlib>
 
 using namespace Eigen;
 
@@ -62,6 +63,10 @@ void ExplorationManager::initialize(rclcpp::Node::SharedPtr node)
   ep_->max_to_mean_threshold_ = node_->get_parameter("exploration/max_to_mean_threshold").as_double();
   ep_->max_to_mean_percentage_ = node_->get_parameter("exploration/max_to_mean_percentage").as_double();
   ep_->tsp_dir_ = node_->get_parameter("exploration/tsp_dir").as_string();
+  if (!node_->has_parameter("sync_step")) {
+    node_->declare_parameter("sync_step", false);
+  }
+  sync_step_ = node_->get_parameter("sync_step").as_bool();
 
   // Get map parameters for ray casting initialization
   double resolution = sdf_map_->getResolution();
@@ -506,10 +511,20 @@ void ExplorationManager::computeATSPTour(
   auto request = std::make_shared<lkh_mtsp_solver::srv::SolveMTSP::Request>();
   request->prob = 1;
 
+  // sync_step: no wall-clock cutoff (a 5 s expiry under host load would change the plan);
+  // a solver that is gone or hangs for 10 min is a real failure and aborts the run
+  if (sync_step_ && !tsp_client_->wait_for_service(std::chrono::seconds(60))) {
+    RCLCPP_FATAL(node_->get_logger(), "[sync_step] /solve_tsp unavailable: aborting");
+    std::exit(1);
+  }
   auto result = tsp_client_->async_send_request(request);
   // Wait for service response without re-spinning the node (avoids executor conflict)
-  auto status = result.wait_for(std::chrono::seconds(5));
+  auto status = result.wait_for(std::chrono::seconds(sync_step_ ? 600 : 5));
   if (status != std::future_status::ready) {
+    if (sync_step_) {
+      RCLCPP_FATAL(node_->get_logger(), "[sync_step] ATSP solver gave no answer in 600 s: aborting");
+      std::exit(1);
+    }
     RCLCPP_ERROR(node_->get_logger(), "Fail to solve ATSP.");
     return;
   }

@@ -15,3 +15,4 @@ float32 confidence         # fused confidence for label 0 (the target class)
 int32 observation_num      # frames the target class was observed in
 int32 expl_result          # EXPL_RESULT that selected the cluster
 bool at_stop               # sent by the stop backstop (REACH_OBJECT)
+uint32 fusion_seq          # ObjectFusionState.update_seq published before this request (sync_step)

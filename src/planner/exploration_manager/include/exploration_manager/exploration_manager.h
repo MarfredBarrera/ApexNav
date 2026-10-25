@@ -137,6 +137,7 @@ private:
   vector<Vector2i> allNeighbors(const Eigen::Vector2i& idx, int grid_radius);
 
   rclcpp::Client<lkh_mtsp_solver::srv::SolveMTSP>::SharedPtr tsp_client_;  ///< ROS2 service client for TSP solver
+  bool sync_step_ = false;  ///< sync_step: TSP waits without the 5 s cutoff
   rclcpp::CallbackGroup::SharedPtr tsp_cb_group_;  ///< Separate callback group for TSP client
   unique_ptr<RayCaster2D> ray_caster2d_;  ///< Ray casting for collision checking
 };

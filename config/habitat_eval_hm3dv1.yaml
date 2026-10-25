@@ -111,6 +111,10 @@ verification:
 need_video: false
 video_output_path: "videos/test_hm3dv1_{split}"
 test_epi_num: -1
+# Deterministic simulator-planner step (launch the planner with sync_step:=true too):
+# one StepObservation per executed step, no republishing while waiting
+sync_step: false
+sync_stall_timeout_s: 600     # sync_step: abort when the planner sends no action this long
 
 
 # Video rendering

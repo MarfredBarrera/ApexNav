@@ -22,6 +22,7 @@
 #include <plan_env/msg/object_fusion_state.hpp>
 #include <plan_env/msg/verification_request.hpp>
 #include <plan_env/msg/verification_result.hpp>
+#include <plan_env/msg/step_action.hpp>
 
 using Eigen::Vector2d;
 using Eigen::Vector3d;
@@ -111,6 +112,15 @@ private:
   rclcpp::Publisher<plan_env::msg::VerificationRequest>::SharedPtr verify_request_pub_;
   rclcpp::Subscription<plan_env::msg::VerificationResult>::SharedPtr verify_result_sub_;
   rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr robot_marker_pub_;
+
+  /* sync_step: plan step k only once ACTION_FINISH(k) arrived and the map processed step k */
+  bool sync_step_ = false;
+  int awaited_step_ = 0;  // step id of the latest ACTION_FINISH (0: the reset observation)
+  rclcpp::Publisher<plan_env::msg::StepAction>::SharedPtr step_action_pub_;
+  rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr action_finish_step_sub_;
+  void actionFinishStepCallback(const std_msgs::msg::Int32::SharedPtr msg);
+  void publishAction(int action);
+  int lastProcessedStep();
 
   /* Action Planner */
   int callActionPlanner();

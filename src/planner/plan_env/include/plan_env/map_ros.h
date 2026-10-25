@@ -10,6 +10,7 @@
 
 // Custom messages and mapping components
 #include <plan_env/msg/multiple_masks_with_confidence.hpp>
+#include <plan_env/msg/step_observation.hpp>
 #include <plan_env/sdf_map2d.h>
 #include <plan_env/object_map2d.h>
 #include <plan_env/value_map2d.h>
@@ -42,6 +43,7 @@
 #include <pcl/search/impl/search.hpp>
 #include <pcl/filters/conditional_removal.h>
 #include <unordered_set>
+#include <functional>
 
 // Type aliases for convenience
 using std::shared_ptr;
@@ -63,6 +65,17 @@ public:
   void init();
   void reset();
 
+  // sync_step mode (one StepObservation per executed step, see StepObservation.msg)
+  bool syncStep() const { return sync_step_; }
+  int lastProcessedStep() const { return last_processed_step_; }
+  // Callback group shared by the map and the FSM in sync_step mode (MutuallyExclusive)
+  rclcpp::CallbackGroup::SharedPtr syncCallbackGroup() const { return sync_cb_group_; }
+  // Called at the end of every processed StepObservation (odometry, step id)
+  void setStepHook(std::function<void(const nav_msgs::msg::Odometry&, int)> hook)
+  {
+    step_hook_ = std::move(hook);
+  }
+
 private:
   // ROS2 callback functions
   void depthPoseCallback(  ///< Process synchronized depth image and pose data
@@ -70,6 +83,9 @@ private:
       const nav_msgs::msg::Odometry::ConstSharedPtr& pose);
   void updateESDFCallback();
   void detectedObjectCloudCallback(const plan_env::msg::MultipleMasksWithConfidence::SharedPtr msg);
+  void stepObservationCallback(const plan_env::msg::StepObservation::SharedPtr msg);
+  void processDepthPose(const sensor_msgs::msg::Image& img, const nav_msgs::msg::Odometry& pose);
+  void processObjectClouds(const plan_env::msg::MultipleMasksWithConfidence& msg);
   void itmScoreCallback(const std_msgs::msg::Float64::SharedPtr msg);
   void visCallback();
 
@@ -136,6 +152,11 @@ private:
 
   // ROS2 timers for periodic updates
   rclcpp::TimerBase::SharedPtr esdf_timer_;
+  rclcpp::Subscription<plan_env::msg::StepObservation>::SharedPtr step_sub_;
+  rclcpp::CallbackGroup::SharedPtr sync_cb_group_;
+  std::function<void(const nav_msgs::msg::Odometry&, int)> step_hook_;
+  bool sync_step_ = false;
+  int last_processed_step_ = -1;  ///< sync_step: last StepObservation integrated (-1: none)
   rclcpp::TimerBase::SharedPtr vis_timer_;
 
   // Camera intrinsic parameters

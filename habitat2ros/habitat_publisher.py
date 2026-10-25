@@ -87,6 +87,35 @@ class ROSPublisher(Node):
         self.publish_robot_odom(ros_time, gps, compass)
 
 
+def make_step_messages(bridge, ros_time, observations):
+    """(depth Image, robot Odometry, camera-pose Odometry) for one observation, exactly as
+    the per-topic publishers build them; sync_step packs them into one StepObservation."""
+    gps = observations["gps"]
+    compass = float(np.asarray(observations["compass"]).reshape(-1)[0])
+    pitch = float(observations["camera_pitch"])
+    depth_msg = bridge.cv2_to_imgmsg(observations["depth"], encoding="passthrough")
+    depth_msg.header.stamp = ros_time
+    depth_msg.header.frame_id = "world"
+    odom = Odometry()
+    odom.header.stamp = ros_time
+    odom.header.frame_id = "world"
+    odom.child_frame_id = "base_link"
+    odom.pose.pose = Pose(
+        position=Point(x=float(-gps[2]), y=float(-gps[0]), z=float(gps[1])),
+        orientation=_quat_from_array(quaternion_from_euler(0, 0, compass)),
+    )
+    camera = Odometry()
+    camera.header.stamp = ros_time
+    camera.header.frame_id = "world"
+    camera.child_frame_id = "base_link"
+    camera.pose.pose = Pose(
+        position=Point(x=float(-gps[2]), y=float(-gps[0]), z=float(gps[1] + 0.88)),
+        orientation=_quat_from_array(quaternion_from_euler(
+            pitch + np.pi / 2.0, np.pi, compass + np.pi / 2.0)),
+    )
+    return depth_msg, odom, camera
+
+
 class ROSPublisherNonNode:
     """Non-node version for use with external node"""
     def __init__(self, node):

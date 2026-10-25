@@ -21,11 +21,13 @@ from std_msgs.msg import Int32, Int32MultiArray, Float32MultiArray, Float64
 from plan_env.msg import (
     MultipleMasksWithConfidence,
     ObjectFusionState,
+    StepAction,
+    StepObservation,
     VerificationRequest,
     VerificationResult,
 )
 
-from habitat2ros.habitat_publisher import ROSPublisherNonNode
+from habitat2ros.habitat_publisher import ROSPublisherNonNode, make_step_messages
 from params import ROS_STATE
 
 
@@ -54,6 +56,9 @@ class HabitatEvalNode(Node):
         self.verification_request = None
         self.last_verification_seq = 0
         self.verification_seq_floor = 0
+        # sync_step mode (enable_sync_step): one StepObservation per executed step
+        self.sync_step = False
+        self.step_action = None
 
         # Publishers
         self.obj_point_cloud_pub = self.create_publisher(
@@ -143,7 +148,61 @@ class HabitatEvalNode(Node):
             "observation_num": int(msg.observation_num),
             "expl_result": int(msg.expl_result),
             "at_stop": bool(msg.at_stop),
+            "fusion_seq": int(msg.fusion_seq),
         }
+
+    # ------------------------------------------------------------------
+    # sync_step: deterministic simulator-planner step
+    # ------------------------------------------------------------------
+
+    def enable_sync_step(self):
+        """Switch to sync_step: the planner gets one StepObservation per executed step and
+        answers with a StepAction tagged with that step (see plan_env/msg)."""
+        if self.sync_step:
+            return
+        self.sync_step = True
+        reliable = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE, history=HistoryPolicy.KEEP_LAST, depth=10)
+        self.step_obs_pub = self.create_publisher(
+            StepObservation, "/habitat/step_observation", reliable)
+        self.action_finish_step_pub = self.create_publisher(
+            Int32, "/habitat/action_finish_step", reliable)
+        self.create_subscription(
+            StepAction, "/habitat/step_action", self.step_action_callback, reliable)
+
+    def step_action_callback(self, msg):
+        self.step_action = {
+            "action": int(msg.action),
+            "step": int(msg.step),
+            "fusion_seq": int(msg.fusion_seq),
+            "final_state": int(msg.final_state),
+            "expl_result": int(msg.expl_result),
+        }
+        self.global_action = int(msg.action)
+
+    def publish_step_observation(self, step, observations, itm=None, clouds=None, reopen=()):
+        """Everything the planner's map needs from one executed step, in one message."""
+        msg = StepObservation()
+        msg.step = int(step)
+        ros_time = self.get_clock().now().to_msg()
+        msg.depth, msg.odom, msg.camera_pose = make_step_messages(
+            self.ros_pub.bridge, ros_time, observations)
+        msg.has_itm = itm is not None
+        msg.itm_score = float(itm) if itm is not None else -1.0
+        msg.has_clouds = clouds is not None
+        if clouds is not None:
+            msg.clouds = clouds
+        msg.reopen_cluster_ids = [int(c) for c in reopen]
+        self.step_obs_pub.publish(msg)
+
+    def wait_for_fusion(self, seq, timeout=60.0):
+        """Spin until the planner's fusion snapshot numbered ``seq`` has arrived, so the gate
+        and the recorder see the snapshot the planner acted on, not whichever came first."""
+        deadline = time.time() + timeout
+        while seq > 0 and (self.object_fusion is None or self.object_fusion["update_seq"] < seq):
+            if time.time() > deadline:
+                raise RuntimeError(f"[sync_step] fusion snapshot {seq} did not arrive in {timeout:.0f} s")
+            rclpy.spin_once(self, timeout_sec=0.05)
 
     def start_verification_episode(self):
         """Forget requests from earlier episodes (call once the planner is ready)."""
@@ -179,10 +238,16 @@ class HabitatEvalNode(Node):
         publisher.publish(msg)
 
     def publish_observations(self):
-        """Push the latest observations, confidence threshold and FSM trigger."""
+        """Push the latest observations, confidence threshold and FSM trigger.
+
+        In sync_step mode only the pre-episode handshake calls this; the planner integrates
+        the repeated step-0 observation once (it drops step ids it has already seen)."""
         if self.msg_observations is None:
             return
-        self.ros_pub.habitat_publish_ros_topic(deepcopy(self.msg_observations))
+        if self.sync_step:
+            self.publish_step_observation(0, self.msg_observations)
+        else:
+            self.ros_pub.habitat_publish_ros_topic(deepcopy(self.msg_observations))
         self.publish_float64(self.confidence_threshold_pub, self.fusion_threshold)
         self.trigger_pub.publish(PoseStamped())
 
@@ -200,10 +265,13 @@ class HabitatEvalNode(Node):
             self.pub_timer.cancel()
             self.pub_timer = None
 
-    def wait_for_planner_ready(self):
+    def wait_for_planner_ready(self, timeout=None):
         """Block until the FSM has odometry and has accepted the trigger."""
         self.ros_state = ROS_STATE.INIT
+        deadline = None if timeout is None else time.time() + timeout
         while self.ros_state in (ROS_STATE.INIT, ROS_STATE.WAIT_TRIGGER):
+            if deadline is not None and time.time() > deadline:
+                raise RuntimeError(f"planner not ready after {timeout:.0f} s")
             if self.ros_state == ROS_STATE.INIT:
                 print("Waiting for ROS to get odometry...")
             else:
@@ -237,6 +305,7 @@ def query_planner_fusion_config(node, timeout=5.0):
         "object.min_observation_num",
         "object.use_observation",
         "verification.enabled",
+        "sync_step",
     ]
     try:
         client = AsyncParameterClient(node, "exploration_node")

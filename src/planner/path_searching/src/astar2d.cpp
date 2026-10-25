@@ -1,6 +1,7 @@
 #include <path_searching/astar2d.h>
 #include <sstream>
 #include <chrono>
+#include <stdexcept>
 
 using namespace std;
 using namespace Eigen;
@@ -27,6 +28,20 @@ void Astar2D::init(rclcpp::Node::SharedPtr node, const SDFMap2D::Ptr& sdf_map)
   }
   node->get_parameter("astar.resolution_astar", resolution_);
   node->get_parameter("astar.lambda_heu", lambda_heu_);
+  if (!node->has_parameter("sync_step")) {
+    node->declare_parameter("sync_step", false);
+  }
+  if (!node->has_parameter("astar.expansions_per_s")) {
+    node->declare_parameter("astar.expansions_per_s", 0.0);
+  }
+  node_ = node;
+  if (node->get_parameter("sync_step").as_bool()) {
+    expansions_per_s_ = node->get_parameter("astar.expansions_per_s").as_double();
+    if (expansions_per_s_ <= 0.0)
+      throw std::runtime_error("sync_step needs astar.expansions_per_s > 0");
+    RCLCPP_WARN(node->get_logger(), "[Astar2D] sync_step: budget = max_time x %.0f expansions/s",
+        expansions_per_s_);
+  }
   allocate_num_ = 1000000;
 
   this->sdf_map_ = sdf_map;
@@ -68,6 +83,21 @@ void Astar2D::setResolution(const double& res)
 int Astar2D::astarSearch(const Eigen::Vector2d& start_pt, const Eigen::Vector2d& end_pt,
     double success_dist, double max_time, int safety_mode)
 {
+  if (expansions_per_s_ > 0.0)
+    return astarSearchImpl(start_pt, end_pt, success_dist, max_time, safety_mode);
+  const auto t0 = std::chrono::steady_clock::now();
+  int result = astarSearchImpl(start_pt, end_pt, success_dist, max_time, safety_mode);
+  stat_time_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  stat_iters_ += iter_num_;
+  if (++stat_searches_ % 2000 == 0 && node_ && stat_time_ > 0.0)
+    RCLCPP_INFO(node_->get_logger(), "[Astar2D] %ld searches, %.0f expansions/s", stat_searches_,
+        stat_iters_ / stat_time_);
+  return result;
+}
+
+int Astar2D::astarSearchImpl(const Eigen::Vector2d& start_pt, const Eigen::Vector2d& end_pt,
+    double success_dist, double max_time, int safety_mode)
+{
   Node2DPtr cur_node = path_node_pool_[0];
   cur_node->parent = nullptr;
   cur_node->position = start_pt;
@@ -96,9 +126,13 @@ int Astar2D::astarSearch(const Eigen::Vector2d& start_pt, const Eigen::Vector2d&
       return REACH_END;
     }
 
-    // Early termination if time up
-    auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
-    if (elapsed > max_time) {
+    // Early termination if time up (sync_step: if the expansion budget is used up)
+    bool time_up;
+    if (expansions_per_s_ > 0.0)
+      time_up = iter_num_ >= max_time * expansions_per_s_;
+    else
+      time_up = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count() > max_time;
+    if (time_up) {
       early_terminate_cost_ = cur_node->g_score + getDiagHeu(cur_node->position, end_pt);
       // ROS_WARN("Astar Long Time");
       return NO_PATH;

@@ -47,6 +47,7 @@ public:
   // Core map management functions
   void initMap(rclcpp::Node::SharedPtr node);
   void resetMap();
+  MapROS* mapROS() { return map_ros_.get(); }  ///< ROS interface (sync_step hooks)
   void inputDepthCloud2D(const pcl::PointCloud<pcl::PointXY>::Ptr& points,
       const Eigen::Vector3d& camera_pos, vector<Eigen::Vector2i>& free_grids);
   void inputObjectCloud2D(

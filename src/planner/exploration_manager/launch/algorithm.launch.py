@@ -49,6 +49,23 @@ def verification_params(context):
     }
 
 
+# A* node expansions per second of planner wall time, measured on this host in the
+# original (wall-clock) mode; sync_step turns each A* time budget into this many
+# expansions per second of budget, so planning no longer depends on host load
+ASTAR_EXPANSIONS_PER_S = 1.0e6
+
+
+def sync_step_params(context):
+    """Resolve the sync_step argument (deterministic simulator-planner step; off = original)."""
+    raw = LaunchConfiguration('sync_step').perform(context).strip().lower()
+    if raw not in ('true', 'false', '1', '0'):
+        raise RuntimeError(f"sync_step must be true or false, got '{raw}'")
+    return {
+        'sync_step': raw in ('true', '1'),
+        'astar.expansions_per_s': ASTAR_EXPANSIONS_PER_S,
+    }
+
+
 def launch_setup(context, *args, **kwargs):
     """Build the exploration node once the launch arguments can be resolved."""
     trajectory_manager_share = get_package_share_directory('trajectory_manager')
@@ -136,6 +153,7 @@ def launch_setup(context, *args, **kwargs):
 
                 **object_fusion_params(context),
                 **verification_params(context),
+                **sync_step_params(context),
             }
         ],
         remappings=[
@@ -186,6 +204,14 @@ def generate_launch_description():
             description=(
                 'true = a target cluster must pass perception.Verifier '
                 '(perception_gate) before the agent may stop at it'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'sync_step',
+            default_value='false',
+            description=(
+                'true = one StepObservation per simulator step, integrated in a fixed '
+                'order before the FSM plans (deterministic runs)'
             ),
         ),
         # Nodes

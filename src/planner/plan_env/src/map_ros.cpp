@@ -51,11 +51,19 @@ void MapROS::reset()
   filtered_depth_cloud2d_->clear();
   continue_over_depth_count_ = -1;
   itm_score_ = -1.0;
+  last_processed_step_ = -1;
   map_start_time_ = node_->get_clock()->now();
 }
 
 void MapROS::init()
 {
+  // sync_step: one StepObservation per executed step replaces the separate depth/pose,
+  // ITM and object-cloud topics, and the ESDF is updated inside that callback
+  if (!node_->has_parameter("sync_step")) {
+    node_->declare_parameter("sync_step", false);
+  }
+  sync_step_ = node_->get_parameter("sync_step").as_bool();
+
   // Load camera intrinsic parameters from ROS2 parameter server
   if (!node_->has_parameter("map_ros/fx")) {
     node_->declare_parameter("map_ros/fx", -1.0);
@@ -152,9 +160,18 @@ void MapROS::init()
   local_updated_ = false;
   esdf_need_update_ = false;
 
-  // Setup periodic timers for map updates and visualization
-  esdf_timer_ = node_->create_wall_timer(100ms, std::bind(&MapROS::updateESDFCallback, this));
-  vis_timer_ = node_->create_wall_timer(250ms, std::bind(&MapROS::visCallback, this));
+  // Setup periodic timers for map updates and visualization. In sync_step mode the
+  // ESDF is updated per step (stepObservationCallback) and visualization shares the
+  // map/FSM callback group, so it never reads a map that is being written
+  if (sync_step_) {
+    sync_cb_group_ = node_->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    vis_timer_ = node_->create_wall_timer(
+        250ms, std::bind(&MapROS::visCallback, this), sync_cb_group_);
+  }
+  else {
+    esdf_timer_ = node_->create_wall_timer(100ms, std::bind(&MapROS::updateESDFCallback, this));
+    vis_timer_ = node_->create_wall_timer(250ms, std::bind(&MapROS::visCallback, this));
+  }
 
   // Setup publishers for map visualization
   occupied_pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>("/grid_map/occupied", 10);
@@ -181,6 +198,20 @@ void MapROS::init()
   value_map_pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>("/grid_map/value_map", 10);
   confidence_map_pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>(
       "/grid_map/confidence_map", 10);
+
+  if (sync_step_) {
+    // Reliable: a lost step would stall the FSM, which waits for every step id
+    rclcpp::SubscriptionOptions options;
+    options.callback_group = sync_cb_group_;
+    step_sub_ = node_->create_subscription<plan_env::msg::StepObservation>(
+        "/habitat/step_observation", rclcpp::QoS(rclcpp::KeepLast(10)).reliable(),
+        std::bind(&MapROS::stepObservationCallback, this, std::placeholders::_1), options);
+    RCLCPP_WARN(node_->get_logger(), "[MapROS] sync_step ON: integrating /habitat/step_observation");
+    continue_over_depth_count_ = -1;
+    itm_score_ = -1.0;
+    map_start_time_ = node_->get_clock()->now();
+    return;
+  }
 
   // Setup subscribers for object detection and ITM scores
   detected_object_cloud_sub_ = node_->create_subscription<plan_env::msg::MultipleMasksWithConfidence>(
@@ -227,8 +258,48 @@ void MapROS::itmScoreCallback(const std_msgs::msg::Float64::SharedPtr msg)
   itm_score_ = msg->data;
 }
 
+void MapROS::stepObservationCallback(const plan_env::msg::StepObservation::SharedPtr msg)
+{
+  // Steps arrive in order, each exactly once. A repeat (the pre-episode handshake
+  // republishes step 0) or a stale step from the previous episode is dropped
+  int expected = last_processed_step_ + 1;
+  if (msg->step != expected) {
+    if (msg->step > expected)
+      RCLCPP_FATAL(node_->get_logger(), "[sync_step] step %d arrived, expected %d: a step was lost",
+          msg->step, expected);
+    return;
+  }
+
+  // Fixed order: pose -> depth/occupancy -> value map (this step's ITM) -> object clouds
+  itm_score_ = msg->has_itm ? msg->itm_score : -1.0;
+  processDepthPose(msg->depth, msg->camera_pose);
+  if (msg->has_clouds)
+    processObjectClouds(msg->clouds);
+
+  // The perception gate reopens rejected clusters as of this step
+  for (int id : msg->reopen_cluster_ids) {
+    if (map_->object_map2d_->getVerification(id) == -1) {
+      map_->object_map2d_->setVerification(id, 0);
+      RCLCPP_WARN(node_->get_logger(), "[Verification] cluster %d reopened (step %d)", id, msg->step);
+    }
+  }
+
+  // ESDF now, not on a wall-clock timer, so planning always sees this step's map
+  updateESDFCallback();
+
+  last_processed_step_ = msg->step;
+  if (step_hook_)
+    step_hook_(msg->odom, msg->step);
+}
+
 void MapROS::detectedObjectCloudCallback(const plan_env::msg::MultipleMasksWithConfidence::SharedPtr msg)
 {
+  processObjectClouds(*msg);
+}
+
+void MapROS::processObjectClouds(const plan_env::msg::MultipleMasksWithConfidence& m)
+{
+  const auto* msg = &m;
   // Validate message structure consistency
   if (!(msg->confidence_scores.size() == msg->point_clouds.size() &&
           msg->confidence_scores.size() == msg->label_indices.size())) {
@@ -366,6 +437,13 @@ void MapROS::depthPoseCallback(
     const sensor_msgs::msg::Image::ConstSharedPtr& img,
     const nav_msgs::msg::Odometry::ConstSharedPtr& pose)
 {
+  processDepthPose(*img, *pose);
+}
+
+void MapROS::processDepthPose(const sensor_msgs::msg::Image& img_msg, const nav_msgs::msg::Odometry& pose_msg)
+{
+  const auto* img = &img_msg;
+  const auto* pose = &pose_msg;
   // Extract camera pose from odometry message
   camera_pos_(0) = pose->pose.pose.position.x;
   camera_pos_(1) = pose->pose.pose.position.y;
@@ -384,7 +462,7 @@ void MapROS::depthPoseCallback(
     return;
 
   // Convert depth image format (Habitat publishes Float32, some sensors use 8UC1)
-  cv_bridge::CvImagePtr cv_ptr = cv_bridge::toCvCopy(img, img->encoding);
+  cv_bridge::CvImagePtr cv_ptr = cv_bridge::toCvCopy(*img, img->encoding);
   if (img->encoding == sensor_msgs::image_encodings::TYPE_32FC1)
     (cv_ptr->image).convertTo(cv_ptr->image, CV_16UC1, k_depth_scaling_factor_);
   if (img->encoding == sensor_msgs::image_encodings::TYPE_8UC1)

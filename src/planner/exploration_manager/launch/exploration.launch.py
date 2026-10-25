@@ -69,6 +69,12 @@ def generate_launch_description():
         description='true = verify target clusters with perception.Verifier (perception_gate)'
     )
 
+    sync_step_arg = DeclareLaunchArgument(
+        'sync_step',
+        default_value='false',
+        description='true = deterministic step: one StepObservation per simulator step'
+    )
+
     cx_arg = DeclareLaunchArgument('cx', default_value='320.0')
     cy_arg = DeclareLaunchArgument('cy', default_value='240.0')
     fx_arg = DeclareLaunchArgument('fx', default_value='388.1910413097385')
@@ -98,6 +104,7 @@ def generate_launch_description():
             'fy_': LaunchConfiguration('fy'),
             'multiview_fusion': LaunchConfiguration('multiview_fusion'),
             'verification_gate': LaunchConfiguration('verification_gate'),
+            'sync_step': LaunchConfiguration('sync_step'),
         }.items()
     )
 
@@ -115,6 +122,7 @@ def generate_launch_description():
         fy_arg,
         multiview_fusion_arg,
         verification_gate_arg,
+        sync_step_arg,
         # Include algorithm
         algorithm_launch,
     ])

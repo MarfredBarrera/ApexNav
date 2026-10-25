@@ -47,6 +47,7 @@ import tqdm
 # Habitat-related imports
 import habitat
 from habitat.config.default import patch_config
+from habitat.config import read_write
 from habitat.sims.habitat_simulator.actions import HabitatSimActions
 
 # ROS message imports
@@ -136,6 +137,10 @@ def run_episode(env, node, ctx, label, llm_answer, room):
     cld_with_score_msg = MultipleMasksWithConfidence()
 
     gate = ctx["gate"]
+    # sync_step: each step's map inputs go out once, in one StepObservation, and the
+    # next action is only taken once it is known to be planned from that step
+    sync = ctx["sync_step"]
+    last_progress = time.time()
     while rclpy.ok() and not env.episode_over:
         rclpy.spin_once(node, timeout_sec=0.1)
 
@@ -143,15 +148,20 @@ def run_episode(env, node, ctx, label, llm_answer, room):
         # selected is verified. Answer the latched request; no sim step here
         if node.verification_request is not None:
             request, node.verification_request = node.verification_request, None
+            if sync:
+                node.wait_for_fusion(request.get("fusion_seq", 0))
             # A gate-off run never gets here (main() checks the planner flag);
             # accepting keeps a mismatched planner from waiting for its timeout
             state = gate.handle(request, node.object_fusion, count_steps) if gate else 1
             node.publish_verification_result(request["seq"], request["cluster_id"], state)
+            last_progress = time.time()
             continue
 
         # Keep publishing observations, confidence, and trigger so the FSM
-        # always has fresh odom and can re-trigger after episode transitions
-        node.publish_observations()
+        # always has fresh odom and can re-trigger after episode transitions.
+        # Not in sync_step mode: repeats were integrated again by the planner
+        if not sync:
+            node.publish_observations()
 
         # Skip episode if target is not on the same floor
         if not episode_is_feasible(env.current_episode):
@@ -159,7 +169,23 @@ def run_episode(env, node, ctx, label, llm_answer, room):
 
         # Parse action from decision system
         if node.global_action is None:
+            if sync and time.time() - last_progress > ctx["sync_stall_timeout_s"]:
+                raise RuntimeError(
+                    f"[sync_step] no action for step {count_steps + 1} within "
+                    f"{ctx['sync_stall_timeout_s']:.0f} s: planner stalled")
             continue
+        if sync:
+            planned = node.step_action
+            if planned["step"] != count_steps:
+                raise RuntimeError(
+                    f"[sync_step] action planned from step {planned['step']}, expected {count_steps}")
+            node.wait_for_fusion(planned["fusion_seq"])
+            # The FSM verdict the action was published with (-1: none yet)
+            if planned["final_state"] >= 0:
+                node.final_state = planned["final_state"]
+            if planned["expl_result"] >= 0:
+                node.expl_result = planned["expl_result"]
+            last_progress = time.time()
         if count_steps == ctx["max_episode_steps"] - 1:
             node.global_action = ACTION.STOP
         planned_action = node.global_action
@@ -199,7 +225,8 @@ def run_episode(env, node, ctx, label, llm_answer, room):
         cosine = get_itm_message_cosine(observations["rgb"], label, room)
         print(f"Target related room: {room}")
         print(f"ITM cosine similarity: {cosine:.3f}")
-        node.publish_float64(node.itm_score_pub, cosine)
+        if not sync:
+            node.publish_float64(node.itm_score_pub, cosine)
 
         # Detect objects in the current observation
         observations["rgb"], score_list, object_masks_list, label_list = get_object(
@@ -213,7 +240,8 @@ def run_episode(env, node, ctx, label, llm_answer, room):
         observations["camera_pitch"] = camera_pitch
         node.msg_observations = deepcopy(observations)
         del observations["camera_pitch"]
-        node.ros_pub.habitat_publish_ros_topic(node.msg_observations)
+        if not sync:
+            node.ros_pub.habitat_publish_ros_topic(node.msg_observations)
 
         # Generate and publish object point clouds
         (
@@ -225,17 +253,26 @@ def run_episode(env, node, ctx, label, llm_answer, room):
         )
         cld_with_score_msg.confidence_scores = score_list
         cld_with_score_msg.label_indices = label_list
-        node.cld_with_score_pub.publish(cld_with_score_msg)
+        if not sync:
+            node.cld_with_score_pub.publish(cld_with_score_msg)
         step_pose = agent_world_pose(observations)
 
         # Keep target detections as verification evidence; a rejected cluster
         # seen anew after the cooldown is reopened for another check
-        for cluster_id in gate.observe(
+        reopened = gate.observe(
             count_steps, rgb_gate, object_masks_list, label_list, score_list,
             detection_world_centroids, detection_semantic_instances, step_pose,
             camera_pitch, node.object_fusion,
-        ) if gate else ():
-            node.publish_verification_result(0, cluster_id, 0)
+        ) if gate else []
+        if sync:
+            # The reopens ride with this step, so the planner applies them before it
+            # plans the next action
+            node.publish_step_observation(
+                count_steps, node.msg_observations, itm=cosine,
+                clouds=cld_with_score_msg, reopen=reopened)
+        else:
+            for cluster_id in reopened:
+                node.publish_verification_result(0, cluster_id, 0)
 
         info = env.get_metrics()
         ctx["video"].track(observations)
@@ -272,6 +309,8 @@ def run_episode(env, node, ctx, label, llm_answer, room):
 
         # Notify ROS system that action execution is complete
         node.publish_int32(node.state_pub, HABITAT_STATE.ACTION_FINISH)
+        if sync:
+            node.publish_int32(node.action_finish_step_pub, count_steps)
 
     return count_steps, pass_object
 
@@ -309,6 +348,16 @@ def main(
     recorder.set_context(dataset=dataset)
     planner_cfg_read = False
 
+    # sync_step: deterministic simulator-planner step (launch the planner with
+    # sync_step:=true too). A verification error or timeout aborts instead of
+    # failing open, so timing never decides a verdict
+    sync_step = bool(cfg.get("sync_step", False))
+    if sync_step:
+        node.enable_sync_step()
+        if cfg.get("verification", {}).get("enabled", False):
+            with read_write(cfg):
+                cfg.verification.max_consecutive_errors = 1
+
     video = EpisodeVideo(cfg)
     gate = build_verification_gate(cfg, video_output_path)
     totals = RunTotals(
@@ -331,6 +380,8 @@ def main(
         "max_episode_steps": max_episode_steps,
         "success_distance": success_distance,
         "step_delay": step_delay,
+        "sync_step": sync_step,
+        "sync_stall_timeout_s": float(cfg.get("sync_stall_timeout_s", 600.0)),
     }
     detector_cfg_plain = OmegaConf.to_container(cfg.detector, resolve=True)
 
@@ -356,6 +407,7 @@ def main(
         # object map on EPISODE_FINISH but the latch here would otherwise persist
         node.object_fusion = None
         node.verification_request = None
+        node.step_action = None
 
         observations = env.reset()
         observations["camera_pitch"] = 0.0
@@ -405,7 +457,7 @@ def main(
         # Start publishing basic information and trigger messages
         node.start_observation_timer()
         print("Agent is waiting in the environment!!!")
-        node.wait_for_planner_ready()
+        node.wait_for_planner_ready(timeout=300.0 if sync_step else None)
         node.stop_observation_timer()
         # Requests latched before the planner reset belong to the last episode
         node.start_verification_episode()
@@ -413,7 +465,7 @@ def main(
         # The planner is alive by now, so its fusion arm can be read back once
         # and stamped into every record produced by this run
         gate_on = gate is not None
-        if (recorder.enabled or gate_on) and not planner_cfg_read:
+        if (recorder.enabled or gate_on or sync_step) and not planner_cfg_read:
             planner_cfg = query_planner_fusion_config(node)
             recorder.set_context(planner_cfg=planner_cfg)
             planner_cfg_read = True
@@ -424,6 +476,12 @@ def main(
                 raise RuntimeError(
                     f"verification.enabled is {gate_on} here but {planner_gate} in "
                     "the planner; launch it with verification_gate:=" + str(gate_on).lower()
+                )
+            planner_sync = (planner_cfg or {}).get("sync_step")
+            if bool(planner_sync) != sync_step:
+                raise RuntimeError(
+                    f"sync_step is {sync_step} here but {planner_sync} in the planner; "
+                    "launch it with sync_step:=" + str(sync_step).lower()
                 )
 
         print("Agent is ready to go!!!!")

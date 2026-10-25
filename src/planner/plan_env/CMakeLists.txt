@@ -34,7 +34,9 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/ObjectFusionState.msg"
   "msg/VerificationRequest.msg"
   "msg/VerificationResult.msg"
-  DEPENDENCIES std_msgs sensor_msgs
+  "msg/StepObservation.msg"
+  "msg/StepAction.msg"
+  DEPENDENCIES std_msgs sensor_msgs nav_msgs
 )
 
 # Include 디렉토리 설정
