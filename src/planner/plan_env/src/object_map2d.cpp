@@ -105,7 +105,7 @@ void ObjectMap2D::inputObservationObjectsCloud(
       continue;
 
     // Check overlap with each possible object classification
-    for (int label = 0; label < 5; ++label) {
+    for (int label = 0; label < (int)object.confidence_scores_.size(); ++label) {
       if (object.confidence_scores_[label] < 1e-3)
         continue;  // Skip labels with negligible confidence
 

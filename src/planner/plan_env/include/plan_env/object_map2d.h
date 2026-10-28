@@ -107,9 +107,10 @@ struct ObjectCluster {
 
   /**
    * @brief Constructor to initialize multi-class storage
-   * @param size Number of semantic classes to support (default: 5)
+   * @param size Number of semantic classes to support: the target plus up to 5 similar labels
+   *        (the LLM prompt asks for 3-5; OVON answers use 5, HM3D/MP3D at most 4)
    */
-  ObjectCluster(int size = 5)
+  ObjectCluster(int size = 6)
     : clouds_(size)
     , confidence_scores_(size, 0.0)
     , observation_nums_(size, 0)
