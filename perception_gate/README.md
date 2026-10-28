@@ -192,6 +192,7 @@ Override any of them on the command line, e.g. `verification.max_checks=1`.
 | `url` | `http://3dawareverification-dev-1:8770` | Verifier server |
 | `timeout_s` | 120 | per-request HTTP timeout |
 | `on_error` / `on_no_evidence` | accept | fail open: errors and missing views keep the detection, and are logged |
+| `on_view_reject` | reject | the raw frame accepts but the SAM3D view says no: `reject`, or `defer` (the planner may approach the cluster but not stop at it; the stop backstop verifies it again, and a view "no" there rejects). Pair `defer` with server flags `--judge-input --view-when unsure` |
 | `max_consecutive_errors` | 3 | abort the run instead of silently running ungated |
 | `max_checks` | 3 | checks per cluster, including re-checks |
 | `recheck_cooldown_steps` | 25 | steps before a rejected cluster can be re-checked |

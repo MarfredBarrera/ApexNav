@@ -11,7 +11,7 @@ Per episode:
 0.75 m cell of its world centroid (``evidence.EvidenceStore``: the most readable
 views of each place plus its newest). ``handle`` verifies the best view of the
 requested cluster with ``perception.Verifier`` over HTTP and returns the state
-for the planner: 1 accepted, -1 rejected. A request with ``cluster_id`` -1 is
+for the planner: 1 accepted, -1 rejected, 2 deferred. A request with ``cluster_id`` -1 is
 the stop backstop asking about a position that no cluster covers (e.g. an
 over-depth target); it is verified from the evidence nearest that position.
 
@@ -21,6 +21,12 @@ without a server call. A distinct nearby object is judged on its own views: a
 view closer to another cluster (as clusters stood at that step) is not
 evidence for this one, and ties prefer the nearest view. ``at_stop`` requests
 match evidence to the stop position the planner sends.
+
+Deferral (``on_view_reject: defer``): when the raw frame accepts but the SAM3D view
+says no, the cluster is deferred instead of rejected. The planner may approach it but
+not stop at it: the stop backstop verifies it again there, preferring a new view. At
+the stop a view "no" rejects (there is no closer view to wait for), and so does a
+deferred verdict reused from the cache.
 
 Failure policy (fail open by default): a server error or timeout applies
 ``on_error``, a cluster without a stored view ``on_no_evidence``; both are
@@ -58,6 +64,7 @@ DEFAULTS = {
     "ping_timeout_s": 60.0,          # long enough to wait out one in-flight verification
     "on_error": "accept",
     "on_no_evidence": "accept",
+    "on_view_reject": "reject",      # raw frame accepts, SAM3D view says no: reject or defer
     "max_consecutive_errors": 3,
     "max_checks": 3,
     "recheck_cooldown_steps": 25,
@@ -71,7 +78,8 @@ DEFAULTS = {
     "ground_truth_semantic_overlap": 0.5,
 }
 POLICIES = ("accept", "reject")
-ACCEPTED, UNVERIFIED, REJECTED = 1, 0, -1
+ACCEPTED, UNVERIFIED, REJECTED, DEFERRED = 1, 0, -1, 2
+NAMES = {ACCEPTED: "ACCEPTED", REJECTED: "REJECTED", DEFERRED: "DEFERRED"}
 
 
 def target_name(label):
@@ -102,6 +110,8 @@ class VerificationGate:
         for key in ("on_error", "on_no_evidence"):
             if self.cfg[key] not in POLICIES:
                 raise ValueError(f"verification.{key} must be one of {POLICIES}")
+        if self.cfg["on_view_reject"] not in ("reject", "defer"):
+            raise ValueError("verification.on_view_reject must be reject or defer")
         self.enabled = bool(self.cfg["enabled"])
         self.log_dir = str(self.cfg["log_dir"]).format(video_output_path=video_output_path)
         self.camera = camera
@@ -126,7 +136,7 @@ class VerificationGate:
         self.evidence = EvidenceStore(self.cfg["match_distance_m"], self.cfg["evidence_per_cell"],
                                       self.cfg["max_evidence"])
         self.clusters, self.verdicts, self.events = {}, {}, []
-        self.counts = {"requests": 0, "accepted": 0, "rejected": 0, "errors": 0, "no_evidence": 0,
+        self.counts = {"requests": 0, "accepted": 0, "rejected": 0, "deferred": 0, "errors": 0, "no_evidence": 0,
                        "cached": 0, "reopened": 0}
 
     def finish_episode(self):
@@ -238,7 +248,7 @@ class VerificationGate:
     # ------------------------------------------------------------------
 
     def handle(self, request, fusion=None, step=0):
-        """Verify the requested cluster; returns 1 (accept) or -1 (reject) for the planner.
+        """Verify the requested cluster; returns 1 (accept), -1 (reject) or 2 (defer) for the planner.
 
         ``request``: dict with seq, cluster_id, centroid_x/y, confidence, observation_num,
         expl_result, at_stop (the VerificationRequest message)."""
@@ -290,7 +300,8 @@ class VerificationGate:
         if key in self.verdicts:  # this exact view was already judged (for another cluster)
             self.counts["cached"] += 1
             record.update(source="cached", verdict=self.verdicts[key]["verdict"])
-            return self._decide(record, self.verdicts[key]["state"], evidence, None, state)
+            cached = self.verdicts[key]["state"]
+            return self._decide(record, REJECTED if cached == DEFERRED and at_stop else cached, evidence, None, state)
 
         start = time.time()
         try:
@@ -313,20 +324,28 @@ class VerificationGate:
         self.consecutive_errors = 0
         record.update(verdict=verdict, latency_s=round(time.time() - start, 3))
         decided = ACCEPTED if verdict["accepted"] else REJECTED
+        if decided == REJECTED and self.defers(verdict) and not at_stop:
+            decided = DEFERRED
         self.verdicts[key] = {"state": decided, "verdict": verdict}
         return self._decide(record, decided, evidence, reply, state)
+
+    def defers(self, verdict):
+        """True when ``verdict`` is a SAM3D view rejecting what the raw frame accepted, and
+        such rejections defer."""
+        return (self.cfg["on_view_reject"] == "defer" and verdict.get("judged") == "view"
+                and verdict.get("input_scores") is not None)
 
     def _decide(self, record, decided, evidence, reply, state):
         if state is not None:
             state["state"] = decided
         record["state"] = decided
-        self.counts["accepted" if decided == ACCEPTED else "rejected"] += 1
+        self.counts[NAMES[decided].lower()] += 1
         self._log(record, evidence, reply)
         label = (record["verdict"] or {}).get("label")
         self.events.append({"event": "decision", "cluster_id": record["cluster"]["id"], "state": decided,
                             "label": label, "source": record["source"], "error": record["error"]})
         print(f"[verification] {'position' if record['cluster']['id'] < 0 else 'cluster'} "
-              f"{record['cluster']['id']} {'ACCEPTED' if decided == ACCEPTED else 'REJECTED'}: label {label!r} "
+              f"{record['cluster']['id']} {NAMES[decided]}: label {label!r} "
               f"for {self.episode.get('target')!r} ({record['policy'] or record['source']}, "
               f"{record['latency_s'] or 0.0:.1f} s)")
         return decided

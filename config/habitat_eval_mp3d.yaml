@@ -99,6 +99,7 @@ verification:
   timeout_s: 120
   on_error: accept              # server error/timeout: accept (fail open) or reject
   on_no_evidence: accept        # no stored view of the cluster
+  on_view_reject: reject        # raw frame accepts, SAM3D view says no: reject, or defer (approach, re-verify at the stop)
   max_consecutive_errors: 3     # then abort the run: never run silently ungated
   ping_timeout_s: 60            # startup /health; tolerates one in-flight verification
   max_checks: 3                 # per cluster, including re-checks

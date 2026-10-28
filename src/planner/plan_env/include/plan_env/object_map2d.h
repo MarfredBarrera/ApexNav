@@ -68,7 +68,7 @@ struct ObjectConfidenceInfo {
   int observation_num;  ///< Frames the target class was observed in
   Vector2d average;     ///< Cluster centroid
   bool is_confident;    ///< Passes isConfidenceObject()
-  int verification;     ///< Perception gate: -1 rejected, 0 unverified, 1 accepted
+  int verification;     ///< Perception gate: -1 rejected, 0 unverified, 1 accepted, 2 deferred
 };
 
 struct Viewpoint2D {
@@ -96,7 +96,7 @@ struct ObjectCluster {
   int max_seen_count_;                   ///< Maximum observation count across all cells
   vector<Vector2d> good_cells_;          ///< High-confidence cells (frequently observed)
   int best_label_;                       ///< Most confident semantic label
-  int verification_ = 0;                 ///< Perception gate: -1 rejected, 0 unverified, 1 accepted
+  int verification_ = 0;                 ///< Perception gate: -1 rejected, 0 unverified, 1 accepted, 2 deferred
 
   /******* 3D Point Cloud Information *******/
   vector<pcl::shared_ptr<pcl::PointCloud<pcl::PointXYZ>>> clouds_;  ///< Point clouds per semantic

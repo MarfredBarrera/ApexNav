@@ -4,6 +4,7 @@
 #   ./scripts/run_gate_e2e.sh <baseline|gate> <episode>...
 #   SIM_GPU=0 OUT_ROOT=videos/gate_e2e ./scripts/run_gate_e2e.sh gate 213 229 529
 #   SYNC_STEP=true ./scripts/run_gate_e2e.sh baseline 213     # deterministic step
+#   EVAL_ARGS="verification.on_view_reject=defer" ./scripts/run_gate_e2e.sh gate 213
 #
 # Needs the four VLM servers running (scripts/start_session.sh) and, for "gate", the
 # perception server reachable at verification.url. The planner is (re)started here with
@@ -63,7 +64,7 @@ for N in "$@"; do
   if ! planner_up; then echo "planner is down before epi$N"; exit 1; fi
   echo "$(date +%T) start $MODE epi$N"
   timeout 3600 python habitat_evaluation.py --dataset "$DATASET" test_epi_num=$N video_output_path=$OUT \
-      verification.enabled=$GATE sync_step=$SYNC_STEP "record.flush_on=[all]" > "$OUT/eval.log" 2>&1 < /dev/null
+      verification.enabled=$GATE sync_step=$SYNC_STEP "record.flush_on=[all]" ${EVAL_ARGS:-} > "$OUT/eval.log" 2>&1 < /dev/null
   rc=$?
   echo "$(date +%T) done $MODE epi$N rc=$rc"
 done

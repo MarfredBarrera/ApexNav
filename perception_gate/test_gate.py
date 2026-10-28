@@ -10,7 +10,7 @@ import unittest
 
 import numpy as np
 
-from perception_gate.gate import REJECTED, UNVERIFIED, VerificationGate, target_name
+from perception_gate.gate import DEFERRED, REJECTED, UNVERIFIED, VerificationGate, target_name
 
 RGB = np.full((48, 64, 3), 120, dtype=np.uint8)
 
@@ -91,6 +91,28 @@ class GateTests(unittest.TestCase):
         self.assertEqual(self.gate.handle(request(cluster_id=4, seq=2), step=2), 1)  # error -> accept
         counts = self.gate.finish_episode()
         self.assertEqual((counts["no_evidence"], counts["errors"], counts["accepted"]), (1, 1, 2))
+
+    def test_defer(self):
+        """A view "no" after a raw "yes" defers; at the stop it rejects, also from the cache."""
+        self.gate.cfg["on_view_reject"] = "defer"
+        verdicts = []
+        self.gate._verify = lambda *a, **k: {"ok": True, "view_image": None, "verdict": verdicts.pop(0)}
+        view_no = {"accepted": False, "label": "lamp", "judged": "view", "input_scores": {"potted plant": 0.6}}
+        raw_no = {"accepted": False, "label": "lamp", "judged": "input", "input_scores": {"lamp": 0.6}}
+        self.observe(1, 16, (2.0, 0.0))
+        verdicts += [view_no]
+        self.assertEqual(self.gate.handle(request(), step=1), DEFERRED)
+        self.assertEqual(self.gate.handle(request(seq=2, at_stop=True), step=2), REJECTED)  # cached view
+        self.observe(3, 16, (6.0, 0.0))
+        verdicts += [raw_no]
+        self.assertEqual(self.gate.handle(request(cluster_id=5, centroid=(6.0, 0.0), seq=3), step=3), REJECTED)
+        self.observe(4, 16, (9.0, 0.0))
+        verdicts += [view_no]
+        self.assertEqual(self.gate.handle(request(cluster_id=6, centroid=(9.0, 0.0), seq=4, at_stop=True),
+                                         step=4), REJECTED)
+        self.assertEqual(self.gate.finish_episode()["deferred"], 1)
+        with self.assertRaises(ValueError):
+            VerificationGate({"on_view_reject": "maybe"}, "v")
 
     def test_recheck_cooldown(self):
         self.observe(1, 16, (2.0, 0.0), camera=(0.0, 0.0))

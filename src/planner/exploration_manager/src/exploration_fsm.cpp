@@ -292,6 +292,7 @@ bool ExplorationFSM::needsStopVerification(int& cluster_id, Vector2d& pos)
   auto obj_map = expl_manager_->object_map2d_;
   if (ed->target_cluster_id_ >= 0 && obj_map->getVerification(ed->target_cluster_id_) == 1)
     return false;  // the usual path: the target cluster was verified before the approach
+  // A deferred cluster (2) is verified again here, from the stop
   pos = ed->target_object_pos_;
   cluster_id = obj_map->nearestCluster(pos, FSMConstants::STOP_MATCH_DISTANCE);
   if (cluster_id >= 0)
@@ -338,13 +339,16 @@ void ExplorationFSM::requestVerification(int cluster_id, const Vector2d& pos, bo
 }
 
 // Apply a verdict on the pending request. Accepted (or fail-open): carry out the
-// action already planned (approach, or the stop). Rejected: drop the cluster (or
+// action already planned (approach, or the stop). Deferred: carry out the approach;
+// the stop backstop asks again (at a stop, deferred counts as rejected). Rejected: drop the cluster (or
 // cut the position out of over-depth targets) and replan from the same pose as
 // if it had never been detected
 void ExplorationFSM::finishVerification(int state, bool timed_out)
 {
   int id = fd_->verify_cluster_id_;
   auto obj_map = expl_manager_->object_map2d_;
+  if (state == 2 && (id < 0 || fd_->verify_at_stop_))
+    state = -1;
   if (id >= 0)
     obj_map->setVerification(id, state);
   else if (state == 1)
@@ -358,9 +362,10 @@ void ExplorationFSM::finishVerification(int state, bool timed_out)
         verification_timeout_s_);
   else
     RCLCPP_WARN(node_->get_logger(), "[Verification] cluster %d %s%s", id,
-        state == 1 ? "ACCEPTED" : "REJECTED", fd_->verify_at_stop_ ? " [at stop]" : "");
+        state == 1 ? "ACCEPTED" : state == 2 ? "DEFERRED" : "REJECTED",
+        fd_->verify_at_stop_ ? " [at stop]" : "");
   publishObjectFusionState();
-  if (state == 1) {
+  if (state == 1 || state == 2) {
     finishPlanning();
     return;
   }
@@ -390,7 +395,7 @@ void ExplorationFSM::verificationResultCallback(
         msg->cluster_id);
     return;
   }
-  finishVerification(msg->state > 0 ? 1 : -1, false);
+  finishVerification(msg->state == 1 || msg->state == 2 ? msg->state : -1, false);
 }
 
 /**
