@@ -16,6 +16,8 @@ from habitat.config.default import patch_config
 from habitat.config.default_structured_configs import HabitatConfigPlugin, register_hydra_plugin
 from habitat.datasets import make_dataset
 
+from basic_utils.eval import ovon_dataset  # noqa: F401  registers dataset type OVON-v1
+
 
 def iterator_episodes(dataset_name):
     register_hydra_plugin(HabitatConfigPlugin)
@@ -26,7 +28,7 @@ def iterator_episodes(dataset_name):
     options = {k.lower(): v for k, v in hcfg.environment.iterator_options.items()}
     options["seed"] = hcfg.seed
     iterator = dataset.get_episode_iterator(**options)
-    return [next(iterator) for _ in range(len(dataset.episodes))]
+    return [next(iterator) for _ in range(len(dataset.episodes))], hcfg.dataset.split
 
 
 def main():
@@ -37,7 +39,7 @@ def main():
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
 
-    episodes = iterator_episodes(args.dataset)
+    episodes, split = iterator_episodes(args.dataset)
     by_category = {}
     for index, episode in enumerate(episodes):
         by_category.setdefault(episode.object_category, []).append(index)
@@ -57,7 +59,7 @@ def main():
     rows = [{"index": i, "scene_id": episodes[i].scene_id, "episode_id": episodes[i].episode_id,
              "category": episodes[i].object_category} for i in chosen]
     with open(args.out, "w") as f:
-        json.dump({"dataset": args.dataset, "seed": args.seed, "n": args.n, "num_episodes": total,
+        json.dump({"dataset": args.dataset, "split": split, "seed": args.seed, "n": args.n, "num_episodes": total,
                    "allocation": alloc, "population": {c: len(ix) for c, ix in by_category.items()},
                    "episodes": rows}, f, indent=1)
     print(f"{len(rows)} episodes from {total}: {alloc} -> {args.out}")

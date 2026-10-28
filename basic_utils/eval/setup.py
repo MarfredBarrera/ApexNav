@@ -29,9 +29,9 @@ def parse_dataset_arg():
     parser.add_argument(
         "--dataset",
         type=str,
-        choices=["hm3dv1", "hm3dv2", "mp3d"],
+        choices=["hm3dv1", "hm3dv2", "mp3d", "ovon"],
         default="hm3dv2",
-        help="Choose dataset: hm3dv1, hm3dv2 or mp3d (default: hm3dv2)",
+        help="Choose dataset: hm3dv1, hm3dv2, mp3d or ovon (default: hm3dv2)",
     )
     parser.add_argument(
         "--delay",

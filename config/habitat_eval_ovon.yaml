@@ -1,0 +1,28 @@
+# HM3D-OVON (open-vocabulary ObjectNav) on ApexNav: everything as habitat_eval_hm3dv2
+# (embodiment, 500 steps, success 0.2 m, detector, recorder, perception gate), with
+#   - OVON-v1 episodes (basic_utils/eval/ovon_dataset.py; same HM3D-v2 val scenes),
+#   - labels passed verbatim (no MP3D/COCO renaming: OVON's "picture", "cushion", "table"
+#     are the targets as written),
+#   - LLM answers pre-generated for OVON's categories and frozen (llm_client: none, so a
+#     missing label fails instead of querying a model mid-run).
+# Splits: val_unseen (val_unseen/val_unseen.json.gz -> val_unseen_hard.json.gz on the
+# NAS, see data/datasets/ovon/README.md), val_seen, val_seen_synonyms.
+defaults:
+  - habitat_eval_hm3dv2
+  - _self_
+
+habitat:
+  dataset:
+    type: OVON-v1
+    split: val_unseen
+    data_path: data/datasets/ovon/hm3d/{split}/{split}.json.gz
+
+label_mapping: none   # mp3d (default when absent): MP3D -> detector names; none: verbatim
+
+llm:
+  llm_answer_path: llm/answers/llm_answer_ovon.txt
+  llm_response_path: llm/answers/llm_response_ovon.txt
+  llm_client:
+    llm_client: none
+
+video_output_path: "videos/test_ovon_{split}"

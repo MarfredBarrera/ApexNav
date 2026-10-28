@@ -25,6 +25,9 @@ Usage:
     # Run with MP3D dataset
     python habitat_evaluation.py --dataset mp3d
 
+    # Run with HM3D-OVON val_unseen (labels verbatim, frozen LLM answers)
+    python habitat_evaluation.py --dataset ovon
+
     # Test specific episode
     python habitat_evaluation.py --dataset hm3dv2 test_epi_num=10
 
@@ -62,6 +65,7 @@ from basic_utils.eval.habitat_utils import (
     semantic_instances_for_masks,
     slugify_label,
 )
+from basic_utils.eval import ovon_dataset  # noqa: F401  registers dataset type OVON-v1
 from basic_utils.eval.reporting import RunTotals
 from basic_utils.eval.setup import (
     add_visualization_measurements,
@@ -322,6 +326,11 @@ def main(
     dataset: str = "hm3dv2",
 ) -> None:
     category_to_coco, id_to_name = load_category_mapping()
+    # mp3d: MP3D category -> detector name (HM3D/MP3D configs); none: the
+    # episode's category verbatim (open-vocabulary OVON)
+    label_mapping = cfg.get("label_mapping", "mp3d")
+    if label_mapping not in ("mp3d", "none"):
+        raise ValueError(f"label_mapping must be mp3d or none, not {label_mapping}")
 
     node.final_state = 0
     node.expl_result = 0
@@ -414,9 +423,9 @@ def main(
         node.msg_observations = deepcopy(observations)
         del observations["camera_pitch"]
 
-        label = resolve_label(
-            env.current_episode.object_category, category_to_coco, id_to_name
-        )
+        label = env.current_episode.object_category
+        if label_mapping == "mp3d":
+            label = resolve_label(label, category_to_coco, id_to_name)
 
         # Get LLM answer and fusion threshold for the target object
         llm_answer, room, node.fusion_threshold = read_answer(
