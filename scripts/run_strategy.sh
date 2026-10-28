@@ -40,9 +40,17 @@ if [ -f $root/ABORT ]; then echo "$root/ABORT exists"; exit 1; fi
 todo=()
 for n in "$@"; do [ -f $root/$mode/epi$n/episodes.jsonl ] || todo+=($n); done
 if [ ${#todo[@]} -eq 0 ]; then echo "$(date +%T) $NAME: nothing to do"; exit 0; fi
+# A killed attempt leaves a directory without episodes.jsonl; the gate appends to its
+# decisions.jsonl, so move it aside instead of mixing two attempts
+for n in "${todo[@]}"; do
+  [ -d $root/$mode/epi$n ] && mv $root/$mode/epi$n $root/$mode/epi$n.partial.$(date +%Y%m%d%H%M%S)
+done
 
-guard=
+guard=; child=
 cleanup() {
+  # the episode loop runs inside the container and outlives its docker exec client
+  docker exec apexnav pkill -f run_gate_e2e.sh
+  [ -n "$child" ] && kill $child 2>/dev/null
   [ -n "$guard" ] && kill $guard 2>/dev/null
   pkill -f "gpu_guard.sh $GPU" 2>/dev/null
   docker exec $DEV pkill -f "perception.server"
@@ -79,7 +87,9 @@ else
 fi
 (cd $APEX && ABORT=$root/ABORT ./scripts/gpu_guard.sh $GPU 44000 8 >> $root/gpu_guard.log 2>&1) &
 guard=$!
-docker exec apexnav bash -c "cd /workspace/ApexNav && DATASET=$DATASET SIM_GPU=$GPU SYNC_STEP=$SYNC OUT_ROOT=videos/$NAME EVAL_ARGS='$eval_args' ./scripts/run_gate_e2e.sh $mode ${todo[*]} >> videos/$NAME/run_gate.log 2>&1"
+docker exec apexnav bash -c "cd /workspace/ApexNav && DATASET=$DATASET SIM_GPU=$GPU SYNC_STEP=$SYNC OUT_ROOT=videos/$NAME EVAL_ARGS='$eval_args' ./scripts/run_gate_e2e.sh $mode ${todo[*]} >> videos/$NAME/run_gate.log 2>&1" &
+child=$!
+wait $child  # in the background so a TERM runs cleanup now, not after the run
 done_n=0; for n in "${todo[@]}"; do [ -f $root/$mode/epi$n/episodes.jsonl ] && done_n=$((done_n+1)); done
 echo "$(date +%T) $NAME: finished $done_n/${#todo[@]} episodes"
 [ -f $root/ABORT ] && { echo "$NAME aborted"; exit 1; }

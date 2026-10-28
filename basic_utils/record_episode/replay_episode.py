@@ -258,6 +258,8 @@ def replay(record_dir, cfg):
         f"result '{meta.get('result')}') - {len(steps)} steps"
     )
 
+    from basic_utils.eval import ovon_dataset  # noqa: F401  registers dataset type OVON-v1
+
     register_hydra_plugin(HabitatConfigPlugin)
     repo_root = os.path.dirname(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
