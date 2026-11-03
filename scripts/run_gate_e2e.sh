@@ -5,6 +5,7 @@
 #   SIM_GPU=0 OUT_ROOT=videos/gate_e2e ./scripts/run_gate_e2e.sh gate 213 229 529
 #   SYNC_STEP=true ./scripts/run_gate_e2e.sh baseline 213     # deterministic step
 #   EVAL_ARGS="verification.on_view_reject=defer" ./scripts/run_gate_e2e.sh gate 213
+#   APPROACH=true EVAL_ARGS="verification.approach=true" ./scripts/run_gate_e2e.sh gate 213  # d1 server
 #
 # Needs the four VLM servers running (scripts/start_session.sh) and, for "gate", the
 # perception server reachable at verification.url. The planner is (re)started here with
@@ -22,6 +23,8 @@ DATASET=${DATASET:-hm3dv2}
 SYNC_STEP=${SYNC_STEP:-false}
 case "$SYNC_STEP" in true|false) ;; *) echo "SYNC_STEP must be true or false"; exit 2 ;; esac
 PLANNER_PER_EPISODE=${PLANNER_PER_EPISODE:-$SYNC_STEP}
+APPROACH=${APPROACH:-false}  # planner verification_approach (gate state 3, server selector d1)
+case "$APPROACH" in true|false) ;; *) echo "APPROACH must be true or false"; exit 2 ;; esac
 
 # ROS's setup.bash reads unset variables, so set -u only after sourcing it.
 source /opt/apexnav/apexnav-env.sh >/dev/null 2>&1
@@ -41,7 +44,8 @@ vlm_up() {
 
 stop_planner() { pkill -f exploration.launch.py; pkill -f exploration_node; pkill -f tsp_node; sleep 3; }
 start_planner() {  # log file, seconds to wait
-  ros2 launch exploration_manager exploration.launch.py verification_gate:=$GATE sync_step:=$SYNC_STEP > "$1" 2>&1 &
+  ros2 launch exploration_manager exploration.launch.py verification_gate:=$GATE verification_approach:=$APPROACH \
+      sync_step:=$SYNC_STEP > "$1" 2>&1 &
   sleep "$2"
 }
 planner_up() { pgrep -f exploration_node >/dev/null && pgrep -f tsp_node >/dev/null; }

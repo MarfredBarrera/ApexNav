@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Closed-loop ApexNav runs of one verification strategy on GPU $GPU (host side).
-#   ./scripts/run_strategy.sh <baseline|sam3|naive|vqf|top2gap|defer> <name> <sync true|false> <episode>...
+#   ./scripts/run_strategy.sh <baseline|sam3|naive|vqf|top2gap|defer|d1> <name> <sync true|false> <episode>...
 #   GPU=2 DATASET=ovon ./scripts/run_strategy.sh defer ovon_defer true 2044 2965
 # Output: ~/codes/ApexNav/videos/<name>/<baseline|gate>/epiN; perception server logs:
 # ~/codes/3DAwareVerification/outputs/apexnav_online/server_<name>/. Episodes that already
@@ -12,6 +12,9 @@
 #   top2gap: --selector top2gap --no-ensemble --judge-input
 #   defer:   --selector top2gap --no-ensemble --judge-input --view-when unsure, and the gate
 #            defers (verification.on_view_reject=defer) instead of rejecting on a view "no"
+#   d1:      --selector d1 (sufficiency check -> SAM3, else Qwen + SAM3D grid, three-way), and
+#            the gate approaches on "insufficient" (verification.approach=true; the planner
+#            is launched with verification_approach:=true)
 # DATASET (default hm3dv2) is passed to habitat_evaluation.py --dataset.
 # Needs the four VLM servers (scripts/start_session.sh); does not start or stop them.
 # On any exit it stops the perception server/workers, its gpu_guard and any episode or
@@ -21,6 +24,7 @@ STRAT=${1:?strategy}; NAME=${2:?name}; SYNC=${3:?sync}; shift 3
 GPU=${GPU:-0}
 DATASET=${DATASET:-hm3dv2}
 eval_args=
+approach=false
 DEV=3dawareverification-dev-1
 APEX=/home/marfred/codes/ApexNav
 AV=/home/marfred/codes/3DAwareVerification
@@ -32,6 +36,7 @@ case $STRAT in
   top2gap) mode=gate; flags="--selector top2gap --no-ensemble --judge-input" ;;
   defer) mode=gate; flags="--selector top2gap --no-ensemble --judge-input --view-when unsure"
          eval_args="verification.on_view_reject=defer" ;;
+  d1) mode=gate; flags="--selector d1"; eval_args="verification.approach=true"; approach=true ;;
   *) echo "unknown strategy $STRAT"; exit 2 ;;
 esac
 root=$APEX/videos/$NAME
@@ -87,7 +92,7 @@ else
 fi
 (cd $APEX && ABORT=$root/ABORT ./scripts/gpu_guard.sh $GPU 44000 8 >> $root/gpu_guard.log 2>&1) &
 guard=$!
-docker exec apexnav bash -c "cd /workspace/ApexNav && DATASET=$DATASET SIM_GPU=$GPU SYNC_STEP=$SYNC OUT_ROOT=videos/$NAME EVAL_ARGS='$eval_args' ./scripts/run_gate_e2e.sh $mode ${todo[*]} >> videos/$NAME/run_gate.log 2>&1" &
+docker exec apexnav bash -c "cd /workspace/ApexNav && DATASET=$DATASET SIM_GPU=$GPU SYNC_STEP=$SYNC APPROACH=$approach OUT_ROOT=videos/$NAME EVAL_ARGS='$eval_args' ./scripts/run_gate_e2e.sh $mode ${todo[*]} >> videos/$NAME/run_gate.log 2>&1" &
 child=$!
 wait $child  # in the background so a TERM runs cleanup now, not after the run
 done_n=0; for n in "${todo[@]}"; do [ -f $root/$mode/epi$n/episodes.jsonl ] && done_n=$((done_n+1)); done

@@ -104,7 +104,7 @@ tmux split-window -t "${SESSION}:ros" -v -c "${WS}"
 # Foxglove replaces rviz.launch.py here. Both panes are C++ nodes - no CUDA.
 run "${SESSION}:ros.0" use_core - "ros2 launch exploration_manager foxglove.launch.py"
 # Give the models a head start; the planner is cheap to restart if you need to.
-run "${SESSION}:ros.1" use_core - "sleep 20 && ros2 launch exploration_manager exploration.launch.py verification_gate:=${VERIFICATION_GATE:-false} sync_step:=${SYNC_STEP:-false}"
+run "${SESSION}:ros.1" use_core - "sleep 20 && ros2 launch exploration_manager exploration.launch.py verification_gate:=${VERIFICATION_GATE:-false} verification_approach:=${VERIFICATION_APPROACH:-false} sync_step:=${SYNC_STEP:-false}"
 
 # --- window 2: the evaluation shell (Env A) -----------------------------------
 # Exported rather than prefixed, so re-runs and any other command typed in this pane

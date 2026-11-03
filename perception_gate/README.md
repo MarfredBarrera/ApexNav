@@ -198,6 +198,16 @@ Override any of them on the command line, e.g. `verification.max_checks=1`.
 | `recheck_cooldown_steps` | 25 | steps before a rejected cluster can be re-checked |
 | `recheck_min_distance_m` / `recheck_min_angle_deg` | 1.0 / 45 | the re-check needs a view this far from / this different to earlier views |
 | `match_distance_m` | 0.75 | how close a stored view must be to the cluster / stop point |
+| `approach` | false | server `--selector d1` (three-way verdicts): "insufficient" sends the agent closer for a new view (state 3). Must match the planner's `verification_approach`; `scripts/run_strategy.sh d1` sets both |
+| `approach_max_per_cluster` / `approach_max_steps` / `approach_episode_steps` | 2 / 40 / 120 | approach budgets; a failed approach (unreachable, aborted, no new view) or "insufficient" after the last one rejects |
+| `approach_min_closer_m` / `approach_min_angle_deg` | 0.5 / 30 | a view during or after an approach counts as new when it is this much closer than, or this far around the object from, every view already judged |
+
+Approach (d1): the planner drives to a viewpoint 0.8-1.5 m from the object point (the
+evidence centroid) along the judged view's line of sight, jittered 0/+-20/+-40 deg (only
+the side bearings when that view was already within 1.5 m; cost = path length + 1 m per
+20 deg), faces the object and asks again; a new view on the way ends the approach early.
+At the stop the planner first turns to face the object; "insufficient" there gets one
+side-view (+-40 deg) approach if the budget allows, else rejects (never stops on it).
 
 Give-up stops (no frontier left, stuck, step limit) are not verified, by design.
 
