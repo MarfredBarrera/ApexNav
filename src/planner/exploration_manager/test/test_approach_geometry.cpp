@@ -58,11 +58,12 @@ TEST(ApproachGeometry, FarCameraUsesLineOfSight)
 
 TEST(ApproachGeometry, NewViewRule)
 {
-  // Camera 1.8 m away: straight-on and +-20 need r <= 1.3; +-40 is around enough at any radius
+  // Camera 1.8 m away: straight-on and +-20 need r <= 1.8 - 0.5 - 0.45 = 0.85 (only 0.8);
+  // +-40 is around enough (>= 30 + 10 deg) at any radius
   Vector2d object(0.0, 0.0), camera(1.8, 0.0);
   for (const auto& c : candidates(object, camera, false)) {
     if (std::fabs(c.jitter_deg) < 30.0) {
-      EXPECT_LE(c.radius, 1.3 + 1e-9);
+      EXPECT_DOUBLE_EQ(c.radius, 0.8);
     }
   }
   int side = 0;
@@ -79,11 +80,40 @@ TEST(ApproachGeometry, NearCameraSideOnly)
   for (const auto& c : cs) EXPECT_NEAR(std::fabs(angleFrom(object, c.point, M_PI)), 40.0, 1e-6);
 }
 
-TEST(ApproachGeometry, NearCameraKeepsCloser20)
+TEST(ApproachGeometry, NearCameraArrivalSlack)
 {
-  // 1.45 m: +-20 at 0.8 m is 0.65 m closer, so it stays
+  // 1.45 m: +-20 at 0.8 m is only 0.65 m closer, under 0.5 m + the 0.45 m arrival slack
   auto cs = candidates(Vector2d(0, 0), Vector2d(0.0, 1.45), false);
-  EXPECT_EQ(jitters(cs), (std::set<int>{ -40, -20, 20, 40 }));
+  EXPECT_EQ(jitters(cs), (std::set<int>{ -40, 40 }));
+}
+
+TEST(ApproachGeometry, ArrivalStillNew)
+{
+  // Candidates that rely on being closer stay 0.5 m closer from anywhere within the 0.45 m
+  // soft-reach distance of them
+  Vector2d object(0.0, 0.0), camera(3.0, 1.0);
+  double range = camera.norm();
+  for (const auto& c : candidates(object, camera, false)) {
+    for (int k = 0; k < 16; ++k) {
+      Vector2d p = c.point + 0.45 * Vector2d(std::cos(k * M_PI / 8), std::sin(k * M_PI / 8));
+      bool closer = p.norm() <= range - 0.5;
+      // (side candidates rely on the angle; the gate judges an arrival without thresholds)
+      if (std::fabs(c.jitter_deg) < 40.0) {
+        EXPECT_TRUE(closer) << c.jitter_deg << " " << c.radius;
+      }
+    }
+  }
+}
+
+TEST(ApproachGeometry, MinRangeOfAllJudgedViews)
+{
+  // The latest camera is 3 m away, but an earlier judged view was 1.6 m away: straight-on
+  // would need r <= 0.65, so only the side bearings remain
+  auto cs = candidates(Vector2d(0, 0), Vector2d(3.0, 0.0), false, 1.6);
+  EXPECT_EQ(jitters(cs), (std::set<int>{ -40, 40 }));
+  // min_range <= 0: the camera's distance
+  EXPECT_EQ(jitters(candidates(Vector2d(0, 0), Vector2d(3.0, 0.0), false, 0.0)),
+      (std::set<int>{ -40, -20, 0, 20, 40 }));
 }
 
 TEST(ApproachGeometry, StopBackstopSideOnly)

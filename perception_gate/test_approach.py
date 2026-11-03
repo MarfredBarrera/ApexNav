@@ -48,11 +48,11 @@ class ApproachTests(unittest.TestCase):
             self.calls.append(request_id)
             return {"ok": True, "view_image": None, "verdict": d1_verdict(self.statuses.pop(0))}
 
-        self.gate = VerificationGate({"enabled": True, "approach": True,
+        self.gate = VerificationGate({"enabled": True, "approach": True, "on_error": "reject",
                                       "log_dir": self.folder + "/{video_output_path}"}, "v",
                                      verify=verify, ping=lambda url, timeout: {"ok": True,
                                                                               "settings": {"selector": "d1"}})
-        self.gate.start_episode(7, "scene", "ep", "potted_plant", goal_object_ids=["42"])
+        self.gate.start_episode(7, "scene", "ep", "potted_plant", goal_object_ids=["42"], max_episode_steps=500)
 
     def observe(self, step, camera, centroid=OBJECT, size=16, fusion=None):
         return self.gate.observe(step, RGB, [mask(size)], [0], [0.5], [centroid],
@@ -73,7 +73,7 @@ class ApproachTests(unittest.TestCase):
                              expected)
         approach = self.gate.pending_approach(5)
         self.assertEqual(approach, {"approach_id": 1, "object": (17.0, 0.0), "camera": (15.0, 0.0),
-                                    "max_steps": 40, "side_only": False})
+                                    "min_range": 2.0, "max_steps": 40, "side_only": False})
         self.assertIsNone(self.gate.pending_approach(3))
         counts = self.gate.finish_episode()
         self.assertEqual((counts["accepted"], counts["rejected"], counts["moves"], counts["insufficient"],
@@ -114,6 +114,42 @@ class ApproachTests(unittest.TestCase):
         self.assertEqual(self.gate.handle(request(seq=2, approach_id=1, status=1, steps=6), step=6), ACCEPTED)
         self.assertEqual(self.gate.clusters[3]["used"][-1]["camera"], (1.1, 0.0))
 
+    def test_arrival_has_no_new_view_threshold(self):
+        # The viewpoint counts as reached up to 0.45 m off: an arrival is judged on the newest
+        # view since the approach began, even one that is not 0.5 m closer
+        self.observe(1, (0.0, 0.0))
+        self.insufficient_then("correct")
+        self.gate.handle(request(), step=1)
+        self.assertEqual(self.observe(4, (0.3, 0.0)), [])  # not new: no early end
+        self.assertEqual(self.gate.handle(request(seq=2, approach_id=1, status=1, steps=3), step=4), ACCEPTED)
+        self.assertEqual(self.gate.clusters[3]["used"][-1]["camera"], (0.3, 0.0))
+        # ... but an early end still needs a new view
+        self.gate.clusters[3]["approach"] = {"id": 9, "issued_step": 4, "object": OBJECT, "camera": (0.3, 0.0),
+                                             "min_range": 1.7, "max_steps": 40, "side_only": False,
+                                             "at_stop": False, "early": None}
+        self.assertEqual(self.observe(5, (0.5, 0.0)), [])
+        self.assertEqual(self.gate.handle(request(seq=3, approach_id=9, status=4, steps=1), step=5), REJECTED)
+        self.assertEqual(self.gate.finish_episode()["not_redetected"], 1)
+
+    def test_min_range_over_all_judged_views(self):
+        self.gate.clusters[3] = {"state": 0, "checks": 1, "last_step": 0, "centroid": OBJECT, "approaches": 0,
+                                 "approach": None, "used": [{"camera": (1.0, 0.0), "bearing": 0.0, "range": 1.0}]}
+        self.observe(2, (-2.0, 0.0), size=30)  # a new view from 4 m (by the re-check rule)
+        self.insufficient_then()
+        self.assertEqual(self.gate.handle(request(), step=2), APPROACH)
+        approach = self.gate.pending_approach(3)
+        self.assertEqual((approach["camera"], approach["min_range"]), ((-2.0, 0.0), 1.0))
+
+    def test_max_steps_capped_by_episode_end(self):
+        self.observe(480, (0.0, 0.0))
+        self.insufficient_then()
+        self.gate.handle(request(), step=480)
+        self.assertEqual(self.gate.pending_approach(3)["max_steps"], 19)  # steps 481..499; 500 is the stop
+        self.observe(499, (-1.0, 1.0), centroid=(5.0, 0.0))
+        self.insufficient_then()
+        self.assertEqual(self.gate.handle(request(4, (5.0, 0.0), seq=2), step=499), REJECTED)
+        self.assertEqual(decisions(self.folder)[-1]["policy"], "insufficient,episode_end")
+
     def test_cache_bypass(self):
         # A view judged for a stop position is cached; the approach must not reuse that verdict
         self.observe(1, (0.0, 0.0))
@@ -134,7 +170,8 @@ class ApproachTests(unittest.TestCase):
             self.insufficient_then()
             self.assertEqual(self.gate.handle(request(cluster_id, centroid, seq=cluster_id), step=10 * cluster_id),
                              APPROACH)
-            self.observe(10 * cluster_id + 1, (centroid[0] - 1.9, 0.0), centroid)  # not new
+            if status != 1:  # (an arrival with no view since the approach began is not re-detected)
+                self.observe(10 * cluster_id + 1, (centroid[0] - 1.9, 0.0), centroid)  # not new
             self.assertEqual(self.gate.handle(request(cluster_id, centroid, seq=20 + cluster_id, approach_id=1,
                                                       status=status, steps=1), step=10 * cluster_id + 1), REJECTED)
             self.assertIsNone(self.gate.pending_approach(cluster_id))
@@ -209,8 +246,11 @@ class ApproachTests(unittest.TestCase):
 
     def test_selector_must_match(self):
         with self.assertRaises(ValueError):
+            VerificationGate({"enabled": True, "approach": True, "on_error": "reject", "log_dir": self.folder},
+                             "v", ping=lambda url, timeout: {"ok": True, "settings": {"selector": "input"}})
+        with self.assertRaises(ValueError):  # every approach failure rejects, server errors too
             VerificationGate({"enabled": True, "approach": True, "log_dir": self.folder}, "v",
-                             ping=lambda url, timeout: {"ok": True, "settings": {"selector": "input"}})
+                             ping=lambda url, timeout: {"ok": True, "settings": {"selector": "d1"}})
         with self.assertRaises(ValueError):
             VerificationGate({"enabled": True, "log_dir": self.folder}, "v",
                              ping=lambda url, timeout: {"ok": True, "settings": {"selector": "d1"}})

@@ -228,6 +228,7 @@ class HabitatEvalNode(Node):
             msg.object_y = float(approach["object"][1])
             msg.camera_x = float(approach["camera"][0])
             msg.camera_y = float(approach["camera"][1])
+            msg.min_range = float(approach["min_range"])
             msg.max_steps = int(approach["max_steps"])
             msg.side_only = bool(approach["side_only"])
         self.verification_result_pub.publish(msg)

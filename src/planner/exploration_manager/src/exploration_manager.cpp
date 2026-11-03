@@ -786,8 +786,8 @@ bool ExplorationManager::planTrajectory(
 }
 
 bool ExplorationManager::searchApproachPath(const Vector2d& start, const Vector2d& object,
-    const Vector2d& camera, int cluster_id, bool side_only, double max_path, Vector2d& viewpoint,
-    vector<Vector2d>& path, double& jitter_deg)
+    const Vector2d& camera, double min_range, int cluster_id, bool side_only, double max_path,
+    Vector2d& viewpoint, vector<Vector2d>& path, double& jitter_deg)
 {
   const double see_distance = 0.30;  // the sight line reaches the object this close to its cells
   vector<Vector2d> cells;
@@ -816,7 +816,7 @@ bool ExplorationManager::searchApproachPath(const Vector2d& start, const Vector2
 
   // Candidates in a fixed order; cheaper ones first, so the straight-line lower bound
   // (distance + rank cost) prunes A* calls without changing the choice
-  vector<approach::Candidate> candidates = approach::candidates(object, camera, side_only);
+  vector<approach::Candidate> candidates = approach::candidates(object, camera, side_only, min_range);
   std::stable_sort(candidates.begin(), candidates.end(),
       [&](const approach::Candidate& a, const approach::Candidate& b) {
         return (a.point - start).norm() + approach::RANK_COST * a.rank <

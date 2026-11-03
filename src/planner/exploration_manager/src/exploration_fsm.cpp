@@ -9,6 +9,10 @@
 
 using namespace std::chrono_literals;
 
+static_assert(apexnav_planner::approach::ARRIVAL_SLACK >=
+                  apexnav_planner::FSMConstants::VIEWPOINT_SOFT_REACH_DISTANCE,
+    "approach candidates must keep the arrival tolerance in reserve");
+
 namespace apexnav_planner {
 void ExplorationFSM::init(rclcpp::Node::SharedPtr node)
 {
@@ -497,6 +501,7 @@ void ExplorationFSM::startApproach(const plan_env::msg::VerificationResult& msg)
   fd_->vp_approach_id_ = msg.approach_id;
   fd_->vp_object_ = Vector2d(msg.object_x, msg.object_y);
   fd_->vp_camera_ = Vector2d(msg.camera_x, msg.camera_y);
+  fd_->vp_min_range_ = msg.min_range;
   fd_->vp_side_only_ = msg.side_only;
   fd_->vp_max_steps_ = msg.max_steps;
   fd_->vp_steps_ = 0;
@@ -512,7 +517,7 @@ void ExplorationFSM::startApproach(const plan_env::msg::VerificationResult& msg)
   vector<Vector2d> path;
   double jitter = 0.0;
   if (msg.max_steps <= 0 ||
-      !expl_manager_->searchApproachPath(pos, fd_->vp_object_, fd_->vp_camera_, msg.cluster_id,
+      !expl_manager_->searchApproachPath(pos, fd_->vp_object_, fd_->vp_camera_, fd_->vp_min_range_, msg.cluster_id,
           msg.side_only, approach::maxPath(msg.max_steps), viewpoint, path, jitter)) {
     RCLCPP_WARN(node_->get_logger(),
         "[Verification] cluster %d approach %d: no reachable viewpoint around (%.2f, %.2f)%s",
@@ -591,7 +596,8 @@ void ExplorationFSM::planApproachAction()
       fd_->vp_researched_ = true;
       Vector2d viewpoint;
       double jitter = 0.0;
-      if (expl_manager_->searchApproachPath(pos, fd_->vp_object_, fd_->vp_camera_, fd_->vp_cluster_id_,
+      if (expl_manager_->searchApproachPath(pos, fd_->vp_object_, fd_->vp_camera_, fd_->vp_min_range_,
+              fd_->vp_cluster_id_,
               fd_->vp_side_only_, approach::maxPath(fd_->vp_max_steps_ - fd_->vp_steps_), viewpoint, path,
               jitter)) {
         RCLCPP_WARN(node_->get_logger(), "[Verification] viewpoint blocked; new viewpoint (%.2f, %.2f)",

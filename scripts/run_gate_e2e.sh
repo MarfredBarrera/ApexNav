@@ -5,7 +5,7 @@
 #   SIM_GPU=0 OUT_ROOT=videos/gate_e2e ./scripts/run_gate_e2e.sh gate 213 229 529
 #   SYNC_STEP=true ./scripts/run_gate_e2e.sh baseline 213     # deterministic step
 #   EVAL_ARGS="verification.on_view_reject=defer" ./scripts/run_gate_e2e.sh gate 213
-#   APPROACH=true EVAL_ARGS="verification.approach=true" ./scripts/run_gate_e2e.sh gate 213  # d1 server
+#   APPROACH=true EVAL_ARGS="verification.approach=true verification.on_error=reject" ./scripts/run_gate_e2e.sh gate 213  # d1 server
 #
 # Needs the four VLM servers running (scripts/start_session.sh) and, for "gate", the
 # perception server reachable at verification.url. The planner is (re)started here with

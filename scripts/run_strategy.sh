@@ -14,7 +14,8 @@
 #            defers (verification.on_view_reject=defer) instead of rejecting on a view "no"
 #   d1:      --selector d1 (sufficiency check -> SAM3, else Qwen + SAM3D grid, three-way), and
 #            the gate approaches on "insufficient" (verification.approach=true; the planner
-#            is launched with verification_approach:=true)
+#            is launched with verification_approach:=true); server errors reject
+#            (verification.on_error=reject), as every other approach failure does
 # DATASET (default hm3dv2) is passed to habitat_evaluation.py --dataset.
 # Needs the four VLM servers (scripts/start_session.sh); does not start or stop them.
 # On any exit it stops the perception server/workers, its gpu_guard and any episode or
@@ -36,7 +37,7 @@ case $STRAT in
   top2gap) mode=gate; flags="--selector top2gap --no-ensemble --judge-input" ;;
   defer) mode=gate; flags="--selector top2gap --no-ensemble --judge-input --view-when unsure"
          eval_args="verification.on_view_reject=defer" ;;
-  d1) mode=gate; flags="--selector d1"; eval_args="verification.approach=true"; approach=true ;;
+  d1) mode=gate; flags="--selector d1"; eval_args="verification.approach=true verification.on_error=reject"; approach=true ;;
   *) echo "unknown strategy $STRAT"; exit 2 ;;
 esac
 root=$APEX/videos/$NAME

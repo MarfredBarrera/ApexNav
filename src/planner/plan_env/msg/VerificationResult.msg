@@ -19,5 +19,6 @@ float32 object_x           # the point to approach (evidence centroid), planner 
 float32 object_y
 float32 camera_x           # camera of the insufficient view (line of sight object -> camera)
 float32 camera_y
+float32 min_range          # closest object distance of any view the gate judged for the cluster
 int32 max_steps            # actions the planner may spend on this approach
 bool side_only             # stop backstop: only the +-40 deg bearings

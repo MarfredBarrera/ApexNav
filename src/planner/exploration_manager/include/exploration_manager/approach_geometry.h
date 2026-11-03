@@ -25,6 +25,10 @@ constexpr double RANK_COST = 1.0;      // m of path one jitter rank is worth
 // insufficient view, or this far around it (perception_gate approach_min_closer_m / _angle_deg)
 constexpr double MIN_CLOSER = 0.5;
 constexpr double MIN_ANGLE_DEG = 30.0;
+// The planner counts a viewpoint as reached this far off (FSMConstants::
+// VIEWPOINT_SOFT_REACH_DISTANCE), so a candidate keeps that much (and some angle) in reserve
+constexpr double ARRIVAL_SLACK = 0.45;
+constexpr double ANGLE_SLACK_DEG = 10.0;
 
 struct Candidate {
   Eigen::Vector2d point;
@@ -46,13 +50,15 @@ inline std::vector<double> radii()
 // rank, then jitter (+ before -), then radius. The straight-on bearing (rank 0) is dropped
 // when the camera is already within NEAR_DISTANCE of the object (the view was likely cut
 // off or occluded, not far); side_only (stop backstop) keeps only the +-40 deg bearings.
-// Candidates that would not give a new view (neither MIN_CLOSER closer than the camera nor
-// MIN_ANGLE_DEG around the object from it) are dropped.
+// Candidates that would not give a new view even ARRIVAL_SLACK off are dropped: neither
+// MIN_CLOSER + ARRIVAL_SLACK closer than min_range (the closest view the gate judged; <= 0:
+// the camera's distance) nor MIN_ANGLE_DEG + ANGLE_SLACK_DEG around the object.
 inline std::vector<Candidate> candidates(
-    const Eigen::Vector2d& object, const Eigen::Vector2d& camera, bool side_only)
+    const Eigen::Vector2d& object, const Eigen::Vector2d& camera, bool side_only, double min_range = 0.0)
 {
   std::vector<Candidate> out;
   const double range = (camera - object).norm();
+  const double closest = min_range > 0.0 ? std::min(min_range, range) : range;
   const double sight = range > 1e-6 ? std::atan2(camera(1) - object(1), camera(0) - object(0)) : 0.0;
   const bool near = range <= NEAR_DISTANCE;
   for (int rank = 0; rank <= MAX_JITTER_RANK; ++rank) {
@@ -66,8 +72,8 @@ inline std::vector<Candidate> candidates(
       double jitter = sign * rank * JITTER_STEP_DEG;
       double bearing = sight + jitter * M_PI / 180.0;
       for (double r : radii()) {
-        bool closer = r <= range - MIN_CLOSER;
-        bool around = std::fabs(jitter) >= MIN_ANGLE_DEG;
+        bool closer = r <= closest - MIN_CLOSER - ARRIVAL_SLACK + 1e-9;
+        bool around = std::fabs(jitter) >= MIN_ANGLE_DEG + ANGLE_SLACK_DEG - 1e-9;
         if (!closer && !around)
           continue;
         out.push_back({ object + r * Eigen::Vector2d(std::cos(bearing), std::sin(bearing)), jitter, rank, r });

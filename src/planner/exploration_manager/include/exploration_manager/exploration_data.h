@@ -69,6 +69,7 @@ struct FSMData {
     vp_no_progress_ = 0;
     vp_object_ = vp_camera_ = vp_pos_ = vp_last_pos_ = Eigen::Vector2d::Zero();
     vp_jitter_ = 0.0;
+    vp_min_range_ = 0.0;
     vp_side_only_ = false;
     vp_researched_ = false;
     vp_at_stop_ = false;
@@ -129,6 +130,7 @@ struct FSMData {
   Eigen::Vector2d vp_pos_;       // the viewpoint
   Eigen::Vector2d vp_last_pos_;  // position at the previous approach action
   double vp_jitter_;             // deg from the line of sight
+  double vp_min_range_;          // closest object distance of the views the gate judged
   bool vp_side_only_;            // stop backstop: +-40 deg bearings only
   bool vp_researched_;           // the viewpoint was re-searched once after it became blocked
   // The ordinary request the approaches started from: a rejection after an approach at the

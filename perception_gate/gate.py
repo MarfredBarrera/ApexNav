@@ -1,7 +1,7 @@
 """VerificationGate: the Python half of the perception gate (no ROS imports).
 
 Per episode:
-    gate.start_episode(run_index, scene, episode_id, label, goal_object_ids)
+    gate.start_episode(run_index, scene, episode_id, label, goal_object_ids, max_episode_steps)
     reopen = gate.observe(step, rgb, masks, labels, scores, centroids, semantic_instances,
                           pose, camera_pitch, fusion)        # after every sim step
     state = gate.handle(request, fusion, step)               # on /object/verification_request
@@ -147,6 +147,8 @@ class VerificationGate:
         if self.cfg["on_view_reject"] not in ("reject", "defer"):
             raise ValueError("verification.on_view_reject must be reject or defer")
         self.approach = bool(self.cfg["approach"])
+        if self.approach and self.cfg["on_error"] != "reject":
+            raise ValueError("verification.approach needs on_error=reject (every approach failure rejects)")
         for key in ("approach_max_per_cluster", "approach_max_steps", "approach_episode_steps"):
             if int(self.cfg[key]) < 0:
                 raise ValueError(f"verification.{key} must be >= 0")
@@ -172,7 +174,9 @@ class VerificationGate:
     # Episode lifecycle
     # ------------------------------------------------------------------
 
-    def start_episode(self, run_index, scene, episode_id, label, goal_object_ids=()):
+    def start_episode(self, run_index, scene, episode_id, label, goal_object_ids=(), max_episode_steps=None):
+        """``max_episode_steps``: the episode's step limit (an approach never plans past it)."""
+        self.max_episode_steps = None if max_episode_steps is None else int(max_episode_steps)
         self.episode = {"run_index": int(run_index), "scene": str(scene), "episode_id": str(episode_id),
                         "label": str(label), "target": target_name(label),
                         "goal_object_ids": [str(i) for i in goal_object_ids if i is not None]}
@@ -441,6 +445,14 @@ class VerificationGate:
     def _approach_remaining(self):
         return int(self.cfg["approach_episode_steps"]) - self.approach_steps_used
 
+    def _approach_steps_allowed(self, step):
+        """Actions the next approach may take: per approach, per episode budget, and the steps
+        left before the episode's step limit (the last step is the forced stop)."""
+        allowed = min(int(self.cfg["approach_max_steps"]), self._approach_remaining())
+        if self.max_episode_steps is not None:
+            allowed = min(allowed, self.max_episode_steps - int(step) - 1)
+        return allowed
+
     def _approach_blocked(self, record, state, at_stop, approach):
         """Why an insufficient view cannot be approached (None: it can)."""
         if record["cluster"]["id"] < 0 or state is None:
@@ -451,42 +463,52 @@ class VerificationGate:
             return "cluster_budget"
         if min(int(self.cfg["approach_max_steps"]), self._approach_remaining()) <= 0:
             return "episode_budget"
+        if self._approach_steps_allowed(record["step"]) <= 0:
+            return "episode_end"
         return None
 
     def _issue_approach(self, record, state, evidence, at_stop):
         state["approaches"] += 1
         self.counts["moves"] += 1
+        # The planner only knows this view's camera; the gate's new-view test compares with
+        # every judged view, so it also gets the closest of them
+        ranges = [u["range"] for u in state["used"] if "range" in u]
+        min_range = min(ranges) if ranges else _distance(evidence["camera"], evidence["centroid"])
         pending = {"id": state["approaches"], "issued_step": int(record["step"]),
                    "object": tuple(evidence["centroid"]), "camera": tuple(evidence["camera"]),
-                   "max_steps": min(int(self.cfg["approach_max_steps"]), self._approach_remaining()),
+                   "min_range": float(min_range), "max_steps": self._approach_steps_allowed(record["step"]),
                    "side_only": bool(at_stop), "at_stop": bool(at_stop), "early": None}
         state["approach"] = pending
         record["approach"] = {"id": pending["id"], "issued": True, "object": list(pending["object"]),
-                              "camera": list(pending["camera"]), "max_steps": pending["max_steps"],
-                              "side_only": pending["side_only"]}
+                              "camera": list(pending["camera"]), "min_range": round(min_range, 3),
+                              "max_steps": pending["max_steps"], "side_only": pending["side_only"]}
         self.events.append({"event": "approach", "cluster_id": record["cluster"]["id"], "approach": pending["id"],
                             "object": list(pending["object"]), "camera": list(pending["camera"]),
                             "max_steps": pending["max_steps"], "side_only": pending["side_only"]})
 
     def pending_approach(self, cluster_id):
         """The approach a state-3 decision issued for ``cluster_id``: {approach_id, object, camera,
-        max_steps, side_only}; None if there is none."""
+        min_range, max_steps, side_only}; None if there is none."""
         pending = self.clusters.get(int(cluster_id), {}).get("approach")
         if pending is None:
             return None
         return {"approach_id": pending["id"], "object": pending["object"], "camera": pending["camera"],
-                "max_steps": pending["max_steps"], "side_only": pending["side_only"]}
+                "min_range": pending["min_range"], "max_steps": pending["max_steps"],
+                "side_only": pending["side_only"]}
 
-    def _approach_view(self, item, cluster_id, pending, used):
+    def _approach_view(self, item, cluster_id, pending, used, novel=True):
         """Match distance when ``item`` is a new view of the approached object: taken since the
         approach was issued, of the object point (not nearer another cluster), and closer by
         ``approach_min_closer_m`` than, or ``approach_min_angle_deg`` around the object from,
-        every view judged for the cluster. Else None."""
-        if item["step"] < pending["issued_step"]:
+        every view judged for the cluster. Else None. ``novel`` False (arrival: the agent
+        physically moved there): any view taken after the approach was issued."""
+        if item["step"] < pending["issued_step"] or (not novel and item["step"] == pending["issued_step"]):
             return None
         distance = _distance(item["centroid"], pending["object"])
         if distance > self.cfg["match_distance_m"] or self._closer_to_other(item, cluster_id, distance):
             return None
+        if not novel:
+            return distance
         rng = _distance(item["camera"], item["centroid"])
         bearing = _bearing(item["camera"], item["centroid"])
         closer, angle = float(self.cfg["approach_min_closer_m"]), math.radians(self.cfg["approach_min_angle_deg"])
@@ -548,8 +570,11 @@ class VerificationGate:
         if status == EARLY and pending["early"] is not None:
             view = pending["early"]
         else:
+            # Arrival: the newest view since the approach started, without the new-view
+            # thresholds (the planner's viewpoint can sit up to its reach distance off)
             views = [(item, d) for item in self.evidence
-                     for d in [self._approach_view(item, record["cluster"]["id"], pending, state["used"])]
+                     for d in [self._approach_view(item, record["cluster"]["id"], pending, state["used"],
+                                                   novel=status != ARRIVED)]
                      if d is not None]
             if views:  # the newest: on arrival, the one facing the object
                 view = max(views, key=lambda v: (v[0]["step"], v[0]["quality"]))

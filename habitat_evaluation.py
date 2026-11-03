@@ -460,6 +460,7 @@ def main(
                 goal_object_ids=[
                     getattr(goal, "object_id", None) for goal in env.current_episode.goals
                 ],
+                max_episode_steps=ctx["max_episode_steps"],
             )
 
         video.start_episode(observations)
