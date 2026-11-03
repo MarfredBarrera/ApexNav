@@ -157,7 +157,9 @@ def run_episode(env, node, ctx, label, llm_answer, room):
             # A gate-off run never gets here (main() checks the planner flag);
             # accepting keeps a mismatched planner from waiting for its timeout
             state = gate.handle(request, node.object_fusion, count_steps) if gate else 1
-            node.publish_verification_result(request["seq"], request["cluster_id"], state)
+            # state 3: approach the object first; the planner re-requests the cluster
+            approach = gate.pending_approach(request["cluster_id"]) if gate and state == 3 else None
+            node.publish_verification_result(request["seq"], request["cluster_id"], state, approach)
             last_progress = time.time()
             continue
 
@@ -475,9 +477,22 @@ def main(
         # and stamped into every record produced by this run
         gate_on = gate is not None
         if (recorder.enabled or gate_on or sync_step) and not planner_cfg_read:
-            planner_cfg = query_planner_fusion_config(node)
+            planner_cfg = query_planner_fusion_config(node, extra=("verification.approach",))
+            # The approach flag joins the recorded planner config only in approach runs, so
+            # other runs keep their records unchanged
+            approach_on = bool(gate_on and gate.approach)
+            planner_approach = (planner_cfg or {}).get("verification.approach")
+            if planner_cfg is not None and not approach_on:
+                planner_cfg.pop("verification.approach", None)
             recorder.set_context(planner_cfg=planner_cfg)
             planner_cfg_read = True
+            # The approach (gate state 3) needs the planner's approach module, and the
+            # planner's stop-backstop turn must not run without it
+            if (planner_cfg is not None or approach_on) and bool(planner_approach) != approach_on:
+                raise RuntimeError(
+                    f"verification.approach is {approach_on} here but {planner_approach} in "
+                    "the planner; launch it with verification_approach:=" + str(approach_on).lower()
+                )
             # Both halves of the gate must agree, or the planner either never
             # asks or waits for answers that never come
             planner_gate = (planner_cfg or {}).get("verification.enabled")

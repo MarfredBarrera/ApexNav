@@ -149,6 +149,12 @@ class HabitatEvalNode(Node):
             "expl_result": int(msg.expl_result),
             "at_stop": bool(msg.at_stop),
             "fusion_seq": int(msg.fusion_seq),
+            # an approach re-request (perception gate state 3; 0: ordinary request)
+            "approach_id": int(msg.approach_id),
+            "viewpoint_status": int(msg.viewpoint_status),
+            "viewpoint_x": float(msg.viewpoint_x),
+            "viewpoint_y": float(msg.viewpoint_y),
+            "approach_steps": int(msg.approach_steps),
         }
 
     # ------------------------------------------------------------------
@@ -209,12 +215,21 @@ class HabitatEvalNode(Node):
         self.verification_request = None
         self.verification_seq_floor = self.last_verification_seq
 
-    def publish_verification_result(self, seq, cluster_id, state):
-        """Answer a request (state 1 accept, -1 reject) or reopen a cluster (state 0)."""
+    def publish_verification_result(self, seq, cluster_id, state, approach=None):
+        """Answer a request (state 1 accept, -1 reject, 2 defer, 3 approach ``approach``:
+        ``VerificationGate.pending_approach``) or reopen a cluster (state 0)."""
         msg = VerificationResult()
         msg.seq = int(seq)
         msg.cluster_id = int(cluster_id)
         msg.state = int(state)
+        if approach is not None:
+            msg.approach_id = int(approach["approach_id"])
+            msg.object_x = float(approach["object"][0])
+            msg.object_y = float(approach["object"][1])
+            msg.camera_x = float(approach["camera"][0])
+            msg.camera_y = float(approach["camera"][1])
+            msg.max_steps = int(approach["max_steps"])
+            msg.side_only = bool(approach["side_only"])
         self.verification_result_pub.publish(msg)
 
     def publish_int32(self, publisher, data):
@@ -291,7 +306,7 @@ class HabitatEvalNode(Node):
         return False
 
 
-def query_planner_fusion_config(node, timeout=5.0):
+def query_planner_fusion_config(node, timeout=5.0, extra=()):
     """Read the planner's multi-view fusion parameters over the ROS param API.
 
     The fusion arm is chosen by a launch argument on the C++ side, so the
@@ -306,6 +321,7 @@ def query_planner_fusion_config(node, timeout=5.0):
         "object.use_observation",
         "verification.enabled",
         "sync_step",
+        *extra,
     ]
     try:
         client = AsyncParameterClient(node, "exploration_node")
