@@ -31,22 +31,21 @@ deferred verdict reused from the cache.
 
 Approach (``approach``, server selector ``d1``): the server answers three-way
 (``verdict.status``): correct -> 1 accepted, wrong -> -1 rejected, insufficient -> 3
-approach: the planner drives to a viewpoint nearer the object point (the evidence
-centroid) along the line of sight object -> camera of the judged view (jitter 0, +-20,
-+-40 deg; only the side bearings when that camera was already within 1.5 m), faces it
-and re-requests the cluster with ``approach_id`` and ``viewpoint_status`` 1 (arrived),
-2 (no reachable viewpoint), 3 (aborted) or 4 (early). Early: while an approach is
-pending, ``observe`` returns the cluster's id (with the reopens) on the first detection
-of the object that is ``approach_min_closer_m`` closer than, or
-``approach_min_angle_deg`` away from, every view already judged for the cluster; the
-planner ends the approach and asks about that view. On arrival the newest such view is
-judged. Approach re-requests bypass the re-check cooldown, ``max_checks`` and the
-verdict cache. Budgets: ``approach_max_per_cluster`` approaches per cluster,
-``approach_max_steps`` actions each, ``approach_episode_steps`` per episode. Failure
-(unreachable, aborted, not re-detected, no budget, insufficient after the last
-approach) rejects; a rejected cluster then follows the re-check rule below. At the stop
-(``at_stop``) insufficient never accepts: one side-view approach (+-40 deg) if the
-budget allows, else reject. Position requests (cluster -1) never approach.
+approach: the cluster becomes the planner's target and ApexNav's own object navigation
+drives toward it. While an approach is pending, ``observe`` returns the cluster's id
+(with the reopens) on the first detection of the object that is
+``approach_min_closer_m`` closer than, or ``approach_min_angle_deg`` away from, every view
+already judged for the cluster; the planner asks about it at once (``viewpoint_status`` 4):
+accept, reject, or insufficient -> keep approaching (state 3 again, same approach). On
+arrival (the object reached, the agent facing it; status 1) the newest view since the
+approach began is judged without those thresholds, and insufficient rejects. Status 2 (no
+object path, target lost) and 3 (step budget used up) reject. Approach re-requests bypass
+the re-check cooldown, ``max_checks`` and the verdict cache. Budgets:
+``approach_max_per_cluster`` approaches per cluster, ``approach_max_steps`` actions each,
+``approach_episode_steps`` per episode, never past the episode's step limit; no budget ->
+reject. At the stop backstop (``at_stop``) and for positions (cluster -1) insufficient
+rejects. A rejected cluster then follows the re-check rule below. Approach needs
+``on_error: reject``.
 
 Failure policy (fail open by default): a server error or timeout applies
 ``on_error``, a cluster without a stored view ``on_no_evidence``; both are
@@ -421,7 +420,8 @@ class VerificationGate:
         return status
 
     def _decide_three_way(self, record, verdict, evidence, reply, state, at_stop, approach):
-        """correct -> accept, wrong -> reject, insufficient -> approach (budget permitting) or reject."""
+        """correct -> accept, wrong -> reject, insufficient -> approach (budget permitting), keep
+        approaching (a new view on the way), or reject (at the stop, on arrival, no budget)."""
         status = self._tri_state(verdict)
         model = verdict.get("source")
         record.update(status=status, model=model)
@@ -434,12 +434,18 @@ class VerificationGate:
         if status == "wrong":
             return self._decide(record, REJECTED, evidence, reply, state)
         self.counts["insufficient"] += 1
+        if approach is not None and approach["status"] == EARLY:
+            # A new view on the way that is still insufficient: keep approaching
+            approach["early"] = None
+            state["approach"] = approach
+            record["policy"] = "insufficient,keep_approaching"
+            return self._decide(record, APPROACH, evidence, reply, state)
         blocked = self._approach_blocked(record, state, at_stop, approach)
         if blocked is not None:
             self.counts["approach_exhausted"] += 1
             record["policy"] = f"insufficient,{blocked}"
             return self._decide(record, REJECTED, evidence, reply, state)
-        self._issue_approach(record, state, evidence, at_stop)
+        self._issue_approach(record, state, evidence)
         return self._decide(record, APPROACH, evidence, reply, state)
 
     def _approach_remaining(self):
@@ -457,8 +463,10 @@ class VerificationGate:
         """Why an insufficient view cannot be approached (None: it can)."""
         if record["cluster"]["id"] < 0 or state is None:
             return "position"
-        if approach is not None and approach["at_stop"]:
-            return "stop_side_view_used"  # one side-view approach at the stop
+        if approach is not None:
+            return "arrival"  # judged on arrival at the object: never stop on insufficient
+        if at_stop:
+            return "at_stop"
         if state["approaches"] >= int(self.cfg["approach_max_per_cluster"]):
             return "cluster_budget"
         if min(int(self.cfg["approach_max_steps"]), self._approach_remaining()) <= 0:
@@ -467,34 +475,28 @@ class VerificationGate:
             return "episode_end"
         return None
 
-    def _issue_approach(self, record, state, evidence, at_stop):
+    def _issue_approach(self, record, state, evidence):
         state["approaches"] += 1
         self.counts["moves"] += 1
-        # The planner only knows this view's camera; the gate's new-view test compares with
-        # every judged view, so it also gets the closest of them
-        ranges = [u["range"] for u in state["used"] if "range" in u]
-        min_range = min(ranges) if ranges else _distance(evidence["camera"], evidence["centroid"])
         pending = {"id": state["approaches"], "issued_step": int(record["step"]),
                    "object": tuple(evidence["centroid"]), "camera": tuple(evidence["camera"]),
-                   "min_range": float(min_range), "max_steps": self._approach_steps_allowed(record["step"]),
-                   "side_only": bool(at_stop), "at_stop": bool(at_stop), "early": None}
+                   "max_steps": self._approach_steps_allowed(record["step"]), "steps": 0,
+                   "early": None, "status": None}
         state["approach"] = pending
         record["approach"] = {"id": pending["id"], "issued": True, "object": list(pending["object"]),
-                              "camera": list(pending["camera"]), "min_range": round(min_range, 3),
-                              "max_steps": pending["max_steps"], "side_only": pending["side_only"]}
+                              "camera": list(pending["camera"]), "max_steps": pending["max_steps"]}
         self.events.append({"event": "approach", "cluster_id": record["cluster"]["id"], "approach": pending["id"],
                             "object": list(pending["object"]), "camera": list(pending["camera"]),
-                            "max_steps": pending["max_steps"], "side_only": pending["side_only"]})
+                            "max_steps": pending["max_steps"]})
 
     def pending_approach(self, cluster_id):
-        """The approach a state-3 decision issued for ``cluster_id``: {approach_id, object, camera,
-        min_range, max_steps, side_only}; None if there is none."""
+        """The approach a state-3 decision issued (or keeps) for ``cluster_id``: {approach_id,
+        object, camera, max_steps}; None if there is none."""
         pending = self.clusters.get(int(cluster_id), {}).get("approach")
         if pending is None:
             return None
         return {"approach_id": pending["id"], "object": pending["object"], "camera": pending["camera"],
-                "min_range": pending["min_range"], "max_steps": pending["max_steps"],
-                "side_only": pending["side_only"]}
+                "max_steps": pending["max_steps"]}
 
     def _approach_view(self, item, cluster_id, pending, used, novel=True):
         """Match distance when ``item`` is a new view of the approached object: taken since the
@@ -518,8 +520,8 @@ class VerificationGate:
         return None
 
     def _approach_views(self, step, new):
-        """Clusters under approach with a new view this step (once per approach): the planner
-        ends the approach early (viewpoint_status 4)."""
+        """Clusters under approach with a new view this step (once until it is judged): the
+        planner asks about it at once (viewpoint_status 4)."""
         if not self.approach:
             return []
         ready = []
@@ -538,16 +540,18 @@ class VerificationGate:
         return ready
 
     def _after_approach(self, record, request, state, step):
-        """An approach re-request (viewpoint_status 1 arrived, 2 unreachable, 3 aborted, 4 early)."""
+        """An approach re-request (viewpoint_status 1 arrived, 2 no object path / target lost,
+        3 aborted, 4 new view on the way)."""
         approach_id = int(request.get("approach_id", 0))
         status = int(request.get("viewpoint_status", 0))
-        steps = max(int(request.get("approach_steps", 0)), 0)
+        reported = max(int(request.get("approach_steps", 0)), 0)  # actions so far in this approach
+        pending = state.get("approach") if state is not None else None
+        steps = max(reported - (pending["steps"] if pending is not None else 0), 0)
         self.approach_steps_used += steps
         self.counts["approach_steps"] += steps
-        pending = state.get("approach") if state is not None else None
-        record["approach"] = {"id": approach_id, "status": STATUS_NAMES.get(status, str(status)), "steps": steps,
-                              "viewpoint": [float(request.get("viewpoint_x", 0.0)),
-                                            float(request.get("viewpoint_y", 0.0))],
+        record["approach"] = {"id": approach_id, "status": STATUS_NAMES.get(status, str(status)),
+                              "steps": reported, "agent": [float(request.get("viewpoint_x", 0.0)),
+                                                           float(request.get("viewpoint_y", 0.0))],
                               "episode_steps_used": self.approach_steps_used}
         if state is not None:
             state["approach"] = None
@@ -556,7 +560,7 @@ class VerificationGate:
                                f"{None if pending is None else pending['id']}")
             print(f"[verification] cluster {record['cluster']['id']}: {record['error']}")
             return self._approach_failed(record, state, "approach_mismatch")
-        record["at_stop"] = pending["at_stop"]
+        pending.update(steps=reported, status=status)
         record["approach"].update(object=list(pending["object"]), issued_step=pending["issued_step"])
         if status == UNREACHABLE:
             return self._approach_failed(record, state, "unreachable")
@@ -571,7 +575,7 @@ class VerificationGate:
             view = pending["early"]
         else:
             # Arrival: the newest view since the approach started, without the new-view
-            # thresholds (the planner's viewpoint can sit up to its reach distance off)
+            # thresholds (the agent physically moved there)
             views = [(item, d) for item in self.evidence
                      for d in [self._approach_view(item, record["cluster"]["id"], pending, state["used"],
                                                    novel=status != ARRIVED)]
@@ -580,7 +584,7 @@ class VerificationGate:
                 view = max(views, key=lambda v: (v[0]["step"], v[0]["quality"]))
         if view is None:
             return self._approach_failed(record, state, "not_redetected")
-        return self._judge(record, view[0], view[1], state, step, pending["at_stop"], approach=pending)
+        return self._judge(record, view[0], view[1], state, step, status == ARRIVED, approach=pending)
 
     def _approach_failed(self, record, state, policy):
         """Unreachable, aborted, not re-detected (or a protocol mismatch): reject."""

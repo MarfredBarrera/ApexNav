@@ -10,14 +10,12 @@
 
 #include <exploration_manager/exploration_manager.h>
 #include <exploration_manager/exploration_data.h>
-#include <exploration_manager/approach_geometry.h>
 #include <lkh_mtsp_solver/srv/solve_mtsp.hpp>
 #include <plan_env/map_ros.h>
 #include <path_searching/kino_astar.h>
 #include <trajectory_manager/optimizer.h>
 #include <cmath>
 #include <cstdlib>
-#include <limits>
 
 using namespace Eigen;
 
@@ -98,6 +96,8 @@ void ExplorationManager::reset()
   frontier_map2d_->reset();
   path_finder_->reset();
   ed_.reset(new ExplorationData);
+  forced_cluster_id_ = -1;
+  forced_failed_ = false;
 }
 
 // Over-depth target points this close to a position the perception gate
@@ -120,6 +120,22 @@ int ExplorationManager::planNextBestPoint(const Vector3d& pos, const double& yaw
     Vector2d object_pos = findNearestObjectPoint(pos, cloud);
     ed_->target_object_pos_ = object_pos.x() < -999.0 ? ed_->next_pos_ : object_pos;
   };
+  // ==================== Perception gate approach (state 3) ====================
+  // The cluster the gate asked to approach is the target, whatever its confidence rank;
+  // when no object path to it exists the FSM ends the approach (forced_failed_)
+  forced_failed_ = false;
+  if (forced_cluster_id_ >= 0) {
+    auto cloud = sdf_map_->object_map2d_->getObjectCloud(forced_cluster_id_);
+    if (!cloud->points.empty() && searchObjectPath(pos, cloud, ed_->next_pos_, ed_->next_best_path_)) {
+      setTarget(forced_cluster_id_, cloud);
+      return SEARCH_BEST_OBJECT;
+    }
+    RCLCPP_WARN(node_->get_logger(), "[Verification] approach: no object path to cluster %d (%zu cells)",
+        forced_cluster_id_, cloud->points.size());
+    forced_failed_ = true;
+    ed_->next_best_path_.clear();
+  }
+
   vector<pcl::shared_ptr<pcl::PointCloud<pcl::PointXYZ>>> object_clouds;
   vector<int> object_ids;
   sdf_map_->object_map2d_->getTopConfidenceObjectCloud(object_clouds, true, false, &object_ids);
@@ -783,90 +799,6 @@ bool ExplorationManager::planTrajectory(
   }
 
   return false;
-}
-
-bool ExplorationManager::searchApproachPath(const Vector2d& start, const Vector2d& object,
-    const Vector2d& camera, double min_range, int cluster_id, bool side_only, double max_path,
-    Vector2d& viewpoint, vector<Vector2d>& path, double& jitter_deg)
-{
-  const double see_distance = 0.30;  // the sight line reaches the object this close to its cells
-  vector<Vector2d> cells;
-  if (cluster_id >= 0 && cluster_id < (int)ed_->objects_.size())
-    cells = ed_->objects_[cluster_id];
-  cells.push_back(object);
-  auto near_object = [&](const Vector2d& q) {
-    for (const auto& c : cells)
-      if ((q - c).norm() < see_distance)
-        return true;
-    return false;
-  };
-  // No OCCUPIED cell on p -> object before the line comes within see_distance of the object
-  auto line_of_sight = [&](const Vector2d& p) {
-    double length = (object - p).norm();
-    double step = sdf_map_->getResolution() * 0.5;
-    for (double l = 0.0; l <= length; l += step) {
-      Vector2d q = p + (object - p) * (l / std::max(length, 1e-6));
-      if (near_object(q))
-        return true;
-      if (sdf_map_->getOccupancy(q) == SDFMap2D::OCCUPIED)
-        return false;
-    }
-    return true;
-  };
-
-  // Candidates in a fixed order; cheaper ones first, so the straight-line lower bound
-  // (distance + rank cost) prunes A* calls without changing the choice
-  vector<approach::Candidate> candidates = approach::candidates(object, camera, side_only, min_range);
-  std::stable_sort(candidates.begin(), candidates.end(),
-      [&](const approach::Candidate& a, const approach::Candidate& b) {
-        return (a.point - start).norm() + approach::RANK_COST * a.rank <
-               (b.point - start).norm() + approach::RANK_COST * b.rank;
-      });
-  double best_cost = std::numeric_limits<double>::infinity();
-  for (const auto& c : candidates) {
-    double straight = (c.point - start).norm();
-    double bound = straight + approach::RANK_COST * c.rank;
-    if (bound >= best_cost)
-      break;  // sorted by this bound: nothing later can win
-    if (straight > max_path)
-      continue;
-    // Known free space only: an unknown viewpoint is often inside furniture or behind a wall
-    if (!sdf_map_->isInMap(c.point) || sdf_map_->getOccupancy(c.point) != SDFMap2D::FREE ||
-        sdf_map_->getInflateOccupancy(c.point) == 1 || !line_of_sight(c.point))
-      continue;
-    path_finder_->reset();
-    if (path_finder_->astarSearch(start, c.point, 0.15, 0.2, Astar2D::SAFETY_MODE::NORMAL) !=
-        Astar2D::REACH_END)
-      continue;
-    vector<Vector2d> candidate_path = path_finder_->getPath();
-    double length = Astar2D::pathLength(candidate_path);
-    if (length > max_path)
-      continue;
-    double cost = length + approach::RANK_COST * c.rank;
-    if (cost < best_cost) {
-      best_cost = cost;
-      viewpoint = c.point;
-      path = candidate_path;
-      jitter_deg = c.jitter_deg;
-    }
-  }
-  return std::isfinite(best_cost);
-}
-
-bool ExplorationManager::searchPointPath(
-    const Vector2d& start, const Vector2d& goal, vector<Vector2d>& path)
-{
-  // Known space first; OPTIMISTIC only when newly mapped cells cut the known-space path
-  path_finder_->reset();
-  if (path_finder_->astarSearch(start, goal, 0.15, 0.2, Astar2D::SAFETY_MODE::NORMAL) !=
-      Astar2D::REACH_END) {
-    path_finder_->reset();
-    if (path_finder_->astarSearch(start, goal, 0.15, 0.2, Astar2D::SAFETY_MODE::OPTIMISTIC) !=
-        Astar2D::REACH_END)
-      return false;
-  }
-  path = path_finder_->getPath();
-  return !path.empty();
 }
 
 }  // namespace apexnav_planner

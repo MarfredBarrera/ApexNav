@@ -19,7 +19,7 @@ uint32 fusion_seq          # ObjectFusionState.update_seq published before this 
 # Approach (perception gate state 3, server selector d1): a re-request about one approach.
 # Ordinary requests leave all of these 0.
 int32 approach_id          # 0: ordinary request; else the approach (1-based per cluster) the status refers to
-int32 viewpoint_status     # 1 arrived and facing the object; 2 no reachable viewpoint; 3 aborted; 4 early (new view during the approach)
-float32 viewpoint_x        # the approach's viewpoint (status 1, 3 and 4), planner world frame
+int32 viewpoint_status     # 1 arrived (object reached) and facing the object; 2 no object path / target lost; 3 aborted (step budget); 4 early (new view during the approach)
+float32 viewpoint_x        # the agent's position, planner world frame
 float32 viewpoint_y
 int32 approach_steps       # actions spent on this approach

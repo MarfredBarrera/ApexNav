@@ -4,14 +4,9 @@
 #include <exploration_manager/exploration_data.h>
 #include <vis_utils/planning_visualization.h>
 #include <plan_env/map_ros.h>
-#include <exploration_manager/approach_geometry.h>
 #include <cstdlib>
 
 using namespace std::chrono_literals;
-
-static_assert(apexnav_planner::approach::ARRIVAL_SLACK >=
-                  apexnav_planner::FSMConstants::VIEWPOINT_SOFT_REACH_DISTANCE,
-    "approach candidates must keep the arrival tolerance in reserve");
 
 namespace apexnav_planner {
 void ExplorationFSM::init(rclcpp::Node::SharedPtr node)
@@ -212,10 +207,10 @@ void ExplorationFSM::FSMCallback()
         transitState(ROS_STATE::PUB_ACTION, "FSM");
         updateFrontierAndObject();
       }
-      else if (fd_->vp_active_) {
-        // Perception gate approach: the usual planner (and its verification checks) is not
-        // consulted until the gate has decided
-        planApproachAction();
+      else if (fd_->ap_active_ && expl_manager_->object_map2d_->takeApproachView(fd_->ap_cluster_id_)) {
+        // Approach: the gate saw a new view of the cluster (passed with this step); ask now
+        updateFrontierAndObject();
+        endApproach(4, "new view");
       }
       else if (fd_->stop_face_pending_) {
         // The backstop turned to face the stop target last step: verify that fresh view
@@ -225,7 +220,9 @@ void ExplorationFSM::FSMCallback()
         fd_->final_result_ = FINAL_RESULT::REACH_OBJECT;
         int stop_cluster = -1;
         Vector2d stop_pos;
-        if (needsStopVerification(stop_cluster, stop_pos))
+        if (fd_->ap_active_)
+          endApproach(1, "arrived, facing the object");
+        else if (needsStopVerification(stop_cluster, stop_pos))
           requestVerification(stop_cluster, stop_pos, true);
         else
           finishPlanning();
@@ -245,7 +242,10 @@ void ExplorationFSM::FSMCallback()
         // the agent heads for it (and could stop at it); the action stays held
         int stop_cluster = -1;
         Vector2d stop_pos;
-        if (needsVerification())
+        if (fd_->ap_active_ && checkApproach()) {
+          // the approach ended (or turns to face the object): handled
+        }
+        else if (needsVerification())
           requestVerification(expl_manager_->ed_->target_cluster_id_,
               expl_manager_->ed_->target_object_pos_, false);
         else if (needsStopVerification(stop_cluster, stop_pos)) {
@@ -341,7 +341,8 @@ bool ExplorationFSM::needsStopVerification(int& cluster_id, Vector2d& pos)
 }
 
 // approach_id 0: an ordinary request; else the outcome of that approach (viewpoint_status
-// 1 arrived and facing the object, 2 no reachable viewpoint, 3 aborted, 4 early: a new view)
+// 1 arrived and facing the object, 2 no object path / target lost, 3 aborted (budget),
+// 4 a new view on the way)
 void ExplorationFSM::requestVerification(
     int cluster_id, const Vector2d& pos, bool at_stop, int approach_id, int viewpoint_status)
 {
@@ -354,9 +355,9 @@ void ExplorationFSM::requestVerification(
   if (approach_id > 0) {
     msg.approach_id = approach_id;
     msg.viewpoint_status = viewpoint_status;
-    msg.viewpoint_x = static_cast<float>(fd_->vp_pos_(0));
-    msg.viewpoint_y = static_cast<float>(fd_->vp_pos_(1));
-    msg.approach_steps = fd_->vp_steps_;
+    msg.viewpoint_x = static_cast<float>(fd_->odom_pos_(0));  // where the agent is
+    msg.viewpoint_y = static_cast<float>(fd_->odom_pos_(1));
+    msg.approach_steps = fd_->ap_steps_;
   }
   msg.centroid_x = static_cast<float>(pos(0));
   msg.centroid_y = static_cast<float>(pos(1));
@@ -381,16 +382,11 @@ void ExplorationFSM::requestVerification(
   fd_->verify_cluster_id_ = cluster_id;
   fd_->verify_pos_ = pos;
   fd_->verify_at_stop_ = at_stop;
-  if (approach_id == 0) {  // approach re-requests keep the original stop context
-    fd_->vp_at_stop_ = at_stop;
-    fd_->vp_stop_pos_ = pos;
-  }
+  fd_->verify_approach_id_ = approach_id;
+  fd_->verify_arrival_ = approach_id > 0 && viewpoint_status == 1;
   RCLCPP_WARN(node_->get_logger(),
       "[Verification] request seq=%u cluster=%d (%.2f, %.2f) conf=%.3f%s", msg.seq, cluster_id,
       msg.centroid_x, msg.centroid_y, msg.confidence, at_stop ? " [at stop]" : "");
-  if (approach_id > 0)
-    RCLCPP_WARN(node_->get_logger(), "[Verification] ... approach %d status %d after %d actions",
-        approach_id, viewpoint_status, fd_->vp_steps_);
   verify_request_pub_->publish(msg);
   transitState(ROS_STATE::WAIT_VERIFICATION, "FSM");
 }
@@ -399,24 +395,32 @@ void ExplorationFSM::requestVerification(
 // action already planned (approach, or the stop). Deferred: carry out the approach;
 // the stop backstop asks again (at a stop, deferred counts as rejected). Rejected: drop the cluster (or
 // cut the position out of over-depth targets) and replan from the same pose as
-// if it had never been detected. After an approach the held action is stale, so both
-// replan (accepted: head for the object -> stop)
+// if it had never been detected. Approach re-requests: accepted on the way -> replan (the
+// cluster stays the forced target, so the agent goes on to it and stops); accepted on
+// arrival -> stop; rejected -> drop the forced target and replan
 void ExplorationFSM::finishVerification(int state, bool timed_out)
 {
   int id = fd_->verify_cluster_id_;
   auto obj_map = expl_manager_->object_map2d_;
-  bool moved = fd_->vp_moved_;
-  fd_->vp_moved_ = false;
+  bool approach = fd_->verify_approach_id_ > 0, arrival = fd_->verify_arrival_;
+  fd_->verify_approach_id_ = 0;
+  fd_->verify_arrival_ = false;
+  if (approach || (id >= 0 && expl_manager_->forced_cluster_id_ == id)) {
+    fd_->ap_active_ = false;
+    if (state != 1) {
+      expl_manager_->forced_cluster_id_ = -1;
+      fd_->stop_face_pending_ = false;  // a rejected approach is not verified at the stop
+    }
+  }
   if (state == 2 && (id < 0 || fd_->verify_at_stop_))
     state = -1;
   if (id >= 0)
     obj_map->setVerification(id, state);
   else if (state == 1)
     obj_map->acceptPosition(fd_->verify_pos_);
-  // A rejected stop must not be re-targeted through the over-depth cloud either (also when
-  // the rejection came after an approach that started at the stop)
+  // A rejected stop must not be re-targeted through the over-depth cloud either
   if (state != 1 && (id < 0 || fd_->verify_at_stop_))
-    obj_map->suppressPosition(moved ? fd_->vp_stop_pos_ : fd_->verify_pos_);
+    obj_map->suppressPosition(fd_->verify_pos_);
   if (timed_out)
     RCLCPP_ERROR(node_->get_logger(),
         "[Verification] no verdict for cluster %d within %.0f s: fail open (accepted)", id,
@@ -426,12 +430,17 @@ void ExplorationFSM::finishVerification(int state, bool timed_out)
         state == 1 ? "ACCEPTED" : state == 2 ? "DEFERRED" : "REJECTED",
         fd_->verify_at_stop_ ? " [at stop]" : "");
   publishObjectFusionState();
-  if ((state == 1 || state == 2) && !moved) {
+  if ((state == 1 || state == 2) && (!approach || arrival)) {
     finishPlanning();
     return;
   }
+  if (state == 1) {  // accepted on the way: plan this step anew, toward the object
+    fd_->skip_stuck_check_once_ = true;
+    transitState(ROS_STATE::PLAN_ACTION, "Verification");
+    return;
+  }
   // Without this the reach check in callActionPlanner could stop at the
-  // rejected cluster's (or the approach viewpoint's) stale next_pos_
+  // rejected cluster's next_pos_
   fd_->final_result_ = FINAL_RESULT::EXPLORE;
   fd_->skip_stuck_check_once_ = true;
   transitState(ROS_STATE::PLAN_ACTION, "Verification");
@@ -463,11 +472,11 @@ void ExplorationFSM::verificationResultCallback(
         msg->cluster_id);
     return;
   }
-  // state 3: insufficient view; approach the object for a better one
+  // state 3: insufficient view; approach the cluster (or keep approaching it)
   if (msg->state == 3) {
-    if (!approach_enabled_ || msg->cluster_id < 0) {
-      RCLCPP_ERROR(node_->get_logger(), "[Verification] protocol error: state 3 for cluster %d (approach %s)",
-          msg->cluster_id, approach_enabled_ ? "on" : "off");
+    if (!approach_enabled_ || msg->cluster_id < 0 || fd_->verify_at_stop_) {
+      RCLCPP_ERROR(node_->get_logger(), "[Verification] protocol error: state 3 for cluster %d%s (approach %s)",
+          msg->cluster_id, fd_->verify_at_stop_ ? " at the stop" : "", approach_enabled_ ? "on" : "off");
       if (sync_step_)
         std::exit(1);
       finishVerification(-1, false);
@@ -491,145 +500,93 @@ bool ExplorationFSM::facing(const Vector2d& point, int& turn)
   return turn == ACTION::MOVE_FORWARD;
 }
 
-// Gate state 3: drive to the cheapest reachable viewpoint nearer the object point along the
-// line of sight (or to the side). None reachable: tell the gate at once (no step is taken)
+// Gate state 3: the cluster becomes the planner's forced target and ApexNav's own object
+// navigation (searchObjectPath, per-step replanning) drives toward it. After an ordinary
+// request the held action already heads for it (it was planned for this cluster), so it is
+// carried out as the approach's first action; after a re-request (a new view that was still
+// insufficient) the approach goes on and this step is planned anew
 void ExplorationFSM::startApproach(const plan_env::msg::VerificationResult& msg)
 {
+  bool resume = fd_->verify_approach_id_ > 0;
+  fd_->verify_approach_id_ = 0;
+  fd_->verify_arrival_ = false;
+  if (!resume || msg.approach_id != fd_->ap_approach_id_ || msg.cluster_id != fd_->ap_cluster_id_)
+    fd_->ap_steps_ = 0;
+  fd_->ap_active_ = true;
+  fd_->ap_cluster_id_ = msg.cluster_id;
+  fd_->ap_approach_id_ = msg.approach_id;
+  fd_->ap_max_steps_ = msg.max_steps;
+  fd_->ap_object_ = Vector2d(msg.object_x, msg.object_y);
+  expl_manager_->forced_cluster_id_ = msg.cluster_id;
   auto obj_map = expl_manager_->object_map2d_;
-  Vector2d pos(fd_->odom_pos_(0), fd_->odom_pos_(1));
-  fd_->vp_cluster_id_ = msg.cluster_id;
-  fd_->vp_approach_id_ = msg.approach_id;
-  fd_->vp_object_ = Vector2d(msg.object_x, msg.object_y);
-  fd_->vp_camera_ = Vector2d(msg.camera_x, msg.camera_y);
-  fd_->vp_min_range_ = msg.min_range;
-  fd_->vp_side_only_ = msg.side_only;
-  fd_->vp_max_steps_ = msg.max_steps;
-  fd_->vp_steps_ = 0;
-  fd_->vp_no_progress_ = 0;
-  fd_->vp_last_pos_ = pos;
-  fd_->vp_researched_ = false;
-  fd_->vp_pos_ = pos;
-  // Under approach: one cluster at a time; a new view of it ends the approach early
-  obj_map->setVerification(msg.cluster_id, 3);
-  obj_map->takeApproachView(msg.cluster_id);  // drop any stale mark
+  obj_map->setVerification(msg.cluster_id, 3);  // under approach: one cluster at a time
+  obj_map->takeApproachView(msg.cluster_id);    // drop any stale mark
   publishObjectFusionState();
-  Vector2d viewpoint;
-  vector<Vector2d> path;
-  double jitter = 0.0;
-  if (msg.max_steps <= 0 ||
-      !expl_manager_->searchApproachPath(pos, fd_->vp_object_, fd_->vp_camera_, fd_->vp_min_range_, msg.cluster_id,
-          msg.side_only, approach::maxPath(msg.max_steps), viewpoint, path, jitter)) {
-    RCLCPP_WARN(node_->get_logger(),
-        "[Verification] cluster %d approach %d: no reachable viewpoint around (%.2f, %.2f)%s",
-        msg.cluster_id, msg.approach_id, fd_->vp_object_(0), fd_->vp_object_(1),
-        msg.side_only ? " [side only]" : "");
-    requestVerification(msg.cluster_id, fd_->vp_object_, fd_->vp_at_stop_, msg.approach_id, 2);
+  Vector2d pos(fd_->odom_pos_(0), fd_->odom_pos_(1));
+  RCLCPP_WARN(node_->get_logger(),
+      "[Verification] cluster %d approach %d %s: object (%.2f, %.2f) %.2f m away, evidence camera "
+      "%.2f m from it; %d/%d actions used",
+      msg.cluster_id, msg.approach_id, resume ? "goes on" : "starts", msg.object_x, msg.object_y,
+      (fd_->ap_object_ - pos).norm(), (Vector2d(msg.camera_x, msg.camera_y) - fd_->ap_object_).norm(),
+      fd_->ap_steps_, msg.max_steps);
+  if (!resume && fd_->final_result_ == FINAL_RESULT::SEARCH_OBJECT &&
+      expl_manager_->ed_->target_cluster_id_ == msg.cluster_id && msg.max_steps > 0) {
+    fd_->ap_steps_ = 1;
+    finishPlanning();  // the held action, toward this cluster
     return;
   }
-  fd_->vp_active_ = true;
-  // final_result_ and next_pos_ are overwritten here, so the held action is stale from now
-  // on, even if the robot arrives without taking a step
-  fd_->vp_moved_ = true;
-  fd_->vp_pos_ = viewpoint;
-  fd_->vp_jitter_ = jitter;
-  expl_manager_->ed_->next_best_path_ = path;
-  expl_manager_->ed_->next_pos_ = viewpoint;
-  fd_->final_result_ = FINAL_RESULT::SEARCH_OBJECT;
-  RCLCPP_WARN(node_->get_logger(),
-      "[Verification] cluster %d approach %d: viewpoint (%.2f, %.2f), %.0f deg off the line of sight, "
-      "%.2f m from the object, path %.2f m, max %d actions",
-      msg.cluster_id, msg.approach_id, viewpoint(0), viewpoint(1), jitter,
-      (viewpoint - fd_->vp_object_).norm(), Astar2D::pathLength(path), msg.max_steps);
+  fd_->skip_stuck_check_once_ = true;  // no step was taken since the last plan
   transitState(ROS_STATE::PLAN_ACTION, "Approach");
 }
 
-// One action of an approach: drive to the viewpoint (A* replanned every step), then turn to
-// face the object. A new view of the object (early), arrival or any abort hands back to the
-// gate. Turns here never count toward the stuck detectors (callActionPlanner is not run)
-void ExplorationFSM::planApproachAction()
+// After callActionPlanner during an approach: true when the approach ended here (arrival,
+// no object path, budget) or the agent turns to face the object first; false to carry out
+// the planned action as one more approach action
+bool ExplorationFSM::checkApproach()
 {
-  updateFrontierAndObject();  // keeps the maps and the fusion snapshot current
-  Vector2d pos(fd_->odom_pos_(0), fd_->odom_pos_(1));
-  double yaw = fd_->odom_yaw_;
-  double moved = (pos - fd_->vp_last_pos_).norm();
-  if (fd_->vp_steps_ > 0 && fd_->newest_action_ == ACTION::MOVE_FORWARD &&
-      moved < FSMConstants::STUCKING_DISTANCE)
-    fd_->vp_no_progress_++;
-  else if (moved >= FSMConstants::STUCKING_DISTANCE)
-    fd_->vp_no_progress_ = 0;
-  fd_->vp_last_pos_ = pos;
-
-  // The gate already saw a new view of the object (passed with the step): ask about it now
-  if (expl_manager_->object_map2d_->takeApproachView(fd_->vp_cluster_id_)) {
-    endApproach(4);
-    return;
-  }
-  // Arrived and facing the object: hand back to the gate (checked before the budget, so
-  // arriving on the last allowed action still counts as an arrival)
-  double distance = (pos - fd_->vp_pos_).norm();
-  bool arrived = distance < FSMConstants::VIEWPOINT_REACH_DISTANCE ||
-                 (fd_->vp_no_progress_ > 0 && distance < FSMConstants::VIEWPOINT_SOFT_REACH_DISTANCE);
-  int turn = ACTION::MOVE_FORWARD;
-  if (arrived && facing(fd_->vp_object_, turn)) {
-    endApproach(1);
-    return;
-  }
-  if (fd_->vp_steps_ >= fd_->vp_max_steps_ ||
-      fd_->vp_no_progress_ >= FSMConstants::VIEWPOINT_MAX_NO_PROGRESS) {
-    RCLCPP_WARN(node_->get_logger(), "[Verification] approach aborted after %d actions (%d stalled)",
-        fd_->vp_steps_, fd_->vp_no_progress_);
-    endApproach(3);
-    return;
-  }
-  if (arrived) {
-    fd_->newest_action_ = turn;
-  }
-  else {
-    vector<Vector2d> path;
-    auto sdf_map = expl_manager_->sdf_map_;
-    auto blocked = [&](const Vector2d& p) {
-      return sdf_map->getOccupancy(p) == SDFMap2D::OCCUPIED || sdf_map->getInflateOccupancy(p) == 1;
-    };
-    // The viewpoint turned out blocked (newly mapped): search once more with the remaining
-    // budget, still as the same approach
-    if (blocked(fd_->vp_pos_) && !fd_->vp_researched_) {
-      fd_->vp_researched_ = true;
-      Vector2d viewpoint;
-      double jitter = 0.0;
-      if (expl_manager_->searchApproachPath(pos, fd_->vp_object_, fd_->vp_camera_, fd_->vp_min_range_,
-              fd_->vp_cluster_id_,
-              fd_->vp_side_only_, approach::maxPath(fd_->vp_max_steps_ - fd_->vp_steps_), viewpoint, path,
-              jitter)) {
-        RCLCPP_WARN(node_->get_logger(), "[Verification] viewpoint blocked; new viewpoint (%.2f, %.2f)",
-            viewpoint(0), viewpoint(1));
-        fd_->vp_pos_ = viewpoint;
-        fd_->vp_jitter_ = jitter;
-        expl_manager_->ed_->next_pos_ = viewpoint;
-      }
+  auto ed = expl_manager_->ed_;
+  if (fd_->final_result_ == FINAL_RESULT::REACH_OBJECT) {
+    int turn = ACTION::MOVE_FORWARD;
+    if (!facing(ed->target_object_pos_, turn)) {  // one turn, then verify (stop_face_pending_)
+      RCLCPP_WARN(node_->get_logger(), "[Verification] approach: reached; turning to face the object");
+      fd_->newest_action_ = turn;
+      fd_->stop_face_pending_ = true;
+      fd_->final_result_ = FINAL_RESULT::SEARCH_OBJECT;
+      fd_->ap_steps_++;
+      finishPlanning();
+      return true;
     }
-    bool is_blocked = blocked(fd_->vp_pos_);
-    if (is_blocked || !expl_manager_->searchPointPath(pos, fd_->vp_pos_, path)) {
-      RCLCPP_WARN(node_->get_logger(), "[Verification] approach aborted: %s",
-          is_blocked ? "the viewpoint is occupied" : "no path to it");
-      endApproach(3);
-      return;
-    }
-    fd_->newest_action_ = planNextBestAction(pos, yaw, path);
-    expl_manager_->ed_->next_best_path_ = path;
+    endApproach(1, "arrived, facing the object");
+    return true;
   }
-  fd_->vp_steps_++;
-  transitState(ROS_STATE::PUB_ACTION, "Approach");
+  if (fd_->final_result_ == FINAL_RESULT::STUCKING)
+    return false;  // the episode ends as without the gate (give-up stops are not verified)
+  if (expl_manager_->forced_failed_ || ed->target_cluster_id_ != fd_->ap_cluster_id_ ||
+      fd_->final_result_ != FINAL_RESULT::SEARCH_OBJECT) {
+    endApproach(2, expl_manager_->forced_failed_ ? "no object path" : "target lost");
+    return true;
+  }
+  if (fd_->ap_steps_ >= fd_->ap_max_steps_) {
+    endApproach(3, "step budget used up");
+    return true;
+  }
+  fd_->ap_steps_++;
+  return false;
 }
 
-// The approach is over (1 arrived, 3 aborted, 4 early): the gate decides on the new view
-void ExplorationFSM::endApproach(int status)
+// The approach is over for now: the gate decides (arrival: on the fresh view at the stop)
+void ExplorationFSM::endApproach(int status, const char* reason)
 {
-  fd_->vp_active_ = false;
-  RCLCPP_WARN(node_->get_logger(), "[Verification] cluster %d approach %d %s at (%.2f, %.2f) after %d actions",
-      fd_->vp_cluster_id_, fd_->vp_approach_id_,
-      status == 1 ? "arrived" : status == 4 ? "ended early (new view)" : "aborted", fd_->odom_pos_(0),
-      fd_->odom_pos_(1), fd_->vp_steps_);
-  requestVerification(fd_->vp_cluster_id_, fd_->vp_object_, fd_->vp_at_stop_, fd_->vp_approach_id_, status);
+  fd_->ap_active_ = false;
+  Vector2d pos(fd_->odom_pos_(0), fd_->odom_pos_(1));
+  RCLCPP_WARN(node_->get_logger(),
+      "[Verification] cluster %d approach %d ends (status %d: %s) at (%.2f, %.2f), %.2f m from the "
+      "object, after %d/%d actions",
+      fd_->ap_cluster_id_, fd_->ap_approach_id_, status, reason, pos(0), pos(1),
+      (fd_->ap_object_ - pos).norm(), fd_->ap_steps_, fd_->ap_max_steps_);
+  bool arrival = status == 1;
+  requestVerification(fd_->ap_cluster_id_, arrival ? expl_manager_->ed_->target_object_pos_ : fd_->ap_object_,
+      arrival, fd_->ap_approach_id_, status);
 }
 
 /**

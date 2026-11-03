@@ -199,15 +199,13 @@ Override any of them on the command line, e.g. `verification.max_checks=1`.
 | `recheck_min_distance_m` / `recheck_min_angle_deg` | 1.0 / 45 | the re-check needs a view this far from / this different to earlier views |
 | `match_distance_m` | 0.75 | how close a stored view must be to the cluster / stop point |
 | `approach` | false | server `--selector d1` (three-way verdicts): "insufficient" sends the agent closer for a new view (state 3). Must match the planner's `verification_approach` and needs `on_error: reject`; `scripts/run_strategy.sh d1` sets all three |
-| `approach_max_per_cluster` / `approach_max_steps` / `approach_episode_steps` | 2 / 40 / 120 | approach budgets (also capped by the steps left in the episode); a failed approach (unreachable, aborted, no new view) or "insufficient" after the last one rejects |
-| `approach_min_closer_m` / `approach_min_angle_deg` | 0.5 / 30 | a view during an approach ends it early when it is this much closer than, or this far around the object from, every view already judged; on arrival the newest view since the approach began is judged without these thresholds. The planner keeps 0.45 m / 10 deg of slack in its candidates and gets the closest judged distance (`min_range`) |
+| `approach_max_per_cluster` / `approach_max_steps` / `approach_episode_steps` | 2 / 40 / 120 | approach budgets (also capped by the steps left in the episode); a failed approach (no object path, target lost, budget used up, no view on arrival) or "insufficient" on arrival rejects |
+| `approach_min_closer_m` / `approach_min_angle_deg` | 0.5 / 30 | a view on the way is judged at once when it is this much closer than, or this far around the object from, every view already judged (insufficient: keep approaching); on arrival the newest view since the approach began is judged without these thresholds |
 
-Approach (d1): the planner drives to a viewpoint 0.8-1.5 m from the object point (the
-evidence centroid) along the judged view's line of sight, jittered 0/+-20/+-40 deg (only
-the side bearings when that view was already within 1.5 m; cost = path length + 1 m per
-20 deg), faces the object and asks again; a new view on the way ends the approach early.
-At the stop the planner first turns to face the object; "insufficient" there gets one
-side-view (+-40 deg) approach if the budget allows, else rejects (never stops on it).
+Approach (d1): the insufficient cluster becomes the planner's forced target and ApexNav's
+own object navigation (approach point, per-step replanning) drives toward it. A new view
+on the way is judged at once; at the object the agent turns to face it and the fresh view
+is judged; "insufficient" there (or at any stop) rejects: the agent never stops on it.
 
 Give-up stops (no frontier left, stuck, step limit) are not verified, by design.
 

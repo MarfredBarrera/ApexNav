@@ -52,13 +52,10 @@ constexpr double FORWARD_DISTANCE = 0.15;        // min clearance for marking ob
 constexpr double FORCE_DORMANT_DISTANCE = 0.35;  // force dormant frontier if very close
 constexpr double MIN_SAFE_DISTANCE = 0.15;       // min safe distance to obstacles
 constexpr double STOP_MATCH_DISTANCE = 0.75;     // perception gate: stop target <-> cluster cell
-constexpr double VIEWPOINT_REACH_DISTANCE = 0.25;       // approach viewpoint reached
-constexpr double VIEWPOINT_SOFT_REACH_DISTANCE = 0.45;  // ... accepted when progress stalls this close
 
 // Counters / thresholds
 constexpr int MAX_STUCKING_COUNT = 25;           // max consecutive stuck actions -> stop
 constexpr int MAX_STUCKING_NEXT_POS_COUNT = 14;  // times next_pos unchanged while stuck
-constexpr int VIEWPOINT_MAX_NO_PROGRESS = 5;     // approach: MOVE_FORWARD steps with < STUCKING_DISTANCE progress
 
 // Cost weights
 constexpr double TARGET_WEIGHT = 150.0;
@@ -150,8 +147,8 @@ private:
   void finishVerification(int state, bool timed_out);
   bool facing(const Vector2d& point, int& turn);
   void startApproach(const plan_env::msg::VerificationResult& msg);
-  void planApproachAction();
-  void endApproach(int status);
+  bool checkApproach();
+  void endApproach(int status, const char* reason);
   void transitState(ROS_STATE new_state, string pos_call);
   void wrapAngle(double& angle);
   void publishRobotMarker();

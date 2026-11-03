@@ -739,6 +739,22 @@ bool ObjectMap2D::setVerification(int id, int state)
   return true;
 }
 
+pcl::shared_ptr<pcl::PointCloud<pcl::PointXYZ>> ObjectMap2D::getObjectCloud(int id) const
+{
+  pcl::shared_ptr<pcl::PointCloud<pcl::PointXYZ>> cloud(new pcl::PointCloud<pcl::PointXYZ>());
+  if (id < 0 || id >= (int)objects_.size() || objects_[id].verification_ == -1)
+    return cloud;
+  const auto& cells = objects_[id].good_cells_.empty() ? objects_[id].cells_ : objects_[id].good_cells_;
+  for (const auto& cell : cells) {
+    pcl::PointXYZ point;
+    point.x = cell(0);
+    point.y = cell(1);
+    point.z = 0;
+    cloud->push_back(point);
+  }
+  return cloud;
+}
+
 int ObjectMap2D::getVerification(int id) const
 {
   if (id < 0 || id >= (int)objects_.size())

@@ -139,6 +139,9 @@ public:
       vector<pcl::shared_ptr<pcl::PointCloud<pcl::PointXYZ>>>& top_object_clouds,
       bool limited_confidence = true, bool extreme = false, vector<int>* ids = nullptr);
   bool setVerification(int id, int state);
+  // The cluster's good cells (all cells while it has none) as a cloud; empty for an unknown
+  // or rejected id
+  pcl::shared_ptr<pcl::PointCloud<pcl::PointXYZ>> getObjectCloud(int id) const;
   int getVerification(int id) const;
   // Perception gate. With it on, the extreme "others" cloud (all clusters,
   // mostly other classes) is never a target

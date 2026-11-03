@@ -112,13 +112,13 @@ verification:
   recheck_min_distance_m: 1.0   # ... from a camera this far from every view used before
   recheck_min_angle_deg: 45     # ... or looking at it from this different a direction
   match_distance_m: 0.75        # evidence detection to cluster centroid
-  # Approach (server --selector d1, planner verification_approach:=true): an insufficient
-  # view sends the agent closer along the line of sight (or to the side) for a new view
+  # Approach (server --selector d1, planner verification_approach:=true, on_error: reject):
+  # an insufficient view makes the cluster the planner's target until a new view decides
   approach: false
-  approach_max_per_cluster: 2   # approaches per cluster; failure or insufficient after the last rejects
+  approach_max_per_cluster: 2   # approaches per cluster; failure or insufficient on arrival rejects
   approach_max_steps: 40        # actions per approach
   approach_episode_steps: 120   # approach actions per episode
-  approach_min_closer_m: 0.5    # a new view is this much closer than every judged view ...
+  approach_min_closer_m: 0.5    # a view on the way is new when this much closer than every judged view ...
   approach_min_angle_deg: 30    # ... or this far around the object from each
   log_dir: "{video_output_path}/verification"
   save_images: true
