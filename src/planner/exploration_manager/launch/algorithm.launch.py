@@ -43,9 +43,14 @@ def verification_params(context):
         raise RuntimeError(
             f"verification_gate must be true or false, got '{raw}'"
         )
+    approach = LaunchConfiguration('verification_approach').perform(context).strip().lower()
+    if approach not in ('true', 'false', '1', '0'):
+        raise RuntimeError(f"verification_approach must be true or false, got '{approach}'")
     return {
         'verification.enabled': raw in ('true', '1'),
         'verification.timeout_s': 300.0,
+        # gate state 3 (server selector d1) and the backstop's face-the-object turn
+        'verification.approach': approach in ('true', '1'),
     }
 
 
@@ -204,6 +209,14 @@ def generate_launch_description():
             description=(
                 'true = a target cluster must pass perception.Verifier '
                 '(perception_gate) before the agent may stop at it'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'verification_approach',
+            default_value='false',
+            description=(
+                'true = with verification_gate, an insufficient view (state 3, server '
+                'selector d1) sends the agent closer for a new view'
             ),
         ),
         DeclareLaunchArgument(

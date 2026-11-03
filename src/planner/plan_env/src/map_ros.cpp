@@ -276,11 +276,18 @@ void MapROS::stepObservationCallback(const plan_env::msg::StepObservation::Share
   if (msg->has_clouds)
     processObjectClouds(msg->clouds);
 
-  // The perception gate reopens rejected clusters as of this step
+  // The perception gate reopens rejected clusters as of this step; for a cluster under
+  // approach (3) the id says a new view of it arrived (the FSM ends the approach early)
   for (int id : msg->reopen_cluster_ids) {
-    if (map_->object_map2d_->getVerification(id) == -1) {
+    int verification = map_->object_map2d_->getVerification(id);
+    if (verification == -1) {
       map_->object_map2d_->setVerification(id, 0);
       RCLCPP_WARN(node_->get_logger(), "[Verification] cluster %d reopened (step %d)", id, msg->step);
+    }
+    else if (verification == 3) {
+      map_->object_map2d_->markApproachView(id);
+      RCLCPP_WARN(node_->get_logger(), "[Verification] cluster %d: new view during the approach (step %d)",
+          id, msg->step);
     }
   }
 

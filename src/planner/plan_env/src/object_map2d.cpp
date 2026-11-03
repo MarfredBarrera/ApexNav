@@ -67,6 +67,7 @@ void ObjectMap2D::reset()
   objects_.clear();
   accepted_positions_.clear();
   suppressed_positions_.clear();
+  approach_views_.clear();
   all_object_clouds_->clear();
   over_depth_object_cloud_->clear();
 }

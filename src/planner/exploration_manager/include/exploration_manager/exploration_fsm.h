@@ -52,10 +52,13 @@ constexpr double FORWARD_DISTANCE = 0.15;        // min clearance for marking ob
 constexpr double FORCE_DORMANT_DISTANCE = 0.35;  // force dormant frontier if very close
 constexpr double MIN_SAFE_DISTANCE = 0.15;       // min safe distance to obstacles
 constexpr double STOP_MATCH_DISTANCE = 0.75;     // perception gate: stop target <-> cluster cell
+constexpr double VIEWPOINT_REACH_DISTANCE = 0.25;       // approach viewpoint reached
+constexpr double VIEWPOINT_SOFT_REACH_DISTANCE = 0.45;  // ... accepted when progress stalls this close
 
 // Counters / thresholds
 constexpr int MAX_STUCKING_COUNT = 25;           // max consecutive stuck actions -> stop
 constexpr int MAX_STUCKING_NEXT_POS_COUNT = 14;  // times next_pos unchanged while stuck
+constexpr int VIEWPOINT_MAX_NO_PROGRESS = 5;     // approach: MOVE_FORWARD steps with < STUCKING_DISTANCE progress
 
 // Cost weights
 constexpr double TARGET_WEIGHT = 150.0;
@@ -107,6 +110,7 @@ private:
 
   /* Perception gate: verify a target cluster before the agent may stop at it */
   bool verification_enabled_ = false;
+  bool approach_enabled_ = false;  // verification.approach: gate state 3 and the backstop turn
   double verification_timeout_s_ = 300.0;
   uint32_t verification_seq_ = 0;  // never reset, so a stale reply cannot match
   rclcpp::Publisher<plan_env::msg::VerificationRequest>::SharedPtr verify_request_pub_;
@@ -141,8 +145,13 @@ private:
   void finishPlanning();
   bool needsVerification();
   bool needsStopVerification(int& cluster_id, Vector2d& pos);
-  void requestVerification(int cluster_id, const Vector2d& pos, bool at_stop);
+  void requestVerification(int cluster_id, const Vector2d& pos, bool at_stop, int approach_id = 0,
+      int viewpoint_status = 0);
   void finishVerification(int state, bool timed_out);
+  bool facing(const Vector2d& point, int& turn);
+  void startApproach(const plan_env::msg::VerificationResult& msg);
+  void planApproachAction();
+  void endApproach(int status);
   void transitState(ROS_STATE new_state, string pos_call);
   void wrapAngle(double& angle);
   void publishRobotMarker();

@@ -69,6 +69,12 @@ def generate_launch_description():
         description='true = verify target clusters with perception.Verifier (perception_gate)'
     )
 
+    verification_approach_arg = DeclareLaunchArgument(
+        'verification_approach',
+        default_value='false',
+        description='true = approach for a new view when the gate says insufficient (selector d1)'
+    )
+
     sync_step_arg = DeclareLaunchArgument(
         'sync_step',
         default_value='false',
@@ -104,6 +110,7 @@ def generate_launch_description():
             'fy_': LaunchConfiguration('fy'),
             'multiview_fusion': LaunchConfiguration('multiview_fusion'),
             'verification_gate': LaunchConfiguration('verification_gate'),
+            'verification_approach': LaunchConfiguration('verification_approach'),
             'sync_step': LaunchConfiguration('sync_step'),
         }.items()
     )
@@ -122,6 +129,7 @@ def generate_launch_description():
         fy_arg,
         multiview_fusion_arg,
         verification_gate_arg,
+        verification_approach_arg,
         sync_step_arg,
         # Include algorithm
         algorithm_launch,

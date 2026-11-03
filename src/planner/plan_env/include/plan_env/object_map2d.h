@@ -23,6 +23,7 @@
 #include <pcl/kdtree/kdtree_flann.h>
 #include <pcl/common/common.h>
 #include <unordered_map>
+#include <set>
 
 using Eigen::Vector2d;
 using Eigen::Vector2i;
@@ -68,7 +69,7 @@ struct ObjectConfidenceInfo {
   int observation_num;  ///< Frames the target class was observed in
   Vector2d average;     ///< Cluster centroid
   bool is_confident;    ///< Passes isConfidenceObject()
-  int verification;     ///< Perception gate: -1 rejected, 0 unverified, 1 accepted, 2 deferred
+  int verification;     ///< Perception gate: -1 rejected, 0 unverified, 1 accepted, 2 deferred, 3 under approach
 };
 
 struct Viewpoint2D {
@@ -96,7 +97,7 @@ struct ObjectCluster {
   int max_seen_count_;                   ///< Maximum observation count across all cells
   vector<Vector2d> good_cells_;          ///< High-confidence cells (frequently observed)
   int best_label_;                       ///< Most confident semantic label
-  int verification_ = 0;                 ///< Perception gate: -1 rejected, 0 unverified, 1 accepted, 2 deferred
+  int verification_ = 0;                 ///< Perception gate: -1 rejected, 0 unverified, 1 accepted, 2 deferred, 3 under approach
 
   /******* 3D Point Cloud Information *******/
   vector<pcl::shared_ptr<pcl::PointCloud<pcl::PointXYZ>>> clouds_;  ///< Point clouds per semantic
@@ -150,6 +151,10 @@ public:
   void acceptPosition(const Vector2d& pos) { accepted_positions_.push_back(pos); }
   bool isAcceptedPosition(const Vector2d& pos, double radius) const;
   void suppressPosition(const Vector2d& pos) { suppressed_positions_.push_back(pos); }
+  // Perception gate approach: the gate saw a new view of a cluster under approach (state 3),
+  // passed like a reopen; the FSM takes it once to end the approach early
+  void markApproachView(int id) { approach_views_.insert(id); }
+  bool takeApproachView(int id) { return approach_views_.erase(id) > 0; }
   pcl::shared_ptr<pcl::PointCloud<pcl::PointXYZ>> withoutSuppressed(
       const pcl::shared_ptr<pcl::PointCloud<pcl::PointXYZ>>& cloud, double radius) const;
   void getObjects(
@@ -223,6 +228,7 @@ private:
   // Perception gate
   bool verification_enabled_ = false;
   vector<Vector2d> accepted_positions_, suppressed_positions_;  ///< reset per episode
+  std::set<int> approach_views_;                                ///< reset per episode
 
   // System integration
   SDFMap2D* sdf_map_;

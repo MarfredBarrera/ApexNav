@@ -59,6 +59,21 @@ struct FSMData {
     verify_pos_ = Eigen::Vector2d(0, 0);
     verify_at_stop_ = false;
     last_expl_result_ = -1;
+
+    vp_active_ = false;
+    vp_moved_ = false;
+    vp_cluster_id_ = -1;
+    vp_approach_id_ = 0;
+    vp_steps_ = 0;
+    vp_max_steps_ = 0;
+    vp_no_progress_ = 0;
+    vp_object_ = vp_camera_ = vp_pos_ = vp_last_pos_ = Eigen::Vector2d::Zero();
+    vp_jitter_ = 0.0;
+    vp_side_only_ = false;
+    vp_researched_ = false;
+    vp_at_stop_ = false;
+    vp_stop_pos_ = Eigen::Vector2d::Zero();
+    stop_face_pending_ = false;
   }
   // FSM data
   bool trigger_, have_odom_, have_confidence_;
@@ -101,6 +116,26 @@ struct FSMData {
   int verify_cluster_id_;  // cluster it asks about; -1: a bare position (stop backstop)
   Eigen::Vector2d verify_pos_;
   bool verify_at_stop_;  // sent by the stop backstop
+
+  // Perception gate approach (state 3, verification.approach): drive to a viewpoint nearer
+  // the object point, face it, and ask again. The usual planner is not consulted meanwhile
+  bool vp_active_;  // driving to an approach viewpoint
+  bool vp_moved_;   // an approach started since the ordinary request: its held action is stale
+  int vp_cluster_id_, vp_approach_id_;
+  int vp_steps_, vp_max_steps_;  // actions spent on this approach / allowed
+  int vp_no_progress_;           // MOVE_FORWARD steps with < STUCKING_DISTANCE progress
+  Eigen::Vector2d vp_object_;    // the object point (evidence centroid) the viewpoint faces
+  Eigen::Vector2d vp_camera_;    // camera of the insufficient view (line of sight)
+  Eigen::Vector2d vp_pos_;       // the viewpoint
+  Eigen::Vector2d vp_last_pos_;  // position at the previous approach action
+  double vp_jitter_;             // deg from the line of sight
+  bool vp_side_only_;            // stop backstop: +-40 deg bearings only
+  bool vp_researched_;           // the viewpoint was re-searched once after it became blocked
+  // The ordinary request the approaches started from: a rejection after an approach at the
+  // stop still suppresses the stop position, as an at_stop rejection does
+  bool vp_at_stop_;
+  Eigen::Vector2d vp_stop_pos_;
+  bool stop_face_pending_;  // the backstop turned to face the object; verify at the next step
 };
 
 struct FSMParam {
