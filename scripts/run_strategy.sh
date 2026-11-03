@@ -16,6 +16,7 @@
 #            the gate approaches on "insufficient" (verification.approach=true; the planner
 #            is launched with verification_approach:=true); server errors reject
 #            (verification.on_error=reject), as every other approach failure does
+#            D1_EVIDENCE=input: Qwen judges the frame alone (no SAM3D grid; fits one GPU)
 # DATASET (default hm3dv2) is passed to habitat_evaluation.py --dataset.
 # Needs the four VLM servers (scripts/start_session.sh); does not start or stop them.
 # On any exit it stops the perception server/workers, its gpu_guard and any episode or
@@ -37,7 +38,7 @@ case $STRAT in
   top2gap) mode=gate; flags="--selector top2gap --no-ensemble --judge-input" ;;
   defer) mode=gate; flags="--selector top2gap --no-ensemble --judge-input --view-when unsure"
          eval_args="verification.on_view_reject=defer" ;;
-  d1) mode=gate; flags="--selector d1"; eval_args="verification.approach=true verification.on_error=reject"; approach=true ;;
+  d1) mode=gate; flags="--selector d1 --d1-evidence ${D1_EVIDENCE:-grid}"; eval_args="verification.approach=true verification.on_error=reject"; approach=true ;;
   *) echo "unknown strategy $STRAT"; exit 2 ;;
 esac
 root=$APEX/videos/$NAME
