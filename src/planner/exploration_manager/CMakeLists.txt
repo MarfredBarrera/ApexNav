@@ -87,6 +87,13 @@ install(DIRECTORY config/
   DESTINATION share/${PROJECT_NAME}/config
 )
 
+# Perception gate approach geometry (header only)
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_approach_geometry test/test_approach_geometry.cpp)
+  target_include_directories(test_approach_geometry PRIVATE include ${EIGEN3_INCLUDE_DIRS})
+endif()
+
 # Export
 ament_export_include_directories(include)
 ament_export_dependencies(

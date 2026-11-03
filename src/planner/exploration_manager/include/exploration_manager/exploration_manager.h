@@ -84,6 +84,18 @@ public:
   void calcSemanticFrontierInfo(const vector<SemanticFrontier>& sem_frontiers, double& std_dev,
       double& max_to_mean, double& mean, bool if_print = false);
 
+  // Perception gate approach (state 3): the cheapest candidate of approach::candidates(object,
+  // camera, side_only) that is KNOWN FREE, not inflated, has a line of sight to the object
+  // (no OCCUPIED cell on p -> object before the line comes within 0.3 m of a cell of cluster
+  // cluster_id, or of the object point), and is A*-reachable through known space (NORMAL)
+  // with a path of at most max_path. Cost: path length + approach::RANK_COST * jitter rank.
+  // False when none is feasible.
+  bool searchApproachPath(const Vector2d& start, const Vector2d& object, const Vector2d& camera,
+      int cluster_id, bool side_only, double max_path, Vector2d& viewpoint, vector<Vector2d>& path,
+      double& jitter_deg);
+  // A* to a fixed point (per-step replanning toward a viewpoint): NORMAL, else OPTIMISTIC
+  bool searchPointPath(const Vector2d& start, const Vector2d& goal, vector<Vector2d>& path);
+
   shared_ptr<ExplorationData> ed_;            ///< Exploration data container
   shared_ptr<ExplorationParam> ep_;           ///< Exploration parameters
   unique_ptr<Astar2D> path_finder_;           ///< A* path finding algorithm
