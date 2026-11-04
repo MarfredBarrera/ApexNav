@@ -37,8 +37,8 @@ drives toward it. While an approach is pending, ``observe`` returns the cluster'
 ``approach_min_closer_m`` closer than, or ``approach_min_angle_deg`` away from, every view
 already judged for the cluster; the planner asks about it at once (``viewpoint_status`` 4):
 accept, reject, or insufficient -> keep approaching (state 3 again, same approach). On
-arrival (the object reached, the agent facing it; status 1) the newest view since the
-approach began is judged without those thresholds, and insufficient rejects. Status 2 (no
+arrival (the object reached, the agent facing it; status 1) a view from that very step is
+judged without those thresholds (none: not re-detected), and insufficient rejects. Status 2 (no
 object path, target lost) and 3 (step budget used up) reject. Approach re-requests bypass
 the re-check cooldown, ``max_checks`` and the verdict cache. Budgets:
 ``approach_max_per_cluster`` approaches per cluster, ``approach_max_steps`` actions each,
@@ -498,13 +498,15 @@ class VerificationGate:
         return {"approach_id": pending["id"], "object": pending["object"], "camera": pending["camera"],
                 "max_steps": pending["max_steps"]}
 
-    def _approach_view(self, item, cluster_id, pending, used, novel=True):
+    def _approach_view(self, item, cluster_id, pending, used, arrival_step=None):
         """Match distance when ``item`` is a new view of the approached object: taken since the
         approach was issued, of the object point (not nearer another cluster), and closer by
         ``approach_min_closer_m`` than, or ``approach_min_angle_deg`` around the object from,
-        every view judged for the cluster. Else None. ``novel`` False (arrival: the agent
-        physically moved there): any view taken after the approach was issued."""
-        if item["step"] < pending["issued_step"] or (not novel and item["step"] == pending["issued_step"]):
+        every view judged for the cluster. Else None. ``arrival_step`` (arrival: the agent
+        stands at the object, facing it): a view taken at that step, without the thresholds."""
+        novel = arrival_step is None
+        if item["step"] < pending["issued_step"] or (not novel and (item["step"] != arrival_step or
+                                                                    item["step"] == pending["issued_step"])):
             return None
         distance = _distance(item["centroid"], pending["object"])
         if distance > self.cfg["match_distance_m"] or self._closer_to_other(item, cluster_id, distance):
@@ -574,13 +576,13 @@ class VerificationGate:
         if status == EARLY and pending["early"] is not None:
             view = pending["early"]
         else:
-            # Arrival: the newest view since the approach started, without the new-view
-            # thresholds (the agent physically moved there)
+            # Arrival: a view from this very step (the agent at the object, facing it), without
+            # the new-view thresholds; none -> not re-detected
             views = [(item, d) for item in self.evidence
                      for d in [self._approach_view(item, record["cluster"]["id"], pending, state["used"],
-                                                   novel=status != ARRIVED)]
+                                                   arrival_step=int(step) if status == ARRIVED else None)]
                      if d is not None]
-            if views:  # the newest: on arrival, the one facing the object
+            if views:
                 view = max(views, key=lambda v: (v[0]["step"], v[0]["quality"]))
         if view is None:
             return self._approach_failed(record, state, "not_redetected")

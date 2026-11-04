@@ -52,6 +52,8 @@ constexpr double FORWARD_DISTANCE = 0.15;        // min clearance for marking ob
 constexpr double FORCE_DORMANT_DISTANCE = 0.35;  // force dormant frontier if very close
 constexpr double MIN_SAFE_DISTANCE = 0.15;       // min safe distance to obstacles
 constexpr double STOP_MATCH_DISTANCE = 0.75;     // perception gate: stop target <-> cluster cell
+constexpr double APPROACH_FACE_TOLERANCE = M_PI / 12.0;  // approach arrival: object within +-15 deg
+constexpr int APPROACH_MAX_FACE_TURNS = 3;               // ... turning at most this often
 
 // Counters / thresholds
 constexpr int MAX_STUCKING_COUNT = 25;           // max consecutive stuck actions -> stop
@@ -146,6 +148,8 @@ private:
       int viewpoint_status = 0);
   void finishVerification(int state, bool timed_out);
   bool facing(const Vector2d& point, int& turn);
+  bool facingWithin(const Vector2d& point, double tolerance, int& turn);
+  bool faceTurn();
   void startApproach(const plan_env::msg::VerificationResult& msg);
   bool checkApproach();
   void endApproach(int status, const char* reason);

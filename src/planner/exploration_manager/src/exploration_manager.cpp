@@ -130,6 +130,12 @@ int ExplorationManager::planNextBestPoint(const Vector3d& pos, const double& yaw
       setTarget(forced_cluster_id_, cloud);
       return SEARCH_BEST_OBJECT;
     }
+    // As the extreme case below: a target first reached with relaxed constraints
+    if (!cloud->points.empty() &&
+        searchObjectPathExtreme(pos, cloud, ed_->next_pos_, ed_->next_best_path_)) {
+      setTarget(forced_cluster_id_, cloud);
+      return SEARCH_EXTREME;
+    }
     RCLCPP_WARN(node_->get_logger(), "[Verification] approach: no object path to cluster %d (%zu cells)",
         forced_cluster_id_, cloud->points.size());
     forced_failed_ = true;

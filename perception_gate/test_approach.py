@@ -113,11 +113,11 @@ class ApproachTests(unittest.TestCase):
         self.observe(1, (0.0, 0.0))
         self.insufficient_then("correct")
         self.gate.handle(request(), step=1)
-        self.observe(5, (0.2, 0.0), size=10)                     # not new by the thresholds
+        self.observe(5, (0.2, 0.0), size=30)                     # not new by the thresholds
         self.observe(6, (0.3, 0.0), size=8)
         self.assertEqual(self.gate.handle(request(3, OBJECT, seq=2, at_stop=True, approach_id=1,
                                                   status=1, steps=6), step=6), ACCEPTED)
-        self.assertEqual(self.gate.clusters[3]["used"][-1]["camera"], (0.3, 0.0))  # the newest
+        self.assertEqual(self.gate.clusters[3]["used"][-1]["camera"], (0.3, 0.0))  # this step's view
         # Insufficient on arrival rejects
         self.observe(10, (4.0, 0.0), centroid=(6.0, 0.0))
         self.statuses += ["insufficient", "insufficient"]
@@ -126,6 +126,16 @@ class ApproachTests(unittest.TestCase):
         self.assertEqual(self.gate.handle(request(4, (6.0, 0.0), seq=4, at_stop=True, approach_id=1, status=1,
                                                   steps=2), step=12), REJECTED)
         self.assertEqual(decisions(self.folder)[-1]["policy"], "insufficient,arrival")
+
+    def test_arrival_needs_a_view_from_the_arrival_step(self):
+        self.observe(1, (0.0, 0.0))
+        self.insufficient_then()
+        self.gate.handle(request(), step=1)
+        self.observe(5, (1.5, 0.0))                              # seen on the way, not at arrival
+        self.assertEqual(self.gate.handle(request(3, OBJECT, seq=2, at_stop=True, approach_id=1, status=1,
+                                                  steps=7), step=8), REJECTED)
+        self.assertEqual(self.gate.finish_episode()["not_redetected"], 1)
+        self.assertEqual(len(self.calls), 1)
 
     def test_cache_bypass(self):
         # A view judged for a stop position is cached; the approach must not reuse that verdict

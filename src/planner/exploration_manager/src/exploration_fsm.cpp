@@ -207,7 +207,8 @@ void ExplorationFSM::FSMCallback()
         transitState(ROS_STATE::PUB_ACTION, "FSM");
         updateFrontierAndObject();
       }
-      else if (fd_->ap_active_ && expl_manager_->object_map2d_->takeApproachView(fd_->ap_cluster_id_)) {
+      else if (fd_->ap_active_ && !fd_->stop_face_pending_ &&
+               expl_manager_->object_map2d_->takeApproachView(fd_->ap_cluster_id_)) {
         // Approach: the gate saw a new view of the cluster (passed with this step); ask now
         updateFrontierAndObject();
         endApproach(4, "new view");
@@ -220,8 +221,12 @@ void ExplorationFSM::FSMCallback()
         fd_->final_result_ = FINAL_RESULT::REACH_OBJECT;
         int stop_cluster = -1;
         Vector2d stop_pos;
-        if (fd_->ap_active_)
-          endApproach(1, "arrived, facing the object");
+        if (fd_->ap_active_) {
+          // A new view while turning is the arrival's own view: one request (status 1)
+          expl_manager_->object_map2d_->takeApproachView(fd_->ap_cluster_id_);
+          if (!faceTurn())
+            endApproach(1, "arrived, facing the object");
+        }
         else if (needsStopVerification(stop_cluster, stop_pos))
           requestVerification(stop_cluster, stop_pos, true);
         else
@@ -292,7 +297,8 @@ void ExplorationFSM::FSMCallback()
               verification_timeout_s_);
           std::exit(1);
         }
-        finishVerification(1, true);
+        // With the approach (d1) every failure rejects, a timeout too
+        finishVerification(approach_enabled_ ? -1 : 1, true);
       }
       break;
     }
@@ -403,8 +409,10 @@ void ExplorationFSM::finishVerification(int state, bool timed_out)
   int id = fd_->verify_cluster_id_;
   auto obj_map = expl_manager_->object_map2d_;
   bool approach = fd_->verify_approach_id_ > 0, arrival = fd_->verify_arrival_;
+  bool stuck = fd_->verify_stuck_;
   fd_->verify_approach_id_ = 0;
   fd_->verify_arrival_ = false;
+  fd_->verify_stuck_ = false;
   if (approach || (id >= 0 && expl_manager_->forced_cluster_id_ == id)) {
     fd_->ap_active_ = false;
     if (state != 1) {
@@ -423,13 +431,18 @@ void ExplorationFSM::finishVerification(int state, bool timed_out)
     obj_map->suppressPosition(fd_->verify_pos_);
   if (timed_out)
     RCLCPP_ERROR(node_->get_logger(),
-        "[Verification] no verdict for cluster %d within %.0f s: fail open (accepted)", id,
-        verification_timeout_s_);
+        "[Verification] no verdict for cluster %d within %.0f s: %s", id, verification_timeout_s_,
+        state == 1 ? "fail open (accepted)" : "rejected");
   else
     RCLCPP_WARN(node_->get_logger(), "[Verification] cluster %d %s%s", id,
         state == 1 ? "ACCEPTED" : state == 2 ? "DEFERRED" : "REJECTED",
         fd_->verify_at_stop_ ? " [at stop]" : "");
   publishObjectFusionState();
+  if (stuck) {  // the approach ended because the agent is stuck: give up as without the gate
+    fd_->final_result_ = FINAL_RESULT::STUCKING;
+    finishPlanning();
+    return;
+  }
   if ((state == 1 || state == 2) && (!approach || arrival)) {
     finishPlanning();
     return;
@@ -500,6 +513,41 @@ bool ExplorationFSM::facing(const Vector2d& point, int& turn)
   return turn == ACTION::MOVE_FORWARD;
 }
 
+// True when ``point`` is within ``tolerance`` (rad) of the heading; else ``turn`` turns toward it
+bool ExplorationFSM::facingWithin(const Vector2d& point, double tolerance, int& turn)
+{
+  Vector2d pos(fd_->odom_pos_(0), fd_->odom_pos_(1));
+  turn = ACTION::MOVE_FORWARD;
+  if ((point - pos).norm() < 1e-3)
+    return true;
+  double diff = std::atan2(point(1) - pos(1), point(0) - pos(0)) - fd_->odom_yaw_;
+  wrapAngle(diff);
+  if (std::fabs(diff) <= tolerance)
+    return true;
+  turn = diff > 0 ? ACTION::TURN_LEFT : ACTION::TURN_RIGHT;
+  return false;
+}
+
+// Approach arrival: one more turn toward the object when it is not within +-15 deg of the
+// heading, at most APPROACH_MAX_FACE_TURNS times and within the step budget. True when a
+// turn was planned (the next step comes back here through stop_face_pending_)
+bool ExplorationFSM::faceTurn()
+{
+  int turn = ACTION::MOVE_FORWARD;
+  if (facingWithin(expl_manager_->ed_->target_object_pos_, FSMConstants::APPROACH_FACE_TOLERANCE, turn) ||
+      fd_->ap_face_turns_ >= FSMConstants::APPROACH_MAX_FACE_TURNS || fd_->ap_steps_ >= fd_->ap_max_steps_)
+    return false;
+  RCLCPP_WARN(node_->get_logger(), "[Verification] approach: reached; turning to face the object (%d)",
+      fd_->ap_face_turns_ + 1);
+  fd_->ap_face_turns_++;
+  fd_->ap_steps_++;
+  fd_->newest_action_ = turn;
+  fd_->stop_face_pending_ = true;
+  fd_->final_result_ = FINAL_RESULT::SEARCH_OBJECT;
+  finishPlanning();
+  return true;
+}
+
 // Gate state 3: the cluster becomes the planner's forced target and ApexNav's own object
 // navigation (searchObjectPath, per-step replanning) drives toward it. After an ordinary
 // request the held action already heads for it (it was planned for this cluster), so it is
@@ -510,8 +558,10 @@ void ExplorationFSM::startApproach(const plan_env::msg::VerificationResult& msg)
   bool resume = fd_->verify_approach_id_ > 0;
   fd_->verify_approach_id_ = 0;
   fd_->verify_arrival_ = false;
+  fd_->verify_stuck_ = false;
   if (!resume || msg.approach_id != fd_->ap_approach_id_ || msg.cluster_id != fd_->ap_cluster_id_)
     fd_->ap_steps_ = 0;
+  fd_->ap_face_turns_ = 0;
   fd_->ap_active_ = true;
   fd_->ap_cluster_id_ = msg.cluster_id;
   fd_->ap_approach_id_ = msg.approach_id;
@@ -546,21 +596,18 @@ bool ExplorationFSM::checkApproach()
 {
   auto ed = expl_manager_->ed_;
   if (fd_->final_result_ == FINAL_RESULT::REACH_OBJECT) {
-    int turn = ACTION::MOVE_FORWARD;
-    if (!facing(ed->target_object_pos_, turn)) {  // one turn, then verify (stop_face_pending_)
-      RCLCPP_WARN(node_->get_logger(), "[Verification] approach: reached; turning to face the object");
-      fd_->newest_action_ = turn;
-      fd_->stop_face_pending_ = true;
-      fd_->final_result_ = FINAL_RESULT::SEARCH_OBJECT;
-      fd_->ap_steps_++;
-      finishPlanning();
-      return true;
-    }
-    endApproach(1, "arrived, facing the object");
+    // Turn (budget permitting) until the object is in view, then verify (stop_face_pending_)
+    if (!faceTurn())
+      endApproach(1, "arrived, facing the object");
     return true;
   }
-  if (fd_->final_result_ == FINAL_RESULT::STUCKING)
-    return false;  // the episode ends as without the gate (give-up stops are not verified)
+  if (fd_->final_result_ == FINAL_RESULT::STUCKING) {
+    // The episode still ends as without the gate (give-up stops are not verified), but the
+    // approach gets an outcome first (aborted -> rejected)
+    fd_->verify_stuck_ = true;
+    endApproach(3, "stuck");
+    return true;
+  }
   if (expl_manager_->forced_failed_ || ed->target_cluster_id_ != fd_->ap_cluster_id_ ||
       fd_->final_result_ != FINAL_RESULT::SEARCH_OBJECT) {
     endApproach(2, expl_manager_->forced_failed_ ? "no object path" : "target lost");
