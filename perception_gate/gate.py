@@ -38,7 +38,10 @@ drives toward it. While an approach is pending, ``observe`` returns the cluster'
 already judged for the cluster; the planner asks about it at once (``viewpoint_status`` 4):
 accept, reject, or insufficient -> keep approaching (state 3 again, same approach). On
 arrival (the object reached, the agent facing it; status 1) a view from that very step is
-judged without those thresholds (none: not re-detected), and insufficient rejects. Status 2 (no
+judged without those thresholds; insufficient there is a forced decision by SAM3's raw label on
+that view, and not re-detected, by SAM3's raw label on the cluster's last judged view. The planner arrives within 1.5 m of the object
+(standoff) or on reaching it; a view of the object matches the issued object point or the
+cluster's centroid at that step. Status 2 (no
 object path, target lost) and 3 (step budget used up) reject. Approach re-requests bypass
 the re-check cooldown, ``max_checks`` and the verdict cache. Budgets:
 ``approach_max_per_cluster`` approaches per cluster, ``approach_max_steps`` actions each,
@@ -46,6 +49,27 @@ the re-check cooldown, ``max_checks`` and the verdict cache. Budgets:
 reject. At the stop backstop (``at_stop``) and for positions (cluster -1) insufficient
 rejects. A rejected cluster then follows the re-check rule below. Approach needs
 ``on_error: reject``.
+
+Multi-view close range (``multiview``, needs ``approach`` and a server with
+``settings.multiview``): while an approach is pending, every view of the object goes into the
+cluster's view bank (``state["bank"]``, seeded from the evidence when the approach is issued,
+at most ``multiview_bank`` views; fragments of the object, clusters within
+``multiview_sibling_m`` of it, do not exclude views). Early re-checks, arrivals and (with
+``multiview_failure``) failed approaches with ``multiview_min_views`` distinct-step views are
+decided over ``select_views`` of the bank in one /verify_views request: Qwen correct/wrong
+decides; insufficient keeps approaching (early) or falls back to SAM3 over the views
+(``select.aggregate_views``): accept iff margin M >= ``multiview_arrival_margin`` (arrival) or
+``multiview_failure_margin`` (failure) and the target vote V >= ``multiview_vote``, else reject.
+``multiview_grid``: Qwen also sees the SAM3D grid of the best close view (slot 1). Rule C (not
+re-detected) and rule D (SAM3 on the arrival view) are not used; an empty bank rejects.
+
+JEV + SAM3 (server selector ``jev_sam3``, the d1mv approach and view bank, no grid): JEV-27B-VL only judges the uncertainty
+(unsure -> approach; unsure views on the way keep approaching); SAM3 makes every decision. The first
+request: SAM3's raw label (model ``sam3``). /verify_views on arrivals, failed approaches, and views on
+the way JEV is sure about: SAM3 over the views decides with the fused (evidential) belief, accept iff
+the target is its top (server ``select.fuse_views``; 2026-11-07, it replaced the margin-and-vote rule; the
+``multiview_*_margin`` / ``multiview_vote`` settings apply to the d1 fallback only)
+(model ``sam3``, policy ``multiview,<mode>,sam3_<accept|reject>``).
 
 Failure policy (fail open by default): a server error or timeout applies
 ``on_error``, a cluster without a stored view ``on_no_evidence``; both are
@@ -95,12 +119,31 @@ DEFAULTS = {
     "evidence_per_cell": 8,
     "max_evidence": 256,
     "ground_truth_semantic_overlap": 0.5,
-    "approach": False,               # d1: insufficient -> approach (state 3); needs selector d1 and the planner's verification_approach
+    "approach": False,               # d1/jev_sam3: insufficient -> approach (state 3); needs selector d1 or jev_sam3 and the planner's verification_approach
     "approach_max_per_cluster": 2,
     "approach_max_steps": 40,        # actions per approach
     "approach_episode_steps": 120,   # approach actions per episode
     "approach_min_closer_m": 0.5,    # a new view: this much closer than every judged view of the cluster ...
     "approach_min_angle_deg": 30.0,  # ... or this far around the object from each
+    "multiview": False,              # d1 close range: decide over the bank of the object's views (/verify_views)
+    "multiview_max_views": 6,        # views per request (server limit 8)
+    "multiview_bank": 24,            # views kept per cluster
+    "multiview_min_views": 2,        # distinct-step views a failed approach needs for a decision
+    "multiview_sibling_m": 0.5,      # a nearer cluster this close to the object is a fragment of it
+    "multiview_dup_distance_m": 0.3, # a view this close to a chosen one ...
+    "multiview_dup_angle_deg": 15.0, # ... and looking from this similar a direction is a duplicate
+    "multiview_arrival_margin": 0.0, # d1 SAM3 fallback on arrival: accept iff M >= this and V >= vote
+    "multiview_failure_margin": 0.15,  # ... after a failed approach
+    "multiview_vote": 0.5,
+    "multiview_failure": True,       # decide failed approaches over the bank: true, false or "aborted" (budget only)
+    "multiview_grid": False,         # Qwen also sees the SAM3D grid of the best close view (server --multiview-grid)
+    "multiview_sam3": "fallback",    # SAM3 per view: fallback (Qwen insufficient), always (ablation) or never
+    "multiview_sam3_shortcut": False,  # ablation: a sufficient best close view lets SAM3 decide
+    "multiview_variant": None,       # ablation: crop_small or forced2
+    "multiview_forced2_min": 0.5,    # forced2: correct iff p(A) / (p(A) + p(B)) >= this
+    "multiview_grid_scores": False,  # diagnostic: SAM3 top-1 of each grid render (logged only)
+    "approach_planner": None,        # None: ApexNav's object navigation approaches (state 3); mppi / closer: the eval
+                                     # loop drives the approach itself (perception_gate.approach, sync_step only)
 }
 POLICIES = ("accept", "reject")
 ACCEPTED, UNVERIFIED, REJECTED, DEFERRED, APPROACH = 1, 0, -1, 2, 3
@@ -112,7 +155,12 @@ TRI_STATES = ("correct", "wrong", "insufficient")
 APPROACH_COUNTS = ("insufficient", "moves", "unreachable", "aborted", "not_redetected", "fallback",
                    "approach_arrived", "approach_early", "approach_accepted", "approach_rejected",
                    "approach_insufficient", "approach_exhausted", "approach_steps", "sam3_decisions",
-                   "qwen_decisions")
+                   "qwen_decisions", "jev_decisions")
+MULTIVIEW_COUNTS = ("multiview_requests", "multiview_qwen", "multiview_sam3", "multiview_failure_decided",
+                    "multiview_views", "multiview_grid_errors", "multiview_jev")
+MULTIVIEW_VARIANTS = (None, "crop_small", "forced2")
+MULTIVIEW_SAM3 = ("fallback", "always", "never")
+THREE_WAY_SELECTORS = ("d1", "jev_sam3")  # servers answering correct / wrong / insufficient (the approach)
 
 
 def target_name(label):
@@ -132,10 +180,44 @@ def _angle_between(a, b):
     return abs((a - b + math.pi) % (2 * math.pi) - math.pi)
 
 
+def _range(item):
+    return _distance(item["camera"], item["centroid"])
+
+
+def select_views(bank, k=6, dup_distance_m=0.3, dup_angle_deg=15.0):
+    """(views, best): up to ``k`` views of one object from ``bank`` (evidence items), nearest
+    first. ``best`` (slot 1, always included; the SAM3D grid view) is the most readable view
+    among those at most the median range away. The rest are added by quality (ties: nearer,
+    newer), skipping duplicates: the same (step, index), or a camera within ``dup_distance_m`` of
+    a chosen view's looking from within ``dup_angle_deg`` of its direction."""
+    items = list({(i["step"], i["index"]): i for i in bank}.values())
+    if not items or k < 1:
+        return [], None
+    ranges = sorted(_range(i) for i in items)
+    median = (ranges[(len(ranges) - 1) // 2] + ranges[len(ranges) // 2]) / 2
+    order = sorted(items, key=lambda i: (-i["quality"], _range(i), -i["step"], i["index"]))
+    best = next(i for i in order if _range(i) <= median)
+    angle = math.radians(dup_angle_deg)
+
+    def duplicate(a, b):
+        return ((a["step"], a["index"]) == (b["step"], b["index"])
+                or (_distance(a["camera"], b["camera"]) <= dup_distance_m
+                    and _angle_between(_bearing(a["camera"], a["centroid"]),
+                                       _bearing(b["camera"], b["centroid"])) <= angle))
+
+    chosen = [best]
+    for item in order:
+        if len(chosen) >= k:
+            break
+        if not any(duplicate(item, c) for c in chosen):
+            chosen.append(item)
+    return sorted(chosen, key=lambda i: (_range(i), -i["step"])), best
+
+
 class VerificationGate:
     """``camera``: intrinsics logged with every decision, e.g. {hfov, width, height}."""
 
-    def __init__(self, cfg=None, video_output_path=".", verify=None, ping=None, camera=None):
+    def __init__(self, cfg=None, video_output_path=".", verify=None, ping=None, camera=None, verify_views=None):
         unknown = set(cfg or {}) - set(DEFAULTS)
         if unknown:
             raise ValueError(f"unknown verification settings: {sorted(unknown)}")
@@ -151,21 +233,47 @@ class VerificationGate:
         for key in ("approach_max_per_cluster", "approach_max_steps", "approach_episode_steps"):
             if int(self.cfg[key]) < 0:
                 raise ValueError(f"verification.{key} must be >= 0")
+        self.approach_planner = self.cfg["approach_planner"]
+        if self.approach_planner is not None:
+            from perception_gate.approach import PLANNERS
+            if self.approach_planner not in PLANNERS or not self.approach:
+                raise ValueError(f"verification.approach_planner must be one of {PLANNERS} and needs approach")
+        self.multiview = bool(self.cfg["multiview"])
+        if self.multiview:
+            if not self.approach:
+                raise ValueError("verification.multiview needs verification.approach")
+            if self.cfg["multiview_variant"] not in MULTIVIEW_VARIANTS:
+                raise ValueError(f"verification.multiview_variant must be one of {MULTIVIEW_VARIANTS}")
+            if self.cfg["multiview_sam3"] not in MULTIVIEW_SAM3:
+                raise ValueError(f"verification.multiview_sam3 must be one of {MULTIVIEW_SAM3}")
+            if self.cfg["multiview_failure"] not in (True, False, "aborted"):
+                raise ValueError("verification.multiview_failure must be true, false or aborted")
+            if not 1 <= int(self.cfg["multiview_max_views"]) <= 8:
+                raise ValueError("verification.multiview_max_views must be 1..8 (server limit)")
+            if int(self.cfg["multiview_bank"]) < int(self.cfg["multiview_max_views"]):
+                raise ValueError("verification.multiview_bank must be >= multiview_max_views")
         self.enabled = bool(self.cfg["enabled"])
         self.log_dir = str(self.cfg["log_dir"]).format(video_output_path=video_output_path)
         self.camera = camera
         self._verify = verify or client.verify
+        self._verify_views = verify_views or client.verify_views
         self.server = None
+        self.selector = None
         self.consecutive_errors = 0
         self.start_episode(-1, "", "", "")
         if self.enabled:
             # A wrong URL, protocol or dead worker is a setup error, not a per-request failure.
             self.server = (ping or client.ping)(self.cfg["url"], timeout=float(self.cfg["ping_timeout_s"]))
-            selector = (self.server.get("settings") or {}).get("selector")
+            selector = self.selector = (self.server.get("settings") or {}).get("selector")
             # Three-way verdicts need the approach on both sides, and the approach needs them
-            if self.approach != (selector == "d1"):
+            if self.approach != (selector in THREE_WAY_SELECTORS):
                 raise ValueError(f"verification.approach={self.approach} does not match the server's "
-                                 f"selector {selector!r} (approach needs --selector d1, and d1 needs approach)")
+                                 f"selector {selector!r} (approach needs --selector d1 or jev_sam3, and they need approach)")
+            settings = self.server.get("settings") or {}
+            if self.multiview and not settings.get("multiview"):
+                raise ValueError("verification.multiview needs a server with /verify_views (settings.multiview)")
+            if self.multiview and self.cfg["multiview_grid"] and not settings.get("multiview_grid"):
+                raise ValueError("verification.multiview_grid needs a server started with --multiview-grid")
             os.makedirs(self.log_dir, exist_ok=True)
             print(f"[verification] gate ON: {self.cfg['url']} {json.dumps(self.server.get('settings'))}")
 
@@ -186,7 +294,10 @@ class VerificationGate:
                        "cached": 0, "reopened": 0}
         if self.approach:  # only with the approach, so other runs keep their counts
             self.counts.update({key: 0 for key in APPROACH_COUNTS})
+        if self.multiview:
+            self.counts.update({key: 0 for key in MULTIVIEW_COUNTS})
         self.approach_steps_used = 0
+        self._sam3_cache = {}  # multiview: SAM3 scores per view (step, index), sent back with later requests
 
     def finish_episode(self):
         """Per-episode counts (None when the gate is off)."""
@@ -202,8 +313,10 @@ class VerificationGate:
     # ------------------------------------------------------------------
 
     def observe(self, step, rgb, masks, labels, scores, centroids, semantic_instances, pose,
-                camera_pitch, fusion=None):
-        """Store this step's target detections; returns rejected cluster ids to reopen."""
+                camera_pitch, fusion=None, external_approach=False):
+        """Store this step's target detections; returns rejected cluster ids to reopen.
+        ``external_approach``: a step of an approach the gate drives itself (approach_planner): evidence only,
+        no reopens and no approach views (the planner waits for the verdict)."""
         if not self.enabled:
             return []
         snapshot = {int(c["id"]): tuple(c["centroid"]) for c in (fusion or {}).get("clusters", [])}
@@ -228,6 +341,10 @@ class VerificationGate:
                     "clusters": snapshot}
             new.append(item)
             self.evidence.add(item)
+        if self.multiview:
+            self._bank_views(new)
+        if external_approach:
+            return []
         return self._reopen(step, new, snapshot) + self._approach_views(step, new)
 
     def _novel(self, item, used):
@@ -397,6 +514,8 @@ class VerificationGate:
             return decided
         self.consecutive_errors = 0
         record.update(verdict=verdict, latency_s=round(time.time() - start, 3))
+        if state is not None:
+            state["last_verdict"] = verdict
         if self._tri_state(verdict) is not None:
             self.verdicts[key] = {"state": None, "verdict": verdict}
             return self._decide_three_way(record, verdict, evidence, reply, state, at_stop, approach)
@@ -421,11 +540,11 @@ class VerificationGate:
 
     def _decide_three_way(self, record, verdict, evidence, reply, state, at_stop, approach):
         """correct -> accept, wrong -> reject, insufficient -> approach (budget permitting), keep
-        approaching (a new view on the way), or reject (at the stop, on arrival, no budget)."""
+        approaching (a new view on the way), SAM3's raw label (on arrival), or reject (at the stop, no budget)."""
         status = self._tri_state(verdict)
         model = verdict.get("source")
         record.update(status=status, model=model)
-        if model in ("sam3", "qwen"):
+        if model in ("sam3", "qwen", "jev"):
             self.counts[f"{model}_decisions"] += 1
         if approach is not None:
             self.counts[f"approach_{'accepted' if status == 'correct' else 'rejected' if status == 'wrong' else 'insufficient'}"] += 1
@@ -440,6 +559,12 @@ class VerificationGate:
             state["approach"] = approach
             record["policy"] = "insufficient,keep_approaching"
             return self._decide(record, APPROACH, evidence, reply, state)
+        if approach is not None:
+            # Arrival (close range) and still insufficient: forced decision, SAM3's raw label on
+            # this view (accept iff it is the target)
+            accepted = verdict.get("label") == self.episode["target"]
+            record["policy"] = f"insufficient,arrival_sam3_{'accept' if accepted else 'reject'}"
+            return self._decide(record, ACCEPTED if accepted else REJECTED, evidence, reply, state)
         blocked = self._approach_blocked(record, state, at_stop, approach)
         if blocked is not None:
             self.counts["approach_exhausted"] += 1
@@ -463,8 +588,6 @@ class VerificationGate:
         """Why an insufficient view cannot be approached (None: it can)."""
         if record["cluster"]["id"] < 0 or state is None:
             return "position"
-        if approach is not None:
-            return "arrival"  # judged on arrival at the object: never stop on insufficient
         if at_stop:
             return "at_stop"
         if state["approaches"] >= int(self.cfg["approach_max_per_cluster"]):
@@ -483,6 +606,10 @@ class VerificationGate:
                    "max_steps": self._approach_steps_allowed(record["step"]), "steps": 0,
                    "early": None, "status": None}
         state["approach"] = pending
+        if self.multiview:  # seed the view bank with every stored view of the object
+            for item in sorted(self.evidence, key=lambda e: e["step"]):
+                if self._bank_match(item, record["cluster"]["id"], pending) is not None:
+                    self._bank_add(state, item)
         record["approach"] = {"id": pending["id"], "issued": True, "object": list(pending["object"]),
                               "camera": list(pending["camera"]), "max_steps": pending["max_steps"]}
         self.events.append({"event": "approach", "cluster_id": record["cluster"]["id"], "approach": pending["id"],
@@ -498,6 +625,39 @@ class VerificationGate:
         return {"approach_id": pending["id"], "object": pending["object"], "camera": pending["camera"],
                 "max_steps": pending["max_steps"]}
 
+    def finish_external_approach(self, request, step, result, approach_log=None):
+        """The verdict of an approach the gate drove itself (perception_gate.approach): ACCEPTED or REJECTED,
+        logged like any decision (policy ``approach_planner,<by>,<accept|reject>``)."""
+        cluster_id = int(request["cluster_id"])
+        state = self.clusters.get(cluster_id)
+        pending = state.get("approach") if state is not None else None
+        steps = int(result.get("actions", 0))
+        self.approach_steps_used += steps
+        self.counts["approach_steps"] += steps
+        accept = bool(result.get("accept"))
+        self.counts["approach_accepted" if accept else "approach_rejected"] += 1
+        self.counts["sam3_decisions"] += result.get("by") in ("belief", "forced")
+        if state is not None:
+            state["approach"] = None
+        record = {**{k: self.episode.get(k) for k in ("run_index", "scene", "episode_id", "label", "target")},
+                  "step": int(step), "seq": int(request.get("seq", 0)),
+                  "cluster": {"id": cluster_id, "centroid": [float(request["centroid_x"]), float(request["centroid_y"])],
+                              "confidence": float(request.get("confidence", 0.0)),
+                              "observation_num": int(request.get("observation_num", 0))},
+                  "expl_result": int(request.get("expl_result", -1)), "at_stop": bool(request.get("at_stop", False)),
+                  "server": None if self.server is None else self.server.get("settings"), "camera": self.camera,
+                  "evidence": None, "verdict": {"status": result.get("status"), "label": None},
+                  "latency_s": result.get("seconds"), "error": None, "source": "server", "ground_truth": None,
+                  "status": result.get("status"), "model": "sam3",
+                  "policy": f"approach_planner,{result.get('by')},{'accept' if accept else 'reject'}",
+                  "approach": {"id": None if pending is None else pending["id"], "planner": self.approach_planner,
+                               "status": result.get("end") or result.get("by"), "steps": steps,
+                               "views": result.get("views"), "counted": result.get("counted"),
+                               "object": None if pending is None else list(pending["object"]),
+                               "issued_step": None if pending is None else pending["issued_step"],
+                               "log": approach_log, "episode_steps_used": self.approach_steps_used}}
+        return self._decide(record, ACCEPTED if accept else REJECTED, None, None, state)
+
     def _approach_view(self, item, cluster_id, pending, used, arrival_step=None):
         """Match distance when ``item`` is a new view of the approached object: taken since the
         approach was issued, of the object point (not nearer another cluster), and closer by
@@ -508,7 +668,11 @@ class VerificationGate:
         if item["step"] < pending["issued_step"] or (not novel and (item["step"] != arrival_step or
                                                                     item["step"] == pending["issued_step"])):
             return None
+        # The issued object point, or the cluster's centroid at the view's step (a large object's
+        # centroid drifts as the approach sees more of it)
         distance = _distance(item["centroid"], pending["object"])
+        if cluster_id in item["clusters"]:
+            distance = min(distance, _distance(item["centroid"], item["clusters"][cluster_id]))
         if distance > self.cfg["match_distance_m"] or self._closer_to_other(item, cluster_id, distance):
             return None
         if not novel:
@@ -564,6 +728,8 @@ class VerificationGate:
             return self._approach_failed(record, state, "approach_mismatch")
         pending.update(steps=reported, status=status)
         record["approach"].update(object=list(pending["object"]), issued_step=pending["issued_step"])
+        if self.multiview:
+            return self._after_approach_multiview(record, state, step, status, pending)
         if status == UNREACHABLE:
             return self._approach_failed(record, state, "unreachable")
         if status == ABORTED:
@@ -585,16 +751,191 @@ class VerificationGate:
             if views:
                 view = max(views, key=lambda v: (v[0]["step"], v[0]["quality"]))
         if view is None:
-            return self._approach_failed(record, state, "not_redetected")
+            return self._not_redetected(record, state)
         return self._judge(record, view[0], view[1], state, step, status == ARRIVED, approach=pending)
 
+    def _not_redetected(self, record, state):
+        """Arrived but the object is not re-detected (often too close, out of frame): SAM3's raw
+        label on the cluster's last judged view decides (accept iff it is the target)."""
+        verdict = (state or {}).get("last_verdict")
+        if verdict is None:
+            return self._approach_failed(record, state, "not_redetected")
+        self.counts["not_redetected"] += 1
+        accepted = verdict.get("label") == self.episode["target"]
+        record.update(verdict=verdict, source="cached", model="sam3",
+                      policy=f"not_redetected,sam3_{'accept' if accepted else 'reject'}")
+        return self._decide(record, ACCEPTED if accepted else REJECTED, None, None, state)
+
     def _approach_failed(self, record, state, policy):
-        """Unreachable, aborted, not re-detected (or a protocol mismatch): reject."""
+        """Unreachable, aborted (or a protocol mismatch, or not re-detected without a verdict): reject."""
         if policy in self.counts:
             self.counts[policy] += 1
         self.counts["fallback"] += 1
         record["policy"] = policy
         return self._decide(record, REJECTED, None, None, state)
+
+    # ------------------------------------------------------------------
+    # Multi-view close range (multiview)
+    # ------------------------------------------------------------------
+
+    def _bank_match(self, item, cluster_id, pending):
+        """Match distance when ``item`` is a view of the approached object for the bank, else None:
+        within ``match_distance_m`` of the issued object point or the cluster's centroid at the
+        item's step, and no other cluster nearer it, unless that cluster lies within
+        ``multiview_sibling_m`` of this one (a fragment of the same object)."""
+        reference = item["clusters"].get(cluster_id)
+        distance = _distance(item["centroid"], pending["object"])
+        if reference is not None:
+            distance = min(distance, _distance(item["centroid"], reference))
+        if distance > self.cfg["match_distance_m"]:
+            return None
+        reference = pending["object"] if reference is None else reference
+        sibling = float(self.cfg["multiview_sibling_m"])
+        if any(other != cluster_id and _distance(item["centroid"], c) < distance and _distance(c, reference) > sibling
+               for other, c in item["clusters"].items()):
+            return None
+        return distance
+
+    def _bank_add(self, state, item):
+        """Add ``item`` to the cluster's bank once; past ``multiview_bank`` views drop the least
+        readable one, never the newest."""
+        bank = state.setdefault("bank", [])
+        if any((b["step"], b["index"]) == (item["step"], item["index"]) for b in bank):
+            return
+        bank.append(item)
+        while len(bank) > int(self.cfg["multiview_bank"]):
+            newest = max(bank, key=lambda b: (b["step"], b["index"]))
+            bank.remove(min((b for b in bank if b is not newest), key=lambda b: (b["quality"], b["step"])))
+
+    def _bank_views(self, new):
+        """Bank this step's views of every object under approach (no novelty thresholds)."""
+        for cluster_id, state in self.clusters.items():
+            pending = state.get("approach")
+            if pending is None:
+                continue
+            for item in new:
+                if item["step"] >= pending["issued_step"] and self._bank_match(item, cluster_id, pending) is not None:
+                    self._bank_add(state, item)
+
+    def _after_approach_multiview(self, record, state, step, status, pending):
+        """An approach re-request with ``multiview``: decided over the cluster's view bank."""
+        bank = state.get("bank", [])
+        if status in (UNREACHABLE, ABORTED):
+            name = STATUS_NAMES[status]
+            failure = self.cfg["multiview_failure"]
+            decide = failure is True or (failure == "aborted" and status == ABORTED)
+            if decide and len({b["step"] for b in bank}) >= int(self.cfg["multiview_min_views"]):
+                self.counts[name] += 1
+                return self._judge_views(record, state, step, "failure", pending)
+            return self._approach_failed(record, state, name)
+        if status not in (ARRIVED, EARLY):
+            record["error"] = f"unknown viewpoint_status {status}"
+            return self._approach_failed(record, state, "approach_mismatch")
+        self.counts["approach_arrived" if status == ARRIVED else "approach_early"] += 1
+        if status == EARLY and pending["early"] is not None:
+            self._bank_add(state, pending["early"][0])
+            bank = state["bank"]
+        if not bank:
+            return self._approach_failed(record, state, "not_redetected")
+        return self._judge_views(record, state, step, "early" if status == EARLY else "arrival", pending)
+
+    def _judge_views(self, record, state, step, mode, pending):
+        """One /verify_views decision over ``select_views`` of the cluster's bank; ``mode`` is
+        "early", "arrival" or "failure" (the table in the module docstring)."""
+        cluster_id = record["cluster"]["id"]
+        views, best = select_views(state["bank"], int(self.cfg["multiview_max_views"]),
+                                   float(self.cfg["multiview_dup_distance_m"]), float(self.cfg["multiview_dup_angle_deg"]))
+        goals, overlap = self.episode.get("goal_object_ids", []), self.cfg["ground_truth_semantic_overlap"]
+        record["evidence"] = {"step": best["step"], "index": best["index"], "score": best["score"],
+                              "area_fraction": round(best["area_fraction"], 5), "camera": list(best["camera"]),
+                              "centroid": list(best["centroid"]), "pitch": best["pitch"],
+                              "input_elevation": -math.degrees(best["pitch"]), "range_m": round(_range(best), 3)}
+        record["ground_truth"] = semantic_goal_overlap(best["semantic_instances"], goals, overlap)
+        record["views"] = [{"step": v["step"], "index": v["index"], "range_m": round(_range(v), 3),
+                            "area": round(v["area_fraction"], 5), "clipped": mask_touches_border(v["mask"]),
+                            "quality": round(v["quality"], 4), "score": v["score"], "camera": list(v["camera"]),
+                            "centroid": list(v["centroid"]), "semantic_instances": v["semantic_instances"],
+                            "ground_truth": semantic_goal_overlap(v["semantic_instances"], goals, overlap)}
+                           for v in views]
+        record["multiview"] = {"mode": mode, "bank": len(state["bank"]), "grid_view": views.index(best)}
+        for v in views:
+            state["used"].append({"camera": v["camera"], "bearing": _bearing(v["camera"], v["centroid"]),
+                                  "range": _range(v)})
+        sam3 = self.cfg["multiview_sam3"]
+        if mode == "early" and sam3 == "fallback":
+            sam3 = "never"  # an insufficient early view keeps approaching; SAM3 is not needed yet
+        variant = self.cfg["multiview_variant"]
+        forced = {}
+        if self.selector == "jev_sam3":  # forced at close range (arrival, failure); SAM3 decides (fused belief)
+            forced = {"forced": mode != "early"}
+        payload = [{"rgb": v["rgb"], "mask": v["mask"], "input_elevation": -math.degrees(v["pitch"]),
+                    "step": v["step"], "index": v["index"], "range_m": _range(v),
+                    "scores": self._sam3_cache.get((v["step"], v["index"]))} for v in views]
+        self.counts["multiview_requests"] += 1
+        self.counts["multiview_views"] += len(views)
+        start = time.time()
+        try:
+            reply = self._verify_views(
+                self.cfg["url"], payload, self.episode["target"], sam3=sam3,
+                request_id=f"epi{self.episode.get('run_index')}_c{cluster_id}_s{step}_mv",
+                timeout=float(self.cfg["timeout_s"]), grid=bool(self.cfg["multiview_grid"]),
+                grid_view=views.index(best), crop_small=variant == "crop_small", forced2=variant == "forced2",
+                forced2_min=float(self.cfg["multiview_forced2_min"]),
+                sam3_shortcut=bool(self.cfg["multiview_sam3_shortcut"]),
+                grid_scores=bool(self.cfg["multiview_grid_scores"]), **forced)
+            verdict = reply["verdict"]
+            status = verdict["status"]
+            if status not in TRI_STATES:
+                raise RuntimeError(f"multiview verdict without a three-way status: {status!r}")
+        except Exception as error:  # as _judge: on_error (reject with the approach), always logged
+            self.consecutive_errors += 1
+            self.counts["errors"] += 1
+            record.update(error=f"{type(error).__name__}: {error}", policy=f"multiview,{mode},on_error={self.cfg['on_error']}",
+                          latency_s=round(time.time() - start, 3))
+            decided = self._decide(record, ACCEPTED if self.cfg["on_error"] == "accept" else REJECTED, best, None,
+                                   state, views)
+            if self.consecutive_errors >= self.cfg["max_consecutive_errors"]:
+                raise RuntimeError(f"perception server failed {self.consecutive_errors} times in a row "
+                                   f"(last: {record['error']}); aborting rather than running ungated")
+            return decided
+        self.consecutive_errors = 0
+        record.update(verdict=verdict, latency_s=round(time.time() - start, 3), status=status)
+        for view in verdict.get("per_view") or []:
+            if view.get("scores") is not None and view.get("step") is not None:
+                self._sam3_cache[(int(view["step"]), int(view["index"]))] = view["scores"]
+        if (verdict.get("qwen") or {}).get("reconstruct_error"):
+            self.counts["multiview_grid_errors"] += 1
+        self.counts[f"approach_{'accepted' if status == 'correct' else 'rejected' if status == 'wrong' else 'insufficient'}"] += 1
+        vlm = "jev" if verdict.get("source") == "jev" else "qwen"  # who answered the views
+        if status in ("correct", "wrong"):
+            shortcut = verdict.get("source") == "sam3"
+            record["model"] = "sam3" if shortcut else f"{vlm}_multi"
+            self.counts["sam3_decisions" if shortcut else f"{vlm}_decisions"] += 1
+            self.counts["multiview_sam3" if shortcut else f"multiview_{vlm}"] += 1
+            if mode == "failure":
+                self.counts["multiview_failure_decided"] += 1
+            decider = ("sam3" if self.selector == "jev_sam3" else "sam3_shortcut") if shortcut else vlm
+            record["policy"] = (f"multiview,{mode},{decider}_"
+                                f"{'accept' if status == 'correct' else 'reject'}")
+            return self._decide(record, ACCEPTED if status == "correct" else REJECTED, best, reply, state, views)
+        self.counts["insufficient"] += 1
+        if mode == "early":  # still insufficient on the way: keep approaching
+            pending["early"] = None
+            state["approach"] = pending
+            record.update(model=f"{vlm}_multi", policy="multiview,early,insufficient,keep_approaching")
+            return self._decide(record, APPROACH, best, reply, state, views)
+        aggregate = verdict.get("aggregate") or {}
+        margin, vote, used = aggregate.get("margin"), aggregate.get("vote"), aggregate.get("n_used", 0)
+        threshold = float(self.cfg["multiview_arrival_margin" if mode == "arrival" else "multiview_failure_margin"])
+        accepted = margin is not None and margin >= threshold and vote >= float(self.cfg["multiview_vote"])
+        record["model"] = "sam3_multi"
+        self.counts["sam3_decisions"] += 1
+        self.counts["multiview_sam3"] += 1
+        if mode == "failure":
+            self.counts["multiview_failure_decided"] += 1
+        summary = "no_sam3_match" if margin is None else f"M={margin:.2f},V={vote:.2f},n={used}"
+        record["policy"] = f"multiview,{mode},insufficient,sam3_{'accept' if accepted else 'reject'}({summary})"
+        return self._decide(record, ACCEPTED if accepted else REJECTED, best, reply, state, views)
 
     def defers(self, verdict):
         """True when ``verdict`` is a SAM3D view rejecting what the raw frame accepted, and
@@ -602,13 +943,13 @@ class VerificationGate:
         return (self.cfg["on_view_reject"] == "defer" and verdict.get("judged") == "view"
                 and verdict.get("input_scores") is not None)
 
-    def _decide(self, record, decided, evidence, reply, state):
+    def _decide(self, record, decided, evidence, reply, state, views=None):
         if state is not None:
             state["state"] = decided
         record["state"] = decided
         if decided != APPROACH:  # an approach is counted as a move when issued
             self.counts[NAMES[decided].lower()] += 1
-        self._log(record, evidence, reply)
+        self._log(record, evidence, reply, views)
         label = (record["verdict"] or {}).get("label")
         self.events.append({"event": "decision", "cluster_id": record["cluster"]["id"], "state": decided,
                             "label": label, "source": record["source"], "error": record["error"]})
@@ -618,7 +959,7 @@ class VerificationGate:
               f"{record['latency_s'] or 0.0:.1f} s)")
         return decided
 
-    def _log(self, record, evidence, reply):
+    def _log(self, record, evidence, reply, views=None):
         if not self.log_dir:
             return
         os.makedirs(self.log_dir, exist_ok=True)
@@ -634,5 +975,14 @@ class VerificationGate:
         if reply and reply.get("view_image"):
             cv2.imwrite(os.path.join(folder, "view.png"),
                         cv2.cvtColor(client.decode_png(reply["view_image"]), cv2.COLOR_RGB2BGR))
+        if reply and reply.get("grid_image"):  # multiview: the SAM3D grid Qwen saw
+            cv2.imwrite(os.path.join(folder, "grid.jpg"),
+                        cv2.cvtColor(client.decode_png(reply["grid_image"]), cv2.COLOR_RGB2BGR))
+        if views:  # multiview: every view sent, nearest first
+            os.makedirs(os.path.join(folder, "views"), exist_ok=True)
+            for k, item in enumerate(views, start=1):
+                name = os.path.join(folder, "views", f"v{k}_s{item['step']}_{item['index']}")
+                cv2.imwrite(name + ".jpg", cv2.cvtColor(item["rgb"], cv2.COLOR_RGB2BGR))
+                cv2.imwrite(name + "_mask.png", item["mask"] * 255)
         with open(os.path.join(folder, "decision.json"), "w", encoding="utf-8") as stream:
             json.dump(record, stream, indent=1)

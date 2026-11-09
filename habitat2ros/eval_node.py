@@ -215,9 +215,11 @@ class HabitatEvalNode(Node):
         self.verification_request = None
         self.verification_seq_floor = self.last_verification_seq
 
-    def publish_verification_result(self, seq, cluster_id, state, approach=None):
+    def publish_verification_result(self, seq, cluster_id, state, approach=None, resume_step=0):
         """Answer a request (state 1 accept, -1 reject, 2 defer, 3 approach ``approach``:
-        ``VerificationGate.pending_approach``) or reopen a cluster (state 0)."""
+        ``VerificationGate.pending_approach``) or reopen a cluster (state 0). ``resume_step``: the
+        verdict comes after an approach the gate drove itself, ending at that step (the planner
+        integrates up to it and replans)."""
         msg = VerificationResult()
         msg.seq = int(seq)
         msg.cluster_id = int(cluster_id)
@@ -229,6 +231,7 @@ class HabitatEvalNode(Node):
             msg.camera_x = float(approach["camera"][0])
             msg.camera_y = float(approach["camera"][1])
             msg.max_steps = int(approach["max_steps"])
+        msg.resume_step = int(resume_step)
         self.verification_result_pub.publish(msg)
 
     def publish_int32(self, publisher, data):

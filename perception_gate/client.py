@@ -62,3 +62,53 @@ def verify(url, rgb, mask, target, input_elevation=0.0, vocabulary=None, request
     if not reply.get("ok"):
         raise RuntimeError(f"perception server: {reply.get('error')}")
     return reply
+
+
+def ask(url, rgb, mask, target, question, options, request_id=None, timeout=120.0):
+    """POST /ask (selector jev_sam3): JEV's distribution over ``options`` for ``question`` about the masked
+    object (outlined in red). Returns {probabilities, options, latency_s, n_tokens}; raises on errors."""
+    payload = {"protocol": PROTOCOL, "request_id": request_id, "target": target, "question": question,
+               "options": list(options),
+               "image": encode_png(cv2.cvtColor(np.ascontiguousarray(rgb), cv2.COLOR_RGB2BGR)),
+               "mask": encode_png(((np.asarray(mask) > 0) * 255).astype(np.uint8))}
+    reply = _call(url, "/ask", payload, timeout=timeout)
+    if not reply.get("ok"):
+        raise RuntimeError(f"perception server /ask: {reply.get('error')}")
+    return reply["jev"]
+
+
+def embed(url, rgbs, request_id=None, timeout=60.0):
+    """POST /embed: L2-normalised CLIP ViT-L/14 features (np.ndarray, one row per RGB frame) for the
+    view-diversity gate (``perception_gate.diversity``). Raises on transport or server errors."""
+    payload = {"protocol": PROTOCOL, "request_id": request_id,
+               "images": [encode_png(cv2.cvtColor(np.ascontiguousarray(rgb), cv2.COLOR_RGB2BGR)) for rgb in rgbs]}
+    reply = _call(url, "/embed", payload, timeout=timeout)
+    if not reply.get("ok"):
+        raise RuntimeError(f"perception server /embed: {reply.get('error')}")
+    return np.asarray(reply["embeddings"], dtype=np.float64)
+
+
+def verify_views(url, views, target, sam3="fallback", vocabulary=None, request_id=None, timeout=120.0,
+                 **variants):
+    """POST /verify_views (server selector d1 or jev): one decision over several views of one object,
+    nearest first. ``views``: [{rgb, mask, input_elevation, step, index, range_m, scores?, jev?}] (rgb
+    HxWx3 RGB, mask HxW nonzero on the object; ``scores``: SAM3 scores and ``jev``: raw JEV
+    probabilities the server returned for that view before, so it is judged only once). ``variants``: grid, grid_view, crop_small, forced2, forced2_min,
+    sam3_shortcut, grid_scores, forced (jev, jev_sam3). Returns {ok, verdict, grid_image}; raises on transport or
+    server errors."""
+    payload = {"protocol": PROTOCOL, "request_id": request_id, "target": target, "sam3": sam3,
+               "vocabulary": vocabulary, **variants, "views": []}
+    for view in views:
+        entry = {"image": encode_png(cv2.cvtColor(np.ascontiguousarray(view["rgb"]), cv2.COLOR_RGB2BGR)),
+                 "mask": encode_png(((np.asarray(view["mask"]) > 0) * 255).astype(np.uint8)),
+                 "input_elevation": float(view.get("input_elevation", 0.0)), "step": int(view["step"]),
+                 "index": int(view["index"]), "range_m": float(view["range_m"])}
+        if view.get("scores") is not None:
+            entry["scores"] = view["scores"]
+        if view.get("jev") is not None:
+            entry["jev"] = view["jev"]
+        payload["views"].append(entry)
+    reply = _call(url, "/verify_views", payload, timeout=timeout)
+    if not reply.get("ok"):
+        raise RuntimeError(f"perception server: {reply.get('error')}")
+    return reply

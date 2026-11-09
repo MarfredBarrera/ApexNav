@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Closed-loop ApexNav runs of one verification strategy on GPU $GPU (host side).
-#   ./scripts/run_strategy.sh <baseline|sam3|naive|vqf|top2gap|defer|d1> <name> <sync true|false> <episode>...
+#   ./scripts/run_strategy.sh <baseline|sam3|naive|vqf|top2gap|defer|d1|d1mv|jev_sam3> <name> <sync true|false> <episode>...
 #   GPU=2 DATASET=ovon ./scripts/run_strategy.sh defer ovon_defer true 2044 2965
 # Output: ~/codes/ApexNav/videos/<name>/<baseline|gate>/epiN; perception server logs:
 # ~/codes/3DAwareVerification/outputs/apexnav_online/server_<name>/. Episodes that already
@@ -17,6 +17,28 @@
 #            is launched with verification_approach:=true); server errors reject
 #            (verification.on_error=reject), as every other approach failure does
 #            D1_EVIDENCE=input: Qwen judges the frame alone (no SAM3D grid; fits one GPU)
+#            D1_ACCEPT_MIN=p: Qwen accepts only with p(correct) >= p, else insufficient (approach)
+#   d1mv:    d1 with Qwen on the frame alone for first requests (--d1-evidence input) and the
+#            close-range decision over the bank of the object's views (verification.multiview=true):
+#            Qwen sees up to 6 outlined views plus the SAM3D grid of the best close view
+#            (verification.multiview_grid; server --multiview-grid), SAM3 over the views if insufficient
+#            MV_GRID=false: images only (no SAM3D at all); MV_VARIANT=crop_small|forced2: prompt variant
+#            MV_ARGS="+verification.multiview_vote=0.6 ...": more gate settings (new keys need "+")
+#   jev_sam3: --selector jev_sam3 (JEV-27B-VL int8 + SAM3 workers, perception.jev): JEV only judges the
+#            uncertainty (frozen jev_gate.json: naming entropy + look-alike contention; unsure -> approach
+#            with the d1mv view bank, multiview_grid=false; unsure views on the way keep approaching);
+#            SAM3 decides: its raw label on a sure first frame, and over up to 6 banked views on arrival,
+#            failure and sure views on the way (d1mv rule: M >= multiview_arrival/failure_margin,
+#            V >= multiview_vote; multiview_min_views=1: one view decides, an empty bank rejects).
+#            JEV loads from the pre-quantized local copy (/data/models/JEV-27B-VL-int8), slimmed (answer-token
+#            head rows on the GPU, embedding table on CPU), so fp32 SAM3 fits next to it on one GPU.
+#            APPROACH_PLANNER=mppi|closer: the gate drives the approach itself (perception_gate.approach:
+#            active_approach's footprint MPPI or the straight-line closer on the agent's own local map) with the
+#            decide.py flow (JEV naming belief -> P(consistent) >= 0.8 -> fused SAM3 over the nearest views);
+#            needs sync true
+# REUSE_SERVER=1: keep a running perception server with the same selector (and start one if none runs),
+#            and leave it running on exit, so a driver running blocks of episodes loads the models once;
+#            the driver stops it (lib.sh cleanup).
 # DATASET (default hm3dv2) is passed to habitat_evaluation.py --dataset.
 # Needs the four VLM servers (scripts/start_session.sh); does not start or stop them.
 # On any exit it stops the perception server/workers, its gpu_guard and any episode or
@@ -38,7 +60,16 @@ case $STRAT in
   top2gap) mode=gate; flags="--selector top2gap --no-ensemble --judge-input" ;;
   defer) mode=gate; flags="--selector top2gap --no-ensemble --judge-input --view-when unsure"
          eval_args="verification.on_view_reject=defer" ;;
-  d1) mode=gate; flags="--selector d1 --d1-evidence ${D1_EVIDENCE:-grid}"; eval_args="verification.approach=true verification.on_error=reject"; approach=true ;;
+  d1mv) mode=gate; grid=${MV_GRID:-true}
+        flags="--selector d1 --d1-evidence input${D1_ACCEPT_MIN:+ --d1-accept-min $D1_ACCEPT_MIN}"
+        [ "$grid" = true ] && flags="$flags --multiview-grid"
+        # the multiview keys are not in the habitat_eval yaml: Hydra adds them with "+"
+        eval_args="verification.approach=true verification.on_error=reject +verification.multiview=true +verification.multiview_grid=$grid${MV_VARIANT:+ +verification.multiview_variant=$MV_VARIANT}${MV_ARGS:+ $MV_ARGS}"
+        approach=true ;;
+  jev_sam3) mode=gate; flags="--selector jev_sam3"
+       eval_args="verification.approach=true verification.on_error=reject +verification.multiview=true +verification.multiview_grid=false +verification.multiview_sam3=never +verification.multiview_min_views=1${APPROACH_PLANNER:+ +verification.approach_planner=$APPROACH_PLANNER}${MV_ARGS:+ $MV_ARGS}"
+       approach=true ;;
+  d1) mode=gate; flags="--selector d1 --d1-evidence ${D1_EVIDENCE:-grid}${D1_ACCEPT_MIN:+ --d1-accept-min $D1_ACCEPT_MIN}${D1_STAGGER:+ --stagger}"; eval_args="verification.approach=true verification.on_error=reject"; approach=true ;;
   *) echo "unknown strategy $STRAT"; exit 2 ;;
 esac
 root=$APEX/videos/$NAME
@@ -60,8 +91,10 @@ cleanup() {
   [ -n "$child" ] && kill $child 2>/dev/null
   [ -n "$guard" ] && kill $guard 2>/dev/null
   pkill -f "gpu_guard.sh $GPU" 2>/dev/null
-  docker exec $DEV pkill -f "perception.server"
-  docker exec $DEV pkill -f "perception.worker"
+  if [ "${REUSE_SERVER:-0}" != 1 ]; then
+    docker exec $DEV pkill -f "perception.server"
+    docker exec $DEV pkill -f "perception.worker"
+  fi
   docker exec apexnav pkill -f habitat_evaluation.py
   docker exec apexnav pkill -f 'exploration.launch.py|exploration_node|tsp_node'
 }
@@ -78,21 +111,26 @@ trap 'exit 130' INT TERM
   echo "planner $(stat -c '%y' $APEX/build/exploration_manager/exploration_node)"
 } >> $root/versions.txt
 
-docker exec $DEV pkill -f "perception.server"; docker exec $DEV pkill -f "perception.worker"; sleep 5
-if [ $mode = gate ]; then
+ping_server() { docker exec $DEV sam3d-env core python -m perception.server ping http://localhost:8770 2>/dev/null; }
+selector=$(echo "$flags" | awk '{print $2}')  # flags start with --selector <name>
+if [ $mode = gate ] && [ "${REUSE_SERVER:-0}" = 1 ] && ping_server | grep -q "\"selector\": \"$selector\""; then
+  echo "$(date +%T) $NAME: reusing the running server ($flags)"
+elif [ $mode = gate ]; then
+  docker exec $DEV pkill -f "perception.server"; docker exec $DEV pkill -f "perception.worker"; sleep 5
   log=outputs/apexnav_online/server_$NAME
   echo "$(date +%T) $NAME: starting server ($flags)"
   docker exec $DEV mkdir -p /workspace/$log
-  docker exec -d $DEV bash -lc "cd /workspace && OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 sam3d-env core python -m perception.server --host 0.0.0.0 --port 8770 --gpu $GPU $flags --log-dir $log >> $log/server.out 2>&1"
-  for i in $(seq 60); do
-    docker exec $DEV sam3d-env core python -m perception.server ping http://localhost:8770 >/dev/null 2>&1 && break
+  docker exec -d ${ALLOC_CONF:+-e PYTORCH_CUDA_ALLOC_CONF=$ALLOC_CONF} $DEV bash -lc "cd /workspace && OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 sam3d-env core python -m perception.server --host 0.0.0.0 --port 8770 --gpu $GPU $flags --log-dir $log >> $log/server.out 2>&1"
+  for i in $(seq 90); do  # jev_sam3: JEV int8 from local disk
+    ping_server >/dev/null && break
     sleep 10
   done
-  docker exec $DEV sam3d-env core python -m perception.server ping http://localhost:8770 >/dev/null 2>&1 || { echo "$NAME: server did not come up"; exit 1; }
+  ping_server >/dev/null || { echo "$NAME: server did not come up"; exit 1; }
 else
+  docker exec $DEV pkill -f "perception.server"; docker exec $DEV pkill -f "perception.worker"; sleep 5
   echo "$(date +%T) $NAME: no gate"
 fi
-(cd $APEX && ABORT=$root/ABORT ./scripts/gpu_guard.sh $GPU 44000 8 >> $root/gpu_guard.log 2>&1) &
+(cd $APEX && ABORT=$root/ABORT ./scripts/gpu_guard.sh $GPU ${GUARD_MAX_MIB:-45500} ${GUARD_MAX_APPS:-8} >> $root/gpu_guard.log 2>&1) &
 guard=$!
 docker exec apexnav bash -c "cd /workspace/ApexNav && DATASET=$DATASET SIM_GPU=$GPU SYNC_STEP=$SYNC APPROACH=$approach OUT_ROOT=videos/$NAME EVAL_ARGS='$eval_args' ./scripts/run_gate_e2e.sh $mode ${todo[*]} >> videos/$NAME/run_gate.log 2>&1" &
 child=$!

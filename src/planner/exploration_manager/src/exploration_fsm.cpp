@@ -410,6 +410,10 @@ void ExplorationFSM::finishVerification(int state, bool timed_out)
   auto obj_map = expl_manager_->object_map2d_;
   bool approach = fd_->verify_approach_id_ > 0, arrival = fd_->verify_arrival_;
   bool stuck = fd_->verify_stuck_;
+  // Accepted at the standoff: not at the object yet, so ApexNav's object navigation goes on to it
+  // (as after an accept on the way) and stops there; the accepted cluster is not asked again
+  bool standoff = arrival && fd_->ap_standoff_;
+  fd_->ap_standoff_ = false;
   fd_->verify_approach_id_ = 0;
   fd_->verify_arrival_ = false;
   fd_->verify_stuck_ = false;
@@ -443,11 +447,16 @@ void ExplorationFSM::finishVerification(int state, bool timed_out)
     finishPlanning();
     return;
   }
-  if ((state == 1 || state == 2) && (!approach || arrival)) {
+  if ((state == 1 || state == 2) && (!approach || arrival) && !(state == 1 && standoff)) {
     finishPlanning();
     return;
   }
-  if (state == 1) {  // accepted on the way: plan this step anew, toward the object
+  if (state == 1) {  // accepted on the way (or at the standoff): plan this step anew, toward the object
+    if (standoff) {
+      // callActionPlanner's reach check runs only in SEARCH_OBJECT
+      fd_->final_result_ = FINAL_RESULT::SEARCH_OBJECT;
+      RCLCPP_WARN(node_->get_logger(), "[Verification] accepted at the standoff: going on to the object");
+    }
     fd_->skip_stuck_check_once_ = true;
     transitState(ROS_STATE::PLAN_ACTION, "Verification");
     return;
@@ -498,7 +507,28 @@ void ExplorationFSM::verificationResultCallback(
     startApproach(*msg);
     return;
   }
+  if (msg->resume_step > 0) {  // the gate approached the object itself (approach_planner): replan from here
+    finishExternalApproach(msg->state == 1 ? 1 : -1, msg->resume_step);
+    return;
+  }
   finishVerification(msg->state == 1 || msg->state == 2 ? msg->state : -1, false);
+}
+
+// The verdict after an approach the gate drove itself (VerificationResult.resume_step): the agent stands
+// elsewhere now, so the action planned before the request is dropped. Plan anew once the map has integrated
+// every approach step; on accept the cluster is the forced target (object navigation goes on to it and stops,
+// as after an accept at the standoff), on reject it is dropped as usual.
+void ExplorationFSM::finishExternalApproach(int state, int resume_step)
+{
+  int id = fd_->verify_cluster_id_;
+  awaited_step_ = std::max(awaited_step_, resume_step);
+  finishVerification(state, false);  // map bookkeeping; a reject already replans (PLAN_ACTION)
+  if (state == 1 && id >= 0) {
+    expl_manager_->forced_cluster_id_ = id;
+    fd_->final_result_ = FINAL_RESULT::SEARCH_OBJECT;
+    fd_->skip_stuck_check_once_ = true;
+    transitState(ROS_STATE::PLAN_ACTION, "Verification (external approach)");
+  }
 }
 
 // True when the robot faces ``point`` (within ACTION_ANGLE / 1.9); else ``turn`` is the
@@ -562,11 +592,13 @@ void ExplorationFSM::startApproach(const plan_env::msg::VerificationResult& msg)
   if (!resume || msg.approach_id != fd_->ap_approach_id_ || msg.cluster_id != fd_->ap_cluster_id_)
     fd_->ap_steps_ = 0;
   fd_->ap_face_turns_ = 0;
+  fd_->ap_standoff_ = false;
   fd_->ap_active_ = true;
   fd_->ap_cluster_id_ = msg.cluster_id;
   fd_->ap_approach_id_ = msg.approach_id;
   fd_->ap_max_steps_ = msg.max_steps;
   fd_->ap_object_ = Vector2d(msg.object_x, msg.object_y);
+  if (!resume) fd_->ap_camera_ = Vector2d(msg.camera_x, msg.camera_y);
   expl_manager_->forced_cluster_id_ = msg.cluster_id;
   auto obj_map = expl_manager_->object_map2d_;
   obj_map->setVerification(msg.cluster_id, 3);  // under approach: one cluster at a time
@@ -595,7 +627,21 @@ void ExplorationFSM::startApproach(const plan_env::msg::VerificationResult& msg)
 bool ExplorationFSM::checkApproach()
 {
   auto ed = expl_manager_->ed_;
-  if (fd_->final_result_ == FINAL_RESULT::REACH_OBJECT) {
+  // Arrival: the object reached, or (standoff) within APPROACH_STANDOFF of its nearest point
+  // and APPROACH_MIN_GAIN closer to it than the evidence camera, so a nearby object on
+  // furniture is not judged from below with its top out of the frame
+  Vector2d pos(fd_->odom_pos_(0), fd_->odom_pos_(1));
+  bool standoff = ed->target_cluster_id_ == fd_->ap_cluster_id_ &&
+      (ed->target_object_pos_ - pos).norm() <= FSMConstants::APPROACH_STANDOFF &&
+      (fd_->ap_object_ - pos).norm() <= (fd_->ap_camera_ - fd_->ap_object_).norm() - FSMConstants::APPROACH_MIN_GAIN;
+  if (fd_->final_result_ == FINAL_RESULT::REACH_OBJECT || standoff) {
+    if (standoff && fd_->final_result_ != FINAL_RESULT::REACH_OBJECT) {
+      // The planned step is not taken: the approach ends here (as REACH_OBJECT would)
+      fd_->final_result_ = FINAL_RESULT::REACH_OBJECT;
+      fd_->ap_standoff_ = true;
+      RCLCPP_WARN(node_->get_logger(), "[Verification] approach: within %.1f m of the object (standoff)",
+          FSMConstants::APPROACH_STANDOFF);
+    }
     // Turn (budget permitting) until the object is in view, then verify (stop_face_pending_)
     if (!faceTurn())
       endApproach(1, "arrived, facing the object");

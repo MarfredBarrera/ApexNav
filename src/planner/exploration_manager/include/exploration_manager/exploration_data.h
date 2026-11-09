@@ -66,6 +66,8 @@ struct FSMData {
     ap_steps_ = 0;
     ap_max_steps_ = 0;
     ap_object_ = Eigen::Vector2d::Zero();
+    ap_camera_ = Eigen::Vector2d::Zero();
+    ap_standoff_ = false;
     verify_arrival_ = false;
     verify_approach_id_ = 0;
     verify_stuck_ = false;
@@ -121,6 +123,8 @@ struct FSMData {
   int ap_cluster_id_, ap_approach_id_;
   int ap_steps_, ap_max_steps_;  // actions taken in this approach / allowed
   Eigen::Vector2d ap_object_;    // object point of the approach (evidence centroid), for the log
+  Eigen::Vector2d ap_camera_;    // camera of the evidence view that issued the approach
+  bool ap_standoff_;             // the approach arrived at the standoff, not at the object
   bool verify_arrival_;          // the pending request is the approach's arrival (at the stop)
   int verify_approach_id_;       // the pending request is about this approach (0: ordinary)
   bool verify_stuck_;            // ... ended because the agent got stuck: stop after the verdict

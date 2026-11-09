@@ -22,3 +22,8 @@ float32 object_y
 float32 camera_x           # camera of the insufficient view (line of sight object -> camera)
 float32 camera_y
 int32 max_steps            # actions the planner may spend on this approach
+# Approach run outside the planner (gate approach_planner mppi/closer, sync_step only): the gate drove the
+# agent itself and answers the original request with state 1 / -1 and resume_step = the last executed step.
+# The planner first integrates every step up to resume_step (their StepObservations), then replans from the
+# new pose; on accept the cluster becomes its forced target, so its object navigation goes on to it and stops.
+int32 resume_step          # 0: an ordinary reply

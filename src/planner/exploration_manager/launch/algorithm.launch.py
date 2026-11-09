@@ -48,7 +48,9 @@ def verification_params(context):
         raise RuntimeError(f"verification_approach must be true or false, got '{approach}'")
     return {
         'verification.enabled': raw in ('true', '1'),
-        'verification.timeout_s': 300.0,
+        # an approach the gate drives itself (approach_planner) answers only after up to 40 actions with
+        # JEV + SAM3 calls; in sync_step a missed deadline aborts the run, so allow for it
+        'verification.timeout_s': 1800.0,
         # gate state 3 (server selector d1) and the backstop's face-the-object turn
         'verification.approach': approach in ('true', '1'),
     }

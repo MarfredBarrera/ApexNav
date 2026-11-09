@@ -129,6 +129,190 @@ def build_verification_gate(cfg, video_output_path):
     return VerificationGate(verification_cfg, video_output_path, camera=camera)
 
 
+def execute_step(env, node, ctx, action, planned_action, count_steps, camera_pitch, label, room, llm_answer,
+                 cld_with_score_msg, external_approach=False):
+    """Execute one action and process its observation (detection, planner map, gate evidence, records).
+    ``external_approach``: a step of an approach the gate drives itself (no ACTION_FINISH, no reopens).
+    Returns {observations, rgb, depth (m), target masks / centroids (label 0), pose, pass_object}."""
+    gate = ctx["gate"]
+    sync = ctx["sync_step"]
+    print(f"\n--------------Step: {count_steps}--------------")
+    print(f"Finding [{label}]; Action: {action};")
+
+    # Notify ROS system that action execution is starting
+    node.publish_int32(node.state_pub, HABITAT_STATE.ACTION_EXEC)
+
+    observations = env.step(action)
+
+    # Keep the untouched observation: get_object() below overwrites
+    # observations["rgb"] in place with the annotated image
+    recorder = ctx["recorder"]
+    rgb_raw = (
+        observations["rgb"].copy()
+        if recorder.enabled and recorder.capture_rgb
+        else None
+    )
+    rgb_gate = None
+    if gate:
+        rgb_gate = rgb_raw if rgb_raw is not None else observations["rgb"].copy()
+
+    # Calculate ITM cosine similarity score
+    cosine = get_itm_message_cosine(observations["rgb"], label, room)
+    print(f"Target related room: {room}")
+    print(f"ITM cosine similarity: {cosine:.3f}")
+    if not sync:
+        node.publish_float64(node.itm_score_pub, cosine)
+
+    # Detect objects in the current observation
+    observations["rgb"], score_list, object_masks_list, label_list = get_object(
+        label, observations["rgb"], ctx["detector_cfg"], llm_answer
+    )
+    detection_semantic_instances = semantic_instances_for_masks(
+        observations.get("semantic"), object_masks_list
+    )
+
+    # Publish habitat observations to ROS
+    observations["camera_pitch"] = camera_pitch
+    node.msg_observations = deepcopy(observations)
+    del observations["camera_pitch"]
+    if not sync:
+        node.ros_pub.habitat_publish_ros_topic(node.msg_observations)
+
+    # Generate and publish object point clouds
+    (
+        cld_with_score_msg.point_clouds,
+        detection_world_centroids,
+    ) = get_object_point_cloud(
+        ctx["cfg"], observations, object_masks_list, node,
+        return_centroids=True,
+    )
+    cld_with_score_msg.confidence_scores = score_list
+    cld_with_score_msg.label_indices = label_list
+    if not sync:
+        node.cld_with_score_pub.publish(cld_with_score_msg)
+    step_pose = agent_world_pose(observations)
+
+    # Keep target detections as verification evidence; a rejected cluster
+    # seen anew after the cooldown is reopened for another check
+    reopened = gate.observe(
+        count_steps, rgb_gate, object_masks_list, label_list, score_list,
+        detection_world_centroids, detection_semantic_instances, step_pose,
+        camera_pitch, node.object_fusion, external_approach=external_approach,
+    ) if gate else []
+    if sync:
+        # The reopens ride with this step, so the planner applies them before it
+        # plans the next action
+        node.publish_step_observation(
+            count_steps, node.msg_observations, itm=cosine,
+            clouds=cld_with_score_msg, reopen=reopened)
+    else:
+        for cluster_id in reopened:
+            node.publish_verification_result(0, cluster_id, 0)
+
+    info = env.get_metrics()
+    ctx["video"].track(observations)
+
+    recorder.log_step(
+        step=count_steps,
+        action=planned_action,
+        pose=step_pose,
+        camera_pitch=camera_pitch,
+        rgb_raw=rgb_raw,
+        rgb_annotated=observations["rgb"],
+        score_list=score_list,
+        label_list=label_list,
+        itm=cosine,
+        distance_to_goal=info["distance_to_goal"],
+        final_state=node.final_state,
+        expl_result=node.expl_result,
+        object_fusion=node.object_fusion,
+        object_masks=object_masks_list,
+        detection_world_centroids=detection_world_centroids,
+        detection_semantic_instances=detection_semantic_instances,
+        verification=gate.pop_events() if gate else None,
+    )
+    ctx["video"].capture(
+        observations, info, itm_score=cosine, step=count_steps, target=label
+    )
+
+    # Track if agent has passed close to the target
+    pass_object = 1 if info["distance_to_goal"] <= ctx["success_distance"] else 0
+
+    if ctx["step_delay"] > 0:
+        time.sleep(ctx["step_delay"])
+
+    # Notify ROS system that action execution is complete (not for a step of an approach the
+    # gate drives: the planner is waiting for the verdict, and only integrates the step)
+    if not external_approach:
+        node.publish_int32(node.state_pub, HABITAT_STATE.ACTION_FINISH)
+        if sync:
+            node.publish_int32(node.action_finish_step_pub, count_steps)
+
+
+    target = [i for i, l in enumerate(label_list) if int(l) == 0]
+    ctx["last_step"] = {"observations": observations, "rgb": rgb_gate,
+            "depth": np.asarray(observations["depth"], np.float32).squeeze() * ctx["max_depth"],
+            "masks": [object_masks_list[i] for i in target],
+            "centroids": [detection_world_centroids[i] if detection_world_centroids is not None else None
+                          for i in target],
+            "pose": step_pose, "pass_object": pass_object}
+    return ctx["last_step"]
+
+
+def run_gate_approach(env, node, ctx, request, count_steps, camera_pitch, label, room, llm_answer,
+                      cld_with_score_msg):
+    """An approach driven by the gate (verification.approach_planner; perception_gate.approach): the planner
+    is waiting for the verdict on ``request``. Each step goes through execute_step (detector, planner map,
+    gate evidence, records) without ACTION_FINISH. Returns (state 1 / -1, count_steps, camera_pitch,
+    pass_object)."""
+    from perception_gate.approach import LiveApproach
+    gate = ctx["gate"]
+    if not ctx["sync_step"]:
+        raise RuntimeError("verification.approach_planner needs sync_step")
+    pending = gate.pending_approach(request["cluster_id"])
+    run = gate.episode["run_index"]
+    tag = f"epi{run}_c{request['cluster_id']}_s{count_steps}"
+    log_dir = os.path.join(gate.log_dir, "approach", tag) if gate.log_dir else None
+    start = time.time()
+    passed = 0
+    # the planners assume camera pitch 0 (ApexNav's pitch after its initial spin)
+    while abs(camera_pitch) > 1e-6 and count_steps < ctx["max_episode_steps"] - 1:
+        planned = ACTION.TURN_UP if camera_pitch < 0 else ACTION.TURN_DOWN
+        camera_pitch += PITCH_STEP if planned == ACTION.TURN_UP else -PITCH_STEP
+        count_steps += 1
+        out = execute_step(env, node, ctx, getattr(HabitatSimActions, ACTION_TO_HABITAT[planned]), planned,
+                           count_steps, camera_pitch, label, room, llm_answer, cld_with_score_msg,
+                           external_approach=True)
+        passed = max(passed, out["pass_object"])
+    approach = LiveApproach(env.sim, gate.cfg["url"], gate.episode["target"], pending["object"],
+                            min(pending["max_steps"], ctx["max_episode_steps"] - 1 - count_steps),
+                            gate.approach_planner, log_dir=log_dir, tag=tag)
+    last = ctx["last_step"]   # the request's frame: the last executed step
+    frame = {"rgb": last["rgb"], "depth": last["depth"]}
+    detections, pose = (last["masks"], last["centroids"]), last["pose"]
+    while True:
+        name = approach.step(frame["rgb"], frame["depth"], detections[0], detections[1], pose)
+        if name is None:
+            break
+        planned = {"move_forward": ACTION.MOVE_FORWARD, "turn_left": ACTION.TURN_LEFT,
+                   "turn_right": ACTION.TURN_RIGHT}[name]
+        count_steps += 1
+        out = execute_step(env, node, ctx, getattr(HabitatSimActions, name), planned, count_steps, camera_pitch,
+                           label, room, llm_answer, cld_with_score_msg, external_approach=True)
+        passed = max(passed, out["pass_object"])
+        frame = {"rgb": out["rgb"], "depth": out["depth"]}
+        detections = (out["masks"], out["centroids"])
+        pose = out["pose"]
+        if env.episode_over:
+            approach._forced("episode_over")
+            break
+    result = dict(approach.result, seconds=round(time.time() - start, 1))
+    state = gate.finish_external_approach(request, count_steps, result, approach_log=log_dir)
+    print(f"[verification] gate approach ({gate.approach_planner}) cluster {request['cluster_id']}: "
+          f"{result['status']} by {result['by']} after {result['actions']} actions")
+    return state, count_steps, camera_pitch, passed
+
+
 def run_episode(env, node, ctx, label, llm_answer, room):
     """Drive one episode to completion.
 
@@ -157,6 +341,17 @@ def run_episode(env, node, ctx, label, llm_answer, room):
             # A gate-off run never gets here (main() checks the planner flag);
             # accepting keeps a mismatched planner from waiting for its timeout
             state = gate.handle(request, node.object_fusion, count_steps) if gate else 1
+            if state == 3 and gate.approach_planner:
+                # the gate drives the approach itself and answers the request with its verdict; the
+                # planner integrates the approach steps (resume_step) and replans from the new pose
+                state, count_steps, camera_pitch, passed = run_gate_approach(
+                    env, node, ctx, request, count_steps, camera_pitch, label, room, llm_answer,
+                    cld_with_score_msg)
+                pass_object = max(pass_object, passed)
+                node.publish_verification_result(request["seq"], request["cluster_id"], state,
+                                                 resume_step=max(count_steps, 1))
+                last_progress = time.time()
+                continue
             # state 3: approach the object first; the planner re-requests the cluster
             approach = gate.pending_approach(request["cluster_id"]) if gate and state == 3 else None
             node.publish_verification_result(request["seq"], request["cluster_id"], state, approach)
@@ -207,116 +402,9 @@ def run_episode(env, node, ctx, label, llm_answer, room):
             camera_pitch += PITCH_STEP
 
         count_steps += 1
-        print(f"\n--------------Step: {count_steps}--------------")
-        print(f"Finding [{label}]; Action: {action};")
-
-        # Notify ROS system that action execution is starting
-        node.publish_int32(node.state_pub, HABITAT_STATE.ACTION_EXEC)
-
-        observations = env.step(action)
-
-        # Keep the untouched observation: get_object() below overwrites
-        # observations["rgb"] in place with the annotated image
-        recorder = ctx["recorder"]
-        rgb_raw = (
-            observations["rgb"].copy()
-            if recorder.enabled and recorder.capture_rgb
-            else None
-        )
-        rgb_gate = None
-        if gate:
-            rgb_gate = rgb_raw if rgb_raw is not None else observations["rgb"].copy()
-
-        # Calculate ITM cosine similarity score
-        cosine = get_itm_message_cosine(observations["rgb"], label, room)
-        print(f"Target related room: {room}")
-        print(f"ITM cosine similarity: {cosine:.3f}")
-        if not sync:
-            node.publish_float64(node.itm_score_pub, cosine)
-
-        # Detect objects in the current observation
-        observations["rgb"], score_list, object_masks_list, label_list = get_object(
-            label, observations["rgb"], ctx["detector_cfg"], llm_answer
-        )
-        detection_semantic_instances = semantic_instances_for_masks(
-            observations.get("semantic"), object_masks_list
-        )
-
-        # Publish habitat observations to ROS
-        observations["camera_pitch"] = camera_pitch
-        node.msg_observations = deepcopy(observations)
-        del observations["camera_pitch"]
-        if not sync:
-            node.ros_pub.habitat_publish_ros_topic(node.msg_observations)
-
-        # Generate and publish object point clouds
-        (
-            cld_with_score_msg.point_clouds,
-            detection_world_centroids,
-        ) = get_object_point_cloud(
-            ctx["cfg"], observations, object_masks_list, node,
-            return_centroids=True,
-        )
-        cld_with_score_msg.confidence_scores = score_list
-        cld_with_score_msg.label_indices = label_list
-        if not sync:
-            node.cld_with_score_pub.publish(cld_with_score_msg)
-        step_pose = agent_world_pose(observations)
-
-        # Keep target detections as verification evidence; a rejected cluster
-        # seen anew after the cooldown is reopened for another check
-        reopened = gate.observe(
-            count_steps, rgb_gate, object_masks_list, label_list, score_list,
-            detection_world_centroids, detection_semantic_instances, step_pose,
-            camera_pitch, node.object_fusion,
-        ) if gate else []
-        if sync:
-            # The reopens ride with this step, so the planner applies them before it
-            # plans the next action
-            node.publish_step_observation(
-                count_steps, node.msg_observations, itm=cosine,
-                clouds=cld_with_score_msg, reopen=reopened)
-        else:
-            for cluster_id in reopened:
-                node.publish_verification_result(0, cluster_id, 0)
-
-        info = env.get_metrics()
-        ctx["video"].track(observations)
-
-        recorder.log_step(
-            step=count_steps,
-            action=planned_action,
-            pose=step_pose,
-            camera_pitch=camera_pitch,
-            rgb_raw=rgb_raw,
-            rgb_annotated=observations["rgb"],
-            score_list=score_list,
-            label_list=label_list,
-            itm=cosine,
-            distance_to_goal=info["distance_to_goal"],
-            final_state=node.final_state,
-            expl_result=node.expl_result,
-            object_fusion=node.object_fusion,
-            object_masks=object_masks_list,
-            detection_world_centroids=detection_world_centroids,
-            detection_semantic_instances=detection_semantic_instances,
-            verification=gate.pop_events() if gate else None,
-        )
-        ctx["video"].capture(
-            observations, info, itm_score=cosine, step=count_steps, target=label
-        )
-
-        # Track if agent has passed close to the target
-        if info["distance_to_goal"] <= ctx["success_distance"] and pass_object == 0:
-            pass_object = 1
-
-        if ctx["step_delay"] > 0:
-            time.sleep(ctx["step_delay"])
-
-        # Notify ROS system that action execution is complete
-        node.publish_int32(node.state_pub, HABITAT_STATE.ACTION_FINISH)
-        if sync:
-            node.publish_int32(node.action_finish_step_pub, count_steps)
+        pass_object = max(pass_object, execute_step(
+            env, node, ctx, action, planned_action, count_steps, camera_pitch, label, room, llm_answer,
+            cld_with_score_msg)["pass_object"])
 
     return count_steps, pass_object
 
@@ -393,6 +481,7 @@ def main(
         "step_delay": step_delay,
         "sync_step": sync_step,
         "sync_stall_timeout_s": float(cfg.get("sync_stall_timeout_s", 600.0)),
+        "max_depth": float(cfg.habitat.simulator.agents.main_agent.sim_sensors.depth_sensor.max_depth),
     }
     detector_cfg_plain = OmegaConf.to_container(cfg.detector, resolve=True)
 

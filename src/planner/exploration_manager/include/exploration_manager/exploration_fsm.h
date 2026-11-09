@@ -54,6 +54,8 @@ constexpr double MIN_SAFE_DISTANCE = 0.15;       // min safe distance to obstacl
 constexpr double STOP_MATCH_DISTANCE = 0.75;     // perception gate: stop target <-> cluster cell
 constexpr double APPROACH_FACE_TOLERANCE = M_PI / 12.0;  // approach arrival: object within +-15 deg
 constexpr int APPROACH_MAX_FACE_TURNS = 3;               // ... turning at most this often
+constexpr double APPROACH_STANDOFF = 1.5;   // approach arrives within this of the object's nearest point ...
+constexpr double APPROACH_MIN_GAIN = 0.5;   // ... once this much closer to it than the evidence camera
 
 // Counters / thresholds
 constexpr int MAX_STUCKING_COUNT = 25;           // max consecutive stuck actions -> stop
@@ -146,6 +148,7 @@ private:
   bool needsStopVerification(int& cluster_id, Vector2d& pos);
   void requestVerification(int cluster_id, const Vector2d& pos, bool at_stop, int approach_id = 0,
       int viewpoint_status = 0);
+  void finishExternalApproach(int state, int resume_step);
   void finishVerification(int state, bool timed_out);
   bool facing(const Vector2d& point, int& turn);
   bool facingWithin(const Vector2d& point, double tolerance, int& turn);
