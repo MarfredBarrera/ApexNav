@@ -27,6 +27,7 @@
 set -euo pipefail
 
 SESSION="${SESSION:-apexnav}"
+VLM_PORT_BASE="${VLM_PORT_BASE:-12181}"  # the four servers take VLM_PORT_BASE .. +3 (clients read the same variable)
 WS=/workspace/ApexNav
 DATASET="${DATASET:-hm3dv2}"
 
@@ -92,10 +93,10 @@ tmux split-window -t "${SESSION}:vlm" -h -c "${WS}"
 tmux split-window -t "${SESSION}:vlm.0" -v -c "${WS}"
 tmux split-window -t "${SESSION}:vlm.2" -v -c "${WS}"
 
-run "${SESSION}:vlm.0" use_vlm "${GPU_GROUNDING_DINO}" "python -m vlm.detector.grounding_dino --port 12181"
-run "${SESSION}:vlm.1" use_vlm "${GPU_BLIP2ITM}"       "python -m vlm.itm.blip2itm         --port 12182"
-run "${SESSION}:vlm.2" use_vlm "${GPU_SAM}"            "python -m vlm.segmentor.sam        --port 12183"
-run "${SESSION}:vlm.3" use_vlm "${GPU_YOLOV7}"         "python -m vlm.detector.yolov7      --port 12184"
+run "${SESSION}:vlm.0" use_vlm "${GPU_GROUNDING_DINO}" "python -m vlm.detector.grounding_dino --port ${VLM_PORT_BASE}"
+run "${SESSION}:vlm.1" use_vlm "${GPU_BLIP2ITM}"       "python -m vlm.itm.blip2itm         --port $((VLM_PORT_BASE + 1))"
+run "${SESSION}:vlm.2" use_vlm "${GPU_SAM}"            "python -m vlm.segmentor.sam        --port $((VLM_PORT_BASE + 2))"
+run "${SESSION}:vlm.3" use_vlm "${GPU_YOLOV7}"         "python -m vlm.detector.yolov7      --port $((VLM_PORT_BASE + 3))"
 
 # --- window 1: ROS (Env A) ----------------------------------------------------
 tmux new-window   -t "${SESSION}" -n ros -c "${WS}"

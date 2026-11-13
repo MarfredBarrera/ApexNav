@@ -385,6 +385,45 @@ def run_close_in(env, node, ctx, planned_action, step_cap, count_steps, camera_p
     return state["count"], camera_pitch, state["passed"]
 
 
+def run_takeover(env, node, ctx, cloud, source, count_steps, camera_pitch, label, room, llm_answer,
+                 cld_with_score_msg):
+    """verification.takeover: at the FIRST gate accept the bench's last-mile navigator (lastmile.live, F_full_cur) drives
+    the agent for the rest of the episode, never handing back to ApexNav: its own STOP ends the episode (final state
+    REACH_OBJECT), else the step cap forces the STOP as for the native planner. ``cloud``: the accepted object's points
+    (sim world frame), ``source``: where they come from. Returns (count_steps, camera_pitch, pass_object)."""
+    from lastmile import live
+    gate = ctx["gate"]
+    accept_step = count_steps
+    count_steps, camera_pitch, passed = level_camera(env, node, ctx, count_steps, camera_pitch, label, room,
+                                                     llm_answer, cld_with_score_msg)
+    live.ensure_level_sensor(env.sim)   # after levelling: look_up / look_down tilt every sensor
+    budget = max(0, ctx["max_episode_steps"] - 1 - count_steps)   # the last step is the STOP
+    tk = live.Takeover(env.sim, cloud, budget, source)
+    if tk.rh and tk.apex and tk.apex_map == "apex":     # LASTMILE_APEXWP_MAP=apex: ApexNav's /grid_map clouds (lastmile/apex_grid.py)
+        from lastmile import apex_grid
+        tk.apex_src = apex_grid.TopicSource(node)
+    table = {live.FORWARD: ACTION.MOVE_FORWARD, live.LEFT: ACTION.TURN_LEFT, live.RIGHT: ACTION.TURN_RIGHT,
+             live.STOP: ACTION.STOP}
+    last, end = ctx["last_step"], None
+    while not env.episode_over:
+        if count_steps >= ctx["max_episode_steps"] - 1:
+            planned, end = ACTION.STOP, "cap"
+        else:
+            planned = table[tk.act(last["depth"], last if tk.rh else None)]
+            if planned == ACTION.STOP:
+                end = "stop"
+                node.final_state = FINAL_RESULT.REACH_OBJECT
+        count_steps += 1
+        last = execute_step(env, node, ctx, getattr(HabitatSimActions, ACTION_TO_HABITAT[planned]), planned,
+                            count_steps, camera_pitch, label, room, llm_answer, cld_with_score_msg,
+                            external_approach=True)
+        passed = max(passed, last["pass_object"])
+        if planned == ACTION.STOP:
+            break
+    gate.log_takeover(accept_step, end or "episode_over", tk.result())
+    return count_steps, camera_pitch, passed
+
+
 def run_gate_approach(env, node, ctx, request, count_steps, camera_pitch, label, room, llm_answer,
                       cld_with_score_msg):
     """An approach driven by the gate (verification.approach_planner; perception_gate.approach): the planner
@@ -437,7 +476,19 @@ def run_gate_approach(env, node, ctx, request, count_steps, camera_pitch, label,
           f"{result['status']} by {result['by']} after {result['actions']} actions")
     stopped = False
     try:
-        if state == 1 and gate.last_mile and not env.episode_over:
+        if state == 1 and gate.takeover and not env.episode_over:
+            cloud, source = approach.cloud, "approach_cloud"
+            if not len(cloud):
+                cloud, source = approach.object_points(), "object_points"
+            if cloud is None or not len(cloud):
+                from lastmile import live
+                position, yaw, _ = S_agent_pose(env.sim)
+                xz = live.pf_to_world_xz(pending["object"], position, yaw, ctx["last_step"]["pose"])
+                cloud, source = np.array([[xz[0], position[1], xz[1]]], np.float32), "cluster_centroid"
+            count_steps, camera_pitch, p = run_takeover(env, node, ctx, cloud, source, count_steps, camera_pitch, label,
+                                                        room, llm_answer, cld_with_score_msg)
+            passed = max(passed, p)
+        elif state == 1 and gate.last_mile and not env.episode_over:
             approach.start_last_mile(max(0, min(LM_BUDGET, ctx["max_episode_steps"] - 1 - count_steps)))
             stopped, count_steps, p = drive_last_mile(env, node, ctx, approach, count_steps, camera_pitch, label,
                                                       room, llm_answer, cld_with_score_msg)
@@ -455,6 +506,11 @@ def request_frame(env, ctx):
     if last is None:
         return None
     return {"depth": last["depth"], "masks": last["masks"], "centroids": last["centroids"], "cam": S.camera(env.sim)}
+
+
+def S_agent_pose(sim):
+    from active_approach import scene as S
+    return S.agent_pose(sim)
 
 
 def run_episode(env, node, ctx, label, llm_answer, room):
@@ -502,6 +558,17 @@ def run_episode(env, node, ctx, label, llm_answer, room):
                 node.publish_verification_result(request["seq"], request["cluster_id"], 3,
                                                  gate.pending_approach(request["cluster_id"]))
                 last_progress = time.time()
+                continue
+            if state == 1 and gate and gate.takeover:
+                # the first gate accept: the bench's last-mile navigator drives from here to the end of the episode
+                from lastmile import live
+                position, yaw, _ = S_agent_pose(env.sim)
+                xz = live.pf_to_world_xz((float(request["centroid_x"]), float(request["centroid_y"])), position, yaw,
+                                         ctx["last_step"]["pose"])
+                count_steps, camera_pitch, passed = run_takeover(
+                    env, node, ctx, np.array([[xz[0], position[1], xz[1]]], np.float32), "cluster_centroid",
+                    count_steps, camera_pitch, label, room, llm_answer, cld_with_score_msg)
+                pass_object = max(pass_object, passed)
                 continue
             if state == 3 and gate.approach_planner:
                 # the gate drives the approach itself and answers the request with its verdict; the

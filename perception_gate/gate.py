@@ -152,6 +152,8 @@ DEFAULTS = {
     "close_in": False,               # terminal close-in at an accepted object when the planner stops / ends stucking
                                      # (perception_gate.close_in; habitat_evaluation.run_close_in)
     "close_in_budget": 12,           # actions before its final STOP
+    "takeover": False,               # at the FIRST accept the bench's last-mile navigator (lastmile.live, F_full_cur) drives
+                                     # to the end of the episode, never handing back (habitat_evaluation.run_takeover)
 }
 POLICIES = ("accept", "reject")
 NO_EVIDENCE_POLICIES = POLICIES + ("defer",)
@@ -255,6 +257,7 @@ class VerificationGate:
         if not self.cfg["last_mile"] and self.approach_planner is None:
             raise ValueError("verification.last_mile=false needs approach_planner (no last mile runs without it)")
         self.close_in = bool(self.cfg["close_in"])
+        self.takeover = bool(self.cfg["takeover"])
         self._frame = None
         self.multiview = bool(self.cfg["multiview"])
         if self.multiview:
@@ -316,6 +319,9 @@ class VerificationGate:
             self.counts.update({key: 0 for key in MULTIVIEW_COUNTS})
         if self.close_in:
             self.counts.update({"close_in": 0, "close_in_actions": 0, "close_in_end": None})
+        if self.takeover:
+            self.counts.update({"takeover": 0, "takeover_step": None, "takeover_actions": 0, "takeover_end": None,
+                                "takeover_reason": None, "takeover_object_dist": None})
         self.accepted_cloud = None   # the most recent accepted object's points (close_in)
         self.approach_steps_used = 0
         self.decided_objects = []   # (points, state) of objects the gate's approaches decided (same_as_decided)
@@ -442,6 +448,23 @@ class VerificationGate:
             self.decided_objects.append((np.asarray(points, np.float32), state))
             if state == ACCEPTED:
                 self.accepted_cloud = np.asarray(points, np.float32)
+
+    def log_takeover(self, step, end, entry):
+        """Record the takeover (habitat_evaluation.run_takeover) in the counts (episodes.jsonl "verification"), the step
+        events and takeover.jsonl: accept step, actions, end (stop / cap / episode_over), the navigator's reason
+        (radius / snapped / stagnation / policy) and its last object distance, cloud source and size, start pose."""
+        entry = {"run_index": self.episode.get("run_index"), "episode_id": self.episode.get("episode_id"),
+                 "accept_step": int(step), "end": end, **entry}
+        self.counts.update(takeover=1, takeover_step=int(step), takeover_actions=entry["actions"], takeover_end=end,
+                           takeover_reason=entry.get("reason"),
+                           takeover_object_dist=None if entry.get("object_dist") is None else round(float(entry["object_dist"]), 3))
+        self.events.append({"event": "takeover", **entry})
+        print(f"[verification] takeover at step {step}: {end} ({entry.get('reason')}) after {entry['actions']} actions, "
+              f"object {entry.get('object_dist')} m")
+        if self.log_dir:
+            os.makedirs(self.log_dir, exist_ok=True)
+            with open(os.path.join(self.log_dir, "takeover.jsonl"), "a", encoding="utf-8") as stream:
+                stream.write(json.dumps(entry, default=float) + "\n")
 
     def log_close_in(self, reason, entry):
         """Record the terminal close-in (habitat_evaluation.run_close_in) in the counts, the step events and

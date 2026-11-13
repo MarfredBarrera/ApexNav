@@ -17,7 +17,8 @@ while true; do
   if [ "$mem" -gt "$MAX_MIB" ] || [ "$apps" -gt "$MAX_APPS" ]; then
     echo "$(date +%T) GUARD TRIPPED"
     mkdir -p "$(dirname "$ABORT")" && touch "$ABORT"
-    docker exec apexnav pkill -f habitat_evaluation.py
+    if [ -n "${KILL_OUT_ROOT:-}" ]; then docker exec apexnav /workspace/ApexNav/scripts/kill_run.sh "$KILL_OUT_ROOT"  # only this run's episodes
+    else docker exec apexnav pkill -f habitat_evaluation.py; fi
     exit 1
   fi
   sleep 5

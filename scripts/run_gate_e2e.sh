@@ -48,7 +48,7 @@ export MPPI_GPU=${MPPI_GPU:-0}   # mppi_v15 batched view scoring on the sim GPU 
 TAG=
 if [ -n "$WORKER" ]; then
   export ROS_DOMAIN_ID=$(( ${DOMAIN_BASE:-50} + WORKER ))
-  export APEXNAV_TSP_DIR=/tmp/apexnav_tsp_w$WORKER
+  export APEXNAV_TSP_DIR=/tmp/apexnav_tsp${DOMAIN_BASE:+_d$DOMAIN_BASE}_w$WORKER   # a second run sets its own DOMAIN_BASE
   mkdir -p "$APEXNAV_TSP_DIR"
   TAG="w$WORKER "
   mkdir -p "$OUT_ROOT" && echo $$ > "$OUT_ROOT/.worker$WORKER.pid"   # run_strategy.sh's cleanup TERMs this PID
@@ -58,7 +58,7 @@ fi
 # habitat_evaluation.py logs connection errors and still exits 0, so check first.
 vlm_up() {
   local port
-  for port in 12181 12182 12183 12184; do
+  for port in $(seq ${VLM_PORT_BASE:-12181} $(( ${VLM_PORT_BASE:-12181} + 3 ))); do
     (exec 3<>/dev/tcp/127.0.0.1/$port) 2>/dev/null || { echo "${TAG}VLM server on port $port is down"; return 1; }
   done
 }
@@ -88,7 +88,7 @@ next_episode() {  # pop the first line of $QUEUE (empty output: queue done)
 trap '[ -n "$EVAL" ] && kill "$EVAL" 2>/dev/null; stop_planner; [ -n "$WORKER" ] && rm -f "$OUT_ROOT/.worker$WORKER.pid"' EXIT
 trap 'exit 143' TERM INT
 
-if [ -z "$WORKER" ]; then  # serial: clear any planner in the container
+if [ -z "$WORKER" ] && [ -z "${DOMAIN_BASE:-}" ]; then  # serial: clear any planner in the container (not with DOMAIN_BASE: another run may be live)
   pkill -f exploration.launch.py; pkill -f exploration_node; pkill -f tsp_node; sleep 3
 fi
 mkdir -p "$OUT_ROOT"

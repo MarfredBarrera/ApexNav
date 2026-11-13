@@ -43,6 +43,12 @@
 # CLOSE_IN=1 [CLOSE_IN_BUDGET=12] (any gate strategy): verification.close_in, the terminal close-in: when the planner
 #            STOPs or ends stucking at an object the gate accepted, up to 12 more actions toward the object's points,
 #            then STOP (perception_gate/close_in.py). Off by default; needs LAST_MILE=0 for a clean comparison.
+# RH=1 [RH_K=8] (with TAKEOVER=1): receding-horizon takeover (lastmile/live.py: LASTMILE_RH / LASTMILE_RH_K).
+# APEXWP=1 [APEXWP_MAP=own|apex] (with TAKEOVER=1 RH=1): the DD-PPO pointgoal is a waypoint (<= 1 m) on an ApexNav-style A* path
+#            to the target cloud O (lastmile/apex_astar.py, LASTMILE_APEXWP); map own = the navigator's LocalMap (default).
+# TAKEOVER=1 (any gate strategy): verification.takeover, at the FIRST gate accept lastmile.live's navigator (the bench's
+#            F_full_cur DD-PPO pointnav) drives to the end of the episode (own STOP, else the forced STOP at the cap), never
+#            handing back; episodes.jsonl verification.takeover* record it. Use with LAST_MILE=0 CLOSE_IN=0.
 # REUSE_SERVER=1: keep a running perception server with the same selector (and start one if none runs),
 #            and leave it running on exit, so a driver running blocks of episodes loads the models once;
 #            the driver stops it (lib.sh cleanup).
@@ -75,7 +81,24 @@ case ${CLOSE_IN:-0} in   # CLOSE_IN=1: terminal close-in at an accepted object (
   1|true) close_in=" +verification.close_in=true${CLOSE_IN_BUDGET:+ +verification.close_in_budget=$CLOSE_IN_BUDGET}" ;;
   *) echo "CLOSE_IN must be 0 or 1"; exit 2 ;;
 esac
+case ${TAKEOVER:-0} in   # TAKEOVER=1: at the first gate accept the bench's last-mile navigator (lastmile/live.py) drives to the end
+  0|false) takeover= ;;
+  1|true) takeover=" +verification.takeover=true" ;;
+  *) echo "TAKEOVER must be 0 or 1"; exit 2 ;;
+esac
+case ${RH:-0} in   # RH=1 [RH_K=8] (with TAKEOVER=1): receding-horizon last mile (lastmile/live.py, LASTMILE_RH)
+  0|false) rh= ;;
+  1|true) rh=" LASTMILE_RH=1${RH_K:+ LASTMILE_RH_K=$RH_K}" ;;
+  *) echo "RH must be 0 or 1"; exit 2 ;;
+esac
+case ${APEXWP:-0} in   # APEXWP=1 [APEXWP_MAP=own|apex] (with TAKEOVER=1 RH=1): ApexNav-style A* waypoints for the DD-PPO pointgoal (lastmile/apex_astar.py)
+  0|false) apexwp= ;;
+  1|true) apexwp=" LASTMILE_APEXWP=1${APEXWP_MAP:+ LASTMILE_APEXWP_MAP=$APEXWP_MAP}${APEXWP_DUMP:+ LASTMILE_APEXWP_DUMP=$APEXWP_DUMP}" ;;
+  *) echo "APEXWP must be 0 or 1"; exit 2 ;;
+esac
 DEV=3dawareverification-dev-1
+PPORT=${PERCEPTION_PORT:-8770}  # perception server port (a second concurrent run sets its own)
+# a second concurrent run also sets VLM_PORT_BASE, DOMAIN_BASE (ROS domain base) and SESSION (see run_parallel.sh)
 APEX=/home/marfred/codes/ApexNav
 AV=/home/marfred/codes/3DAwareVerification
 case $STRAT in
@@ -98,7 +121,8 @@ case $STRAT in
   d1) mode=gate; flags="--selector d1 --d1-evidence ${D1_EVIDENCE:-grid}${D1_ACCEPT_MIN:+ --d1-accept-min $D1_ACCEPT_MIN}${D1_STAGGER:+ --stagger}"; eval_args="verification.approach=true verification.on_error=reject"; approach=true ;;
   *) echo "unknown strategy $STRAT"; exit 2 ;;
 esac
-[ $mode = gate ] && eval_args="$eval_args$no_evidence$close_in"
+[ $mode = gate ] && eval_args="$eval_args$no_evidence$close_in$takeover"
+[ $mode = gate ] && [ -n "${PERCEPTION_PORT:-}" ] && eval_args="$eval_args verification.url=http://$DEV:$PPORT"
 root=$APEX/videos/$NAME
 mkdir -p $root
 if [ -f $root/ABORT ]; then echo "$root/ABORT exists"; exit 1; fi
@@ -119,16 +143,12 @@ cleanup() {
     [ -f "$f" ] && docker exec apexnav kill -TERM "$(cat "$f")" 2>/dev/null
     rm -f "$f"
   done
-  docker exec apexnav pkill -f run_gate_e2e.sh
+  docker exec apexnav /workspace/ApexNav/scripts/kill_run.sh videos/$NAME   # only this run's workers (a second run may be live)
   [ -n "$child" ] && kill $child 2>/dev/null
   [ -n "$guard" ] && kill $guard 2>/dev/null
-  pkill -f "gpu_guard.sh $GPU" 2>/dev/null
-  if [ "${REUSE_SERVER:-0}" != 1 ]; then
-    docker exec $DEV pkill -f "perception.server"
-    docker exec $DEV pkill -f "perception.worker"
-  fi
-  docker exec apexnav pkill -f habitat_evaluation.py
-  docker exec apexnav pkill -f 'exploration.launch.py|exploration_node|tsp_node'
+  pkill -f "gpu_guard.sh $GPU " 2>/dev/null
+  [ "${REUSE_SERVER:-0}" != 1 ] && kill_server
+  docker exec apexnav /workspace/ApexNav/scripts/kill_run.sh videos/$NAME   # backstop: this run's episode, planner nodes
 }
 trap cleanup EXIT
 trap 'exit 130' INT TERM
@@ -143,29 +163,38 @@ trap 'exit 130' INT TERM
   echo "planner $(stat -c '%y' $APEX/build/exploration_manager/exploration_node)"
 } >> $root/versions.txt
 
-ping_server() { docker exec $DEV sam3d-env core python -m perception.server ping http://localhost:8770 2>/dev/null; }
+ping_server() { docker exec $DEV sam3d-env core python -m perception.server ping http://localhost:$PPORT 2>/dev/null; }
+# stop the perception server on port $PPORT and its workers, by PID (never another run's server)
+kill_server() {
+  local pids p w
+  pids=$(docker exec $DEV pgrep -f "^python -m perception.server --host 0.0.0.0 --port $PPORT ")
+  for p in $pids; do
+    w=$(docker exec $DEV pgrep -P $p); docker exec $DEV kill $p; sleep 20  # the server stops its workers
+    for q in $w; do docker exec $DEV kill $q 2>/dev/null; done
+  done
+}
 selector=$(echo "$flags" | awk '{print $2}')  # flags start with --selector <name>
 if [ $mode = gate ] && [ "${REUSE_SERVER:-0}" = 1 ] && ping_server | grep -q "\"selector\": \"$selector\""; then
   echo "$(date +%T) $NAME: reusing the running server ($flags)"
 elif [ $mode = gate ]; then
-  docker exec $DEV pkill -f "perception.server"; docker exec $DEV pkill -f "perception.worker"; sleep 5
+  kill_server; sleep 5
   log=outputs/apexnav_online/server_$NAME
   echo "$(date +%T) $NAME: starting server ($flags)"
   docker exec $DEV mkdir -p /workspace/$log
-  docker exec -d ${ALLOC_CONF:+-e PYTORCH_CUDA_ALLOC_CONF=$ALLOC_CONF} $DEV bash -lc "cd /workspace && OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 sam3d-env core python -m perception.server --host 0.0.0.0 --port 8770 --gpu $GPU $flags --log-dir $log >> $log/server.out 2>&1"
+  docker exec -d ${ALLOC_CONF:+-e PYTORCH_CUDA_ALLOC_CONF=$ALLOC_CONF} $DEV bash -lc "cd /workspace && OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 sam3d-env core python -m perception.server --host 0.0.0.0 --port $PPORT --gpu $GPU $flags --log-dir $log >> $log/server.out 2>&1"
   for i in $(seq 90); do  # jev_sam3: JEV int8 from local disk
     ping_server >/dev/null && break
     sleep 10
   done
   ping_server >/dev/null || { echo "$NAME: server did not come up"; exit 1; }
 else
-  docker exec $DEV pkill -f "perception.server"; docker exec $DEV pkill -f "perception.worker"; sleep 5
+  kill_server; sleep 5
   echo "$(date +%T) $NAME: no gate"
 fi
 # compute apps: 4 VLM servers + 2 perception workers + one per simulator that runs the MPPI approach on the GPU
-(cd $APEX && ABORT=$root/ABORT ./scripts/gpu_guard.sh $GPU ${GUARD_MAX_MIB:-45500} ${GUARD_MAX_APPS:-$((7 + WORKERS))} >> $root/gpu_guard.log 2>&1) &
+(cd $APEX && ABORT=$root/ABORT KILL_OUT_ROOT=videos/$NAME ./scripts/gpu_guard.sh $GPU ${GUARD_MAX_MIB:-45500} ${GUARD_MAX_APPS:-$((7 + WORKERS))} >> $root/gpu_guard.log 2>&1) &
 guard=$!
-env="DATASET=$DATASET SIM_GPU=$GPU SYNC_STEP=$SYNC APPROACH=$approach OUT_ROOT=videos/$NAME EVAL_ARGS='$eval_args'${MPPI_GPU:+ MPPI_GPU=$MPPI_GPU}"
+env="DATASET=$DATASET SIM_GPU=$GPU SYNC_STEP=$SYNC APPROACH=$approach OUT_ROOT=videos/$NAME EVAL_ARGS='$eval_args'${MPPI_GPU:+ MPPI_GPU=$MPPI_GPU}$rh$apexwp${VLM_PORT_BASE:+ VLM_PORT_BASE=$VLM_PORT_BASE}${DOMAIN_BASE:+ DOMAIN_BASE=$DOMAIN_BASE}"
 if [ "$WORKERS" -le 1 ]; then
   docker exec apexnav bash -c "cd /workspace/ApexNav && $env ./scripts/run_gate_e2e.sh $mode ${todo[*]} >> videos/$NAME/run_gate.log 2>&1" &
   child=$!
