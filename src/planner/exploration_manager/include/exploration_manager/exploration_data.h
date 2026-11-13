@@ -70,7 +70,6 @@ struct FSMData {
     ap_standoff_ = false;
     verify_arrival_ = false;
     verify_approach_id_ = 0;
-    verify_stuck_ = false;
     ap_face_turns_ = 0;
     stop_face_pending_ = false;
   }
@@ -127,7 +126,6 @@ struct FSMData {
   bool ap_standoff_;             // the approach arrived at the standoff, not at the object
   bool verify_arrival_;          // the pending request is the approach's arrival (at the stop)
   int verify_approach_id_;       // the pending request is about this approach (0: ordinary)
-  bool verify_stuck_;            // ... ended because the agent got stuck: stop after the verdict
   int ap_face_turns_;            // turns toward the object after reaching it
   bool stop_face_pending_;  // the backstop turned to face the object; verify at the next step
 };

@@ -25,5 +25,6 @@ int32 max_steps            # actions the planner may spend on this approach
 # Approach run outside the planner (gate approach_planner mppi/closer, sync_step only): the gate drove the
 # agent itself and answers the original request with state 1 / -1 and resume_step = the last executed step.
 # The planner first integrates every step up to resume_step (their StepObservations), then replans from the
-# new pose; on accept the cluster becomes its forced target, so its object navigation goes on to it and stops.
+# new pose. After an accept the gate also drives the last mile and stops the episode itself; an accept with
+# resume_step means its last mile gave up far from the object: the cluster is accepted, not a forced target.
 int32 resume_step          # 0: an ordinary reply

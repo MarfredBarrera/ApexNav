@@ -36,19 +36,45 @@
 #            active_approach's footprint MPPI or the straight-line closer on the agent's own local map) with the
 #            decide.py flow (JEV naming belief -> P(consistent) >= 0.8 -> fused SAM3 over the nearest views);
 #            needs sync true
+#            LAST_MILE=0 (with APPROACH_PLANNER): after an accept the gate does not drive the last mile itself;
+#            ApexNav's own navigation goes on to the accepted cluster (not forced). Default 1 (last mile on).
+# NO_EVIDENCE=accept|reject|defer (any gate strategy): verification.on_no_evidence, the verdict on a cluster without a
+#            stored view; defer: ApexNav goes on to it and the stop re-verifies it. Unset: the yaml (accept).
+# CLOSE_IN=1 [CLOSE_IN_BUDGET=12] (any gate strategy): verification.close_in, the terminal close-in: when the planner
+#            STOPs or ends stucking at an object the gate accepted, up to 12 more actions toward the object's points,
+#            then STOP (perception_gate/close_in.py). Off by default; needs LAST_MILE=0 for a clean comparison.
 # REUSE_SERVER=1: keep a running perception server with the same selector (and start one if none runs),
 #            and leave it running on exit, so a driver running blocks of episodes loads the models once;
 #            the driver stops it (lib.sh cleanup).
 # DATASET (default hm3dv2) is passed to habitat_evaluation.py --dataset.
+# WORKERS=N (default 1): N episode workers in parallel (run_gate_e2e.sh WORKER=1..N, each with its own simulator,
+#            planner and ROS_DOMAIN_ID) take the episodes from the shared queue videos/<name>/queue; all share the four
+#            VLM servers and the perception server. scripts/run_parallel.sh is the driver.
 # Needs the four VLM servers (scripts/start_session.sh); does not start or stop them.
 # On any exit it stops the perception server/workers, its gpu_guard and any episode or
 # planner still running. Each start appends the code versions to videos/<name>/versions.txt.
 set -u
 STRAT=${1:?strategy}; NAME=${2:?name}; SYNC=${3:?sync}; shift 3
 GPU=${GPU:-0}
+WORKERS=${WORKERS:-1}
 DATASET=${DATASET:-hm3dv2}
 eval_args=
 approach=false
+case ${LAST_MILE:-1} in   # LAST_MILE=0: no gate last mile after an accept (needs APPROACH_PLANNER)
+  1|true) last_mile= ;;
+  0|false) last_mile=" +verification.last_mile=false" ;;
+  *) echo "LAST_MILE must be 0 or 1"; exit 2 ;;
+esac
+case ${NO_EVIDENCE:-} in   # NO_EVIDENCE=defer: a cluster without a stored view is re-verified at the stop
+  '') no_evidence= ;;
+  accept|reject|defer) no_evidence=" verification.on_no_evidence=$NO_EVIDENCE" ;;
+  *) echo "NO_EVIDENCE must be accept, reject or defer"; exit 2 ;;
+esac
+case ${CLOSE_IN:-0} in   # CLOSE_IN=1: terminal close-in at an accepted object (any gate strategy)
+  0|false) close_in= ;;
+  1|true) close_in=" +verification.close_in=true${CLOSE_IN_BUDGET:+ +verification.close_in_budget=$CLOSE_IN_BUDGET}" ;;
+  *) echo "CLOSE_IN must be 0 or 1"; exit 2 ;;
+esac
 DEV=3dawareverification-dev-1
 APEX=/home/marfred/codes/ApexNav
 AV=/home/marfred/codes/3DAwareVerification
@@ -67,11 +93,12 @@ case $STRAT in
         eval_args="verification.approach=true verification.on_error=reject +verification.multiview=true +verification.multiview_grid=$grid${MV_VARIANT:+ +verification.multiview_variant=$MV_VARIANT}${MV_ARGS:+ $MV_ARGS}"
         approach=true ;;
   jev_sam3) mode=gate; flags="--selector jev_sam3"
-       eval_args="verification.approach=true verification.on_error=reject +verification.multiview=true +verification.multiview_grid=false +verification.multiview_sam3=never +verification.multiview_min_views=1${APPROACH_PLANNER:+ +verification.approach_planner=$APPROACH_PLANNER}${MV_ARGS:+ $MV_ARGS}"
+       eval_args="verification.approach=true verification.on_error=reject +verification.multiview=true +verification.multiview_grid=false +verification.multiview_sam3=never +verification.multiview_min_views=1${APPROACH_PLANNER:+ +verification.approach_planner=$APPROACH_PLANNER}$last_mile${MV_ARGS:+ $MV_ARGS}"
        approach=true ;;
   d1) mode=gate; flags="--selector d1 --d1-evidence ${D1_EVIDENCE:-grid}${D1_ACCEPT_MIN:+ --d1-accept-min $D1_ACCEPT_MIN}${D1_STAGGER:+ --stagger}"; eval_args="verification.approach=true verification.on_error=reject"; approach=true ;;
   *) echo "unknown strategy $STRAT"; exit 2 ;;
 esac
+[ $mode = gate ] && eval_args="$eval_args$no_evidence$close_in"
 root=$APEX/videos/$NAME
 mkdir -p $root
 if [ -f $root/ABORT ]; then echo "$root/ABORT exists"; exit 1; fi
@@ -86,7 +113,12 @@ done
 
 guard=; child=
 cleanup() {
-  # the episode loop runs inside the container and outlives its docker exec client
+  # the episode loop runs inside the container and outlives its docker exec client; parallel workers get a TERM by
+  # PID first (each then stops its own episode and planner), the pkills below are the backstop
+  for f in $root/.worker*.pid; do
+    [ -f "$f" ] && docker exec apexnav kill -TERM "$(cat "$f")" 2>/dev/null
+    rm -f "$f"
+  done
   docker exec apexnav pkill -f run_gate_e2e.sh
   [ -n "$child" ] && kill $child 2>/dev/null
   [ -n "$guard" ] && kill $guard 2>/dev/null
@@ -102,7 +134,7 @@ trap cleanup EXIT
 trap 'exit 130' INT TERM
 
 {
-  echo "== $(date -Is) $STRAT ($mode) dataset=$DATASET sync=$SYNC gpu=$GPU flags='$flags' eval_args='$eval_args'"
+  echo "== $(date -Is) $STRAT ($mode) dataset=$DATASET sync=$SYNC gpu=$GPU workers=$WORKERS flags='$flags' eval_args='$eval_args'"
   echo "episodes: ${todo[*]}"
   echo "ApexNav $(git -C $APEX rev-parse --abbrev-ref HEAD) $(git -C $APEX rev-parse HEAD)"
   git -C $APEX status --short
@@ -130,10 +162,22 @@ else
   docker exec $DEV pkill -f "perception.server"; docker exec $DEV pkill -f "perception.worker"; sleep 5
   echo "$(date +%T) $NAME: no gate"
 fi
-(cd $APEX && ABORT=$root/ABORT ./scripts/gpu_guard.sh $GPU ${GUARD_MAX_MIB:-45500} ${GUARD_MAX_APPS:-8} >> $root/gpu_guard.log 2>&1) &
+# compute apps: 4 VLM servers + 2 perception workers + one per simulator that runs the MPPI approach on the GPU
+(cd $APEX && ABORT=$root/ABORT ./scripts/gpu_guard.sh $GPU ${GUARD_MAX_MIB:-45500} ${GUARD_MAX_APPS:-$((7 + WORKERS))} >> $root/gpu_guard.log 2>&1) &
 guard=$!
-docker exec apexnav bash -c "cd /workspace/ApexNav && DATASET=$DATASET SIM_GPU=$GPU SYNC_STEP=$SYNC APPROACH=$approach OUT_ROOT=videos/$NAME EVAL_ARGS='$eval_args' ./scripts/run_gate_e2e.sh $mode ${todo[*]} >> videos/$NAME/run_gate.log 2>&1" &
-child=$!
+env="DATASET=$DATASET SIM_GPU=$GPU SYNC_STEP=$SYNC APPROACH=$approach OUT_ROOT=videos/$NAME EVAL_ARGS='$eval_args'${MPPI_GPU:+ MPPI_GPU=$MPPI_GPU}"
+if [ "$WORKERS" -le 1 ]; then
+  docker exec apexnav bash -c "cd /workspace/ApexNav && $env ./scripts/run_gate_e2e.sh $mode ${todo[*]} >> videos/$NAME/run_gate.log 2>&1" &
+  child=$!
+else
+  printf '%s\n' "${todo[@]}" > $root/queue
+  rm -f $root/queue.lock $root/.worker*.pid
+  for k in $(seq $WORKERS); do
+    docker exec apexnav bash -c "cd /workspace/ApexNav && WORKER=$k QUEUE=videos/$NAME/queue $env ./scripts/run_gate_e2e.sh $mode >> videos/$NAME/run_gate.log 2>&1" &
+    child="$child $!"
+    sleep ${WORKER_STAGGER:-3}   # spread the simulator starts
+  done
+fi
 wait $child  # in the background so a TERM runs cleanup now, not after the run
 done_n=0; for n in "${todo[@]}"; do [ -f $root/$mode/epi$n/episodes.jsonl ] && done_n=$((done_n+1)); done
 echo "$(date +%T) $NAME: finished $done_n/${#todo[@]} episodes"

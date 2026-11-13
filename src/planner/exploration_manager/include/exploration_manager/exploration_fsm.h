@@ -145,6 +145,7 @@ private:
   void publishObjectFusionState();
   void finishPlanning();
   bool needsVerification();
+  void resetStuckCounters();
   bool needsStopVerification(int& cluster_id, Vector2d& pos);
   void requestVerification(int cluster_id, const Vector2d& pos, bool at_stop, int approach_id = 0,
       int viewpoint_status = 0);

@@ -319,11 +319,22 @@ void ExplorationFSM::finishPlanning()
     transitState(ROS_STATE::FINISH, "FSM");
 }
 
+// Not while escaping a wedge: the escape actions go first, the request comes once they are over
+// (an approach would otherwise replace the escape)
 bool ExplorationFSM::needsVerification()
 {
   int id = expl_manager_->ed_->target_cluster_id_;
-  return verification_enabled_ && fd_->final_result_ == FINAL_RESULT::SEARCH_OBJECT && id >= 0 &&
+  return verification_enabled_ && !fd_->escape_stucking_flag_ &&
+         fd_->final_result_ == FINAL_RESULT::SEARCH_OBJECT && id >= 0 &&
          expl_manager_->object_map2d_->getVerification(id) == 0;
+}
+
+// Approach actions are not ApexNav's own steps: its stuck counters restart when an approach starts and
+// when it ends, so only ApexNav's own failed steps can end an episode as STUCKING
+void ExplorationFSM::resetStuckCounters()
+{
+  fd_->stucking_action_count_ = 0;
+  fd_->stucking_next_pos_count_ = 0;
 }
 
 // Backstop at the stop itself: every stop path (incl. over-depth targets, which
@@ -409,16 +420,15 @@ void ExplorationFSM::finishVerification(int state, bool timed_out)
   int id = fd_->verify_cluster_id_;
   auto obj_map = expl_manager_->object_map2d_;
   bool approach = fd_->verify_approach_id_ > 0, arrival = fd_->verify_arrival_;
-  bool stuck = fd_->verify_stuck_;
   // Accepted at the standoff: not at the object yet, so ApexNav's object navigation goes on to it
   // (as after an accept on the way) and stops there; the accepted cluster is not asked again
   bool standoff = arrival && fd_->ap_standoff_;
   fd_->ap_standoff_ = false;
   fd_->verify_approach_id_ = 0;
   fd_->verify_arrival_ = false;
-  fd_->verify_stuck_ = false;
   if (approach || (id >= 0 && expl_manager_->forced_cluster_id_ == id)) {
     fd_->ap_active_ = false;
+    resetStuckCounters();
     if (state != 1) {
       expl_manager_->forced_cluster_id_ = -1;
       fd_->stop_face_pending_ = false;  // a rejected approach is not verified at the stop
@@ -442,11 +452,6 @@ void ExplorationFSM::finishVerification(int state, bool timed_out)
         state == 1 ? "ACCEPTED" : state == 2 ? "DEFERRED" : "REJECTED",
         fd_->verify_at_stop_ ? " [at stop]" : "");
   publishObjectFusionState();
-  if (stuck) {  // the approach ended because the agent is stuck: give up as without the gate
-    fd_->final_result_ = FINAL_RESULT::STUCKING;
-    finishPlanning();
-    return;
-  }
   if ((state == 1 || state == 2) && (!approach || arrival) && !(state == 1 && standoff)) {
     finishPlanning();
     return;
@@ -514,18 +519,23 @@ void ExplorationFSM::verificationResultCallback(
   finishVerification(msg->state == 1 || msg->state == 2 ? msg->state : -1, false);
 }
 
-// The verdict after an approach the gate drove itself (VerificationResult.resume_step): the agent stands
-// elsewhere now, so the action planned before the request is dropped. Plan anew once the map has integrated
-// every approach step; on accept the cluster is the forced target (object navigation goes on to it and stops,
-// as after an accept at the standoff), on reject it is dropped as usual.
+// The verdict after the gate drove the agent itself (VerificationResult.resume_step: its approach and, after an
+// accept, its own last mile to the object): the agent stands elsewhere now, so the action planned before the
+// request is dropped. Plan anew once the map has integrated every step the gate took. An accept reaches the
+// planner only when the gate's last mile gave up far from the object: the cluster is accepted but not a forced
+// target, so ApexNav's own selection may go on to it or drop it if it is unreachable; on reject it is dropped
+// as usual. The gate's steps were not ApexNav's: its stuck counters restart.
 void ExplorationFSM::finishExternalApproach(int state, int resume_step)
 {
   int id = fd_->verify_cluster_id_;
   awaited_step_ = std::max(awaited_step_, resume_step);
   finishVerification(state, false);  // map bookkeeping; a reject already replans (PLAN_ACTION)
-  if (state == 1 && id >= 0) {
-    expl_manager_->forced_cluster_id_ = id;
-    fd_->final_result_ = FINAL_RESULT::SEARCH_OBJECT;
+  resetStuckCounters();
+  if (state == 1) {
+    if (id >= 0 && expl_manager_->forced_cluster_id_ == id)
+      expl_manager_->forced_cluster_id_ = -1;
+    fd_->stop_face_pending_ = false;
+    fd_->final_result_ = FINAL_RESULT::EXPLORE;  // no reach check against a next_pos_ planned elsewhere
     fd_->skip_stuck_check_once_ = true;
     transitState(ROS_STATE::PLAN_ACTION, "Verification (external approach)");
   }
@@ -588,7 +598,7 @@ void ExplorationFSM::startApproach(const plan_env::msg::VerificationResult& msg)
   bool resume = fd_->verify_approach_id_ > 0;
   fd_->verify_approach_id_ = 0;
   fd_->verify_arrival_ = false;
-  fd_->verify_stuck_ = false;
+  if (!resume) resetStuckCounters();
   if (!resume || msg.approach_id != fd_->ap_approach_id_ || msg.cluster_id != fd_->ap_cluster_id_)
     fd_->ap_steps_ = 0;
   fd_->ap_face_turns_ = 0;
@@ -648,9 +658,8 @@ bool ExplorationFSM::checkApproach()
     return true;
   }
   if (fd_->final_result_ == FINAL_RESULT::STUCKING) {
-    // The episode still ends as without the gate (give-up stops are not verified), but the
-    // approach gets an outcome first (aborted -> rejected)
-    fd_->verify_stuck_ = true;
+    // Stuck within the approach: it ends as aborted (the gate decides; no evidence -> deferred) and the
+    // episode goes on, the stuck counters restarted (finishVerification), so ApexNav's own escape logic runs
     endApproach(3, "stuck");
     return true;
   }

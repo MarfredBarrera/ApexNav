@@ -335,9 +335,7 @@ class Mppi:
             self.vox = VoxelMap(np.asarray(obs.position)[[0, 2]], obs.floor_y)
         self.vox.update(np.asarray(obs.depth), np.asarray(obs.mask, bool), obs.position, obs.yaw)
         if self.prev is not None and self.prev[2] == "move_forward":   # blocked step: mark the cell ahead
-            moved = float(np.hypot(*(np.asarray(obs.position) - self.prev[0])[[0, 2]]))
-            if moved < 0.5 * S.FORWARD_M:
-                pf.lmap.bump(self.prev[0], self.prev[1])
+            if pf.lmap.forward_feedback(self.prev[0], self.prev[1], obs.position):
                 pf.refresh(obs.position)
         if self.done or not len(obs.cloud) or not hasattr(pf, "lmap"):
             self.last = {"stop": "no_object" if not len(obs.cloud) else "done"}
@@ -513,9 +511,7 @@ class MppiV2(Mppi):
             self.vox = VoxelMap(np.asarray(obs.position)[[0, 2]], obs.floor_y)
         self.vox.update(np.asarray(obs.depth), mask, obs.position, obs.yaw)
         if self.prev is not None and self.prev[2] == "move_forward":
-            moved = float(np.hypot(*(np.asarray(obs.position) - self.prev[0])[[0, 2]]))
-            if moved < 0.5 * S.FORWARD_M:
-                pf.lmap.bump(self.prev[0], self.prev[1])
+            if pf.lmap.forward_feedback(self.prev[0], self.prev[1], obs.position):
                 pf.refresh(obs.position)
         if self.done or not len(obs.cloud) or not hasattr(pf, "lmap"):
             self.last = {"stop": "no_object" if not len(obs.cloud) else "done"}
@@ -764,9 +760,7 @@ class MppiV4(MppiV3):
             self.vox = VoxelMap(np.asarray(obs.position)[[0, 2]], obs.floor_y)
         self.vox.update(np.asarray(obs.depth), mask, obs.position, obs.yaw)
         if self.prev is not None and self.prev[2] == "move_forward":
-            moved = float(np.hypot(*(np.asarray(obs.position) - self.prev[0])[[0, 2]]))
-            if moved < 0.5 * S.FORWARD_M:
-                pf.lmap.bump(self.prev[0], self.prev[1])
+            if pf.lmap.forward_feedback(self.prev[0], self.prev[1], obs.position):
                 pf.refresh(obs.position)
         if self.done or not len(obs.cloud) or not hasattr(pf, "lmap"):
             self.last = {"stop": "no_object" if not len(obs.cloud) else "done"}
@@ -1020,9 +1014,7 @@ class MppiV9(MppiV5):
             self.vox = VoxelMap(np.asarray(obs.position)[[0, 2]], obs.floor_y)
         self.vox.update(np.asarray(obs.depth), mask, obs.position, obs.yaw)
         if self.prev is not None and self.prev[2] == "move_forward":
-            moved = float(np.hypot(*(np.asarray(obs.position) - self.prev[0])[[0, 2]]))
-            if moved < 0.5 * S.FORWARD_M:
-                pf.lmap.bump(self.prev[0], self.prev[1])
+            if pf.lmap.forward_feedback(self.prev[0], self.prev[1], obs.position):
                 pf.refresh(obs.position)
         if self.done or not len(obs.cloud) or not hasattr(pf, "lmap"):
             self.last = {"stop": "no_object" if not len(obs.cloud) else "done"}
@@ -1183,42 +1175,60 @@ def _tukey(x, a):
 
 
 class MppiV15(MppiV10):
-    """The view planner (2026-11-09; v12 -> v14 (user's design) -> v15, Stage B 99/104 = v11 with fewer actions,
-    subset B 103/120 best). One MPPI, one value, no phases and no triggers.
-    - Object model = mass: the fused cloud voxel-thinned (one point per 5 cm voxel, about equal surface each), plus
-      mass-matched phantoms over extents never seen: top (until a frame shows the top inside the image) up to
-      max(seen top + TOP_PAD, bottom + category height prior), bottom down to max(floor, top - prior), and the sides
-      cut in the latest frame (missing width from the width prior). A phantom band gets (missing extent / seen
-      extent) of the points.
-    - View score, per pose (torch-batched): every model point p with area a_p projects to (u, v) with window weight
-      w = tukey(u / W) tukey(v / H) (1 in the central 1 - 2 WIN of each axis) and visibility o (ray through the own
-      3D voxel map); C = sum a o w / sum a (fraction of the object's surface well inside the frame), size = sum of
-      the in-window projected areas a f^2 / z^2 / image area, J = sat(size) x C^KAPPA x facing: the optimum is the
-      largest view that keeps the whole object in the window.
-    - Value of a plan: the flow may decide at any usable facing frame on the way, each with P_COMMIT (measured in
-      Stage B: it committed at 33 % of the first admitted frames after the start, 22 % of all), so stopping at t is
-      worth the expected log J of the frame the decision is made on, A_t + S_t log J_t (S_t = P(no decision before t)),
-      minus C_ACT t and C_BUMP bumps, minus w W_REF track(closer's reference): closer's planned drive (its next action
-      from Closer + LocalController, then the lattice descent to its goal) matters far out, w = clip(d_goal / D_BLEND)
-      and non-increasing over the episode (a deliberate back-off for the view never hands control back to closer).
-    - Biased-MPPI sampler (Trevisan & Alonso-Mora 2024), horizon H. Seeds: path-followed lattice paths (both ways round)
-      to ring proposals that can be reached and faced from within H (bearings every 15 deg, RADII beyond the near face;
-      the 3D visibility in the score decides occlusion, a 2D line of sight rejected raised objects over furniture),
-      the best 2 N_PROP by rollout value; closer's drive and goal pose; the shifted last plan (kept unless beaten by
-      DELTA); stay; face-it. Samples perturb the seeds and the softmax-updated categorical.
-    - The best sequence is executed; it stops when staying is within DELTA of the best plan (staying deviates from
-      the reference while far, so no early stop out there)."""
+    """View-aware MPPI approach planner (2026-11-09; Stage B 99/104, second subset 103/120). One cost, minimized over
+    action rollouts; no phases and no triggers.
+
+    Terms
+    - rollout: an action sequence of horizon H on the lattice (F 0.25 m, L / R 30 deg, S stay; S is absorbing),
+      simulated on the agent's own occupancy grid to poses p_0 .. p_H (p_0 the current pose).
+    - warm-start trajectory: the rollout of the naive approach behaviour (selfcontained.Closer + LocalController: drive
+      to a fit distance and face the object), recomputed every step; its goal pose g is also a proposal.
+    - view quality of a pose, J(p) = sat(size) * completeness^KAPPA * centeredness, with view cost c(p) = -log J(p):
+      * object model: the fused cloud voxel-thinned (one point per 5 cm voxel, area a each) plus phantom points over
+        extents a frame cut and no frame has shown since (top / bottom / sides, sized by the category priors
+        round3.PRIORS, mass proportional to the missing extent);
+      * completeness: sum a * o * w / sum a, the fraction of the object's area projected inside a Tukey window
+        (w = 1 in the central 1 - 2 WIN of each image axis) and unoccluded (o: ray through the own voxel map);
+      * size: in-window projected area / image area, saturated as size / (size + S0);
+      * centeredness: 1 within 15 deg of the object's bearing, Gaussian falloff (10 deg) beyond.
+      Moving in raises size and lowers completeness; the minimum is the largest view that keeps the whole object.
+
+    Cost of a rollout (to minimize). For stopping at step t,
+        cost_t = sum_{s<t} q_s R_s c(p_s) + R_t c(p_t) + C_ACT t,
+      where q_s = P_COMMIT for a usable frame (facing within FACE_DEG and visible) and 0 otherwise (q_0 = 0, the
+      current frame is already seen) and R_s = prod_{r<s} (1 - q_r) is the probability that no decision was made
+      before s: the expected view cost of the frame the decision flow commits on (P_COMMIT 0.3, measured: the flow
+      committed at 33 % of first admitted frames, 22 % of all). Then
+        cost = min_t cost_t + C_BUMP bumps + w W_REF track,
+      track = mean_s (|p_s - p^ws_s|^2 / SIG_P^2 + wrap(yaw_s - yaw^ws_s)^2 / SIG_Y^2) against the warm-start
+      trajectory, w = clip(|g - p_0| / D_BLEND, 0, 1) and non-increasing over the episode (it guides the far-out
+      approach; a deliberate back-off for the view never hands control back to it). t* = argmin_t cost_t.
+
+    Optimizer (Biased-MPPI, Trevisan & Alonso-Mora 2024): K rollouts per iteration, ITERS iterations, half perturbed
+    around warm starts (keep each action with 1 - EPS), half from the softmax-updated per-step action distribution
+    (weights exp(-(cost - min cost) / LAMBDA)). Warm starts: path-following rollouts to ring proposals (bearings every
+    15 deg, RADII beyond the near face, reachable and faceable within H; both turn directions; the 2 N_PROP with the
+    lowest cost of 3 N_PROP), the warm-start trajectory and its goal g, the previous rollout shifted (preferred unless
+    beaten by DELTA), stay, and turn-to-face.
+    Execution: the first action of the lowest-cost rollout; stop when staying costs less than DELTA_eff more than it
+    (turning to face first if needed). Uncertainty-aware stop (2026-11-09): an extra action for a better view is worth
+    more while the verdict is open (value of information ~ 1 - p), so DELTA_eff = DELTA (1 - P_STAR) / (1 - p),
+    clipped to [0.2, 3] DELTA, with p = the decision belief's P(consistent) (obs.meta["p_consistent"], given by
+    perception_gate.approach.LiveApproach; 0 before any counted frame); DELTA at p = P_STAR. Without the key (the
+    offline harness run.py) DELTA_eff = DELTA. The previous-rollout hysteresis in plan() keeps DELTA."""
     name = "mppi_v15"
     H, K, ITERS, EPS = 16, 256, 3, 0.15
     KAPPA, WIN, TOP_PAD, SIDE_PAD, EDGE, SEEN_PAD = 2.0, 0.1, 0.2, 0.2, 4, 0.15
     LOOK, S0 = 0.4, 0.05
     N_POINTS, N_PROP, RADII = 400, 6, (0.5, 0.8, 1.1, 1.5, 2.0, 2.6)
     P_COMMIT, DELTA, C_ACT = 0.3, 0.1, 0.02
+    P_STAR = 0.8                     # decide.DEFAULTS["P_STAR"], the decision flow's commit threshold: DELTA_eff = DELTA there
+    C_MAX = -math.log(1.5e-3)        # a pose whose view cost exceeds this is not a usable frame
 
     def reset(self, ctx):
         super().reset(ctx)
         self.top_seen, self.bot_seen, self.top_cut, self.bot_cut = False, False, False, False
-        self.side_ph, self.plan_seq, self._w_cap = None, None, 1.0
+        self.side_ph, self.prev_rollout, self._w_cap = None, None, 1.0
         import os
         import torch
         g = os.environ.get("MPPI_GPU")
@@ -1250,22 +1260,22 @@ class MppiV15(MppiV10):
             self.bot_seen = True
 
     def act(self, obs):
-        self._w, self._ref_poses = 0.0, None
+        """Recompute the warm-start trajectory and its weight, then plan."""
+        self._w, self._ws_seq, self._ws_poses, self._ws_goal = 0.0, None, None, None
         self.cut_flags(obs)
-        self._ref, self._extra_goals = None, []
         cloud = np.asarray(obs.cloud)
         if len(cloud) and hasattr(obs.pathfinder, "lmap") and not self.done:
             here = np.asarray(obs.position)[[0, 2]].astype(float)
             center = G.ObjectModel(cloud, obs.floor_y).center
             H = max(1, min(self.H, obs.remaining))
             try:
-                ref, g = MppiV10.reference(self, obs, here, center, H)
+                seq, g = MppiV10.reference(self, obs, here, center, H)   # naive approach: next action + descent to g
             except Exception:
-                ref, g = None, None
-            if ref is not None and not (ref == self.STAY).all() and g is not None and np.isfinite(g).all():
-                self._ref, self._extra_goals = ref, [g]
+                seq, g = None, None
+            if seq is not None and not (seq == self.STAY).all() and g is not None and np.isfinite(g).all():
+                self._ws_seq, self._ws_goal = seq, g
                 self._w = float(np.clip(np.hypot(*(g - here)) / self.D_BLEND, 0.0, 1.0))
-                self._ref_poses = self.rollout(ref[None], here, obs.yaw, obs.pathfinder)[0][0]
+                self._ws_poses = self.rollout(seq[None], here, obs.yaw, obs.pathfinder)[0][0]
         self._w = self._w_cap = min(self._w, self._w_cap)
         return self.view_act(obs)
 
@@ -1360,8 +1370,8 @@ class MppiV15(MppiV10):
             out.append((~blocked).float())
         return torch.cat(out)
 
-    def score_poses(self, poses):
-        """log J for poses (M, 3) (x, z, yaw), numpy in and out."""
+    def view_cost(self, poses):
+        """View cost c = -log J for poses (M, 3) (x, z, yaw), numpy in and out (torch-batched)."""
         import torch
         if not len(poses):
             return np.zeros(0)
@@ -1387,49 +1397,50 @@ class MppiV15(MppiV10):
         v = (S.HEIGHT / 2 - S.FOCAL * yc / z) / S.HEIGHT
         win = _tukey(u, self.WIN) * _tukey(v, self.WIN) * front.float() * vis
         a = self.t_w[None]
-        C = (a * win).sum(1) / a.sum()
+        completeness = (a * win).sum(1) / a.sum()
         size = ((a * win * S.FOCAL ** 2 / z ** 2).sum(1) / IMG_AREA).clamp(max=1.0)
         dc = self.t_center[None] - cam
         bearing = torch.atan2(-dc[:, 0], -dc[:, 1])
         off = torch.rad2deg(torch.abs(torch.remainder(bearing - yaw + math.pi, 2 * math.pi) - math.pi))
-        facing = torch.exp(-((off - 15.0).clamp(min=0) / 10.0) ** 2)
-        J = size / (size + self.S0) * C ** self.KAPPA * facing   # pixels beyond ~S0 of the image add little
-        self._last_C = C
-        return torch.log(J + 1e-4).cpu().numpy().astype(float)
+        centeredness = torch.exp(-((off - 15.0).clamp(min=0) / 10.0) ** 2)
+        J = size / (size + self.S0) * completeness ** self.KAPPA * centeredness
+        return (-torch.log(J + 1e-4)).cpu().numpy().astype(float)
 
-    def values(self, seqs, here, yaw0, pf, center):
-        poses, bumps = self.rollout(seqs, here, yaw0, pf)
+    def costs(self, rollouts, here, yaw0, pf, center):
+        """(cost (K,), t* (K,), view cost per step (K, H+1), poses (K, H+1, 3)) of action rollouts (K, H)."""
+        poses, bumps = self.rollout(rollouts, here, yaw0, pf)
         K, T, _ = poses.shape
         key = np.stack([np.round(poses[..., 0] / 0.02), np.round(poses[..., 1] / 0.02),
                         np.round((poses[..., 2] - yaw0) / G.LATTICE) % 12], -1).reshape(-1, 3).astype(np.int64)
         uniq, first, inv = np.unique(key, axis=0, return_index=True, return_inverse=True)
         todo = [i for i in range(len(uniq)) if tuple(uniq[i]) not in self.cache]
         if todo:
-            vals = self.score_poses(poses.reshape(-1, 3)[first[todo]])
-            for i, val in zip(todo, vals):
-                self.cache[tuple(uniq[i])] = val
-        sc = np.array([self.cache[tuple(q)] for q in uniq])[np.asarray(inv).ravel()].reshape(K, T)
+            for i, c in zip(todo, self.view_cost(poses.reshape(-1, 3)[first[todo]])):
+                self.cache[tuple(uniq[i])] = c
+        c = np.array([self.cache[tuple(q)] for q in uniq])[np.asarray(inv).ravel()].reshape(K, T)
         d = center[None, None] - poses[..., :2]
         bearing = np.arctan2(-d[..., 0], -d[..., 1])
         off = np.abs((bearing - poses[..., 2] + np.pi) % (2 * np.pi) - np.pi)
-        usable = (off <= math.radians(self.FACE_DEG)) & (sc > math.log(1.5e-3))
-        u = usable.astype(float) * self.P_COMMIT
-        u[:, 0] = 0.0                                                       # the current frame is already seen
-        S = np.cumprod(np.c_[np.ones((K, 1)), 1.0 - u[:, :-1]], axis=1)       # P(no decision before t)
-        A = np.c_[np.zeros((K, 1)), np.cumsum((u * S * sc)[:, :-1], axis=1)]
-        gain = A + S * sc - self.C_ACT * np.arange(T)[None]
-        tstar = gain.argmax(1)
-        value = gain.max(1) - self.C_BUMP * bumps
-        if self._w > 0 and self._ref_poses is not None:   # deviation from closer's drive, weighted far out
-            rp = self._ref_poses
-            n = min(T, len(rp))
-            dp = ((poses[:, 1:n, :2] - rp[None, 1:n, :2]) ** 2).sum(-1) / self.SIG_P ** 2
-            dy = ((poses[:, 1:n, 2] - rp[None, 1:n, 2] + np.pi) % (2 * np.pi) - np.pi) ** 2 / self.SIG_Y ** 2
-            value = value - self._w * self.W_REF * (dp + dy).mean(1)
-        return value, tstar, sc, poses
+        usable = (off <= math.radians(self.FACE_DEG)) & (c < self.C_MAX)
+        q = usable.astype(float) * self.P_COMMIT
+        q[:, 0] = 0.0                                                       # the current frame is already seen
+        R = np.cumprod(np.c_[np.ones((K, 1)), 1.0 - q[:, :-1]], axis=1)       # P(no decision before t)
+        A = np.c_[np.zeros((K, 1)), np.cumsum((q * R * c)[:, :-1], axis=1)]   # expected cost of earlier decisions
+        cost_t = A + R * c + self.C_ACT * np.arange(T)[None]
+        tstar = cost_t.argmin(1)
+        cost = cost_t.min(1) + self.C_BUMP * bumps
+        if self._w > 0 and self._ws_poses is not None:   # tracking the warm-start trajectory, weighted far out
+            wp = self._ws_poses
+            n = min(T, len(wp))
+            dp = ((poses[:, 1:n, :2] - wp[None, 1:n, :2]) ** 2).sum(-1) / self.SIG_P ** 2
+            dy = ((poses[:, 1:n, 2] - wp[None, 1:n, 2] + np.pi) % (2 * np.pi) - np.pi) ** 2 / self.SIG_Y ** 2
+            cost = cost + self._w * self.W_REF * (dp + dy).mean(1)
+        return cost, tstar, c, poses
 
-    # ---------------- proposals (Biased-MPPI seeds) ----------------
+    # ---------------- proposals and warm-start rollouts ----------------
     def proposals(self, obs, here, center, pts):
+        """Ring poses around the object, facing it, reachable and faceable within H; the 3 N_PROP lowest by view cost
+        plus C_ACT x estimated actions, at least 0.4 m apart."""
         pf, lm = obs.pathfinder, obs.pathfinder.lmap
         r_face = float(np.percentile(np.hypot(*(pts[:, [0, 2]] - center).T), 90))
         b = np.radians(np.arange(0, 360, 15))
@@ -1444,19 +1455,19 @@ class MppiV15(MppiV10):
         yaw0 = obs.yaw
         k = np.round(np.array([G.wrap(G.bearing_yaw(c, center) - yaw0) for c in cand]) / G.LATTICE)
         poses = np.c_[cand, yaw0 + k * G.LATTICE]
-        sc = self.score_poses(poses)
+        c = self.view_cost(poses)
         dist_t, _ = pf._tree(lm.cell(here))
         cij = np.floor((cand - lm.origin) / L.CELL).astype(int)
         togo = dist_t[cij[:, 0] * lm.n + cij[:, 1]] * L.CELL / S.FORWARD_M
         turns = np.abs(k) + 2 * (togo > 0.5)
-        # a seed can only score a proposal it reaches (and faces from) within the horizon
+        # a warm-start rollout can only evaluate a proposal it reaches (and faces from) within the horizon
         head = np.array([G.bearing_yaw(here, c) for c in cand])
         k_out = np.round(np.abs([G.wrap(h - yaw0) for h in head]) / G.LATTICE)
         k_in = np.round(np.abs([G.wrap(G.bearing_yaw(c, center) - h) for c, h in zip(cand, head)]) / G.LATTICE)
         steps = np.where(togo > 0.5, togo + k_out + k_in, np.abs(k))
         togo = np.where(steps <= min(self.H, getattr(obs, "remaining", self.H)), togo, np.inf)
-        rank = sc - self.C_ACT * (np.where(np.isfinite(togo), togo, 1e3) + turns)
-        order = np.argsort(-rank)
+        rank = c + self.C_ACT * (np.where(np.isfinite(togo), togo, 1e3) + turns)
+        order = np.argsort(rank)
         keep = []
         for i in order:
             if not np.isfinite(togo[i]):
@@ -1465,11 +1476,11 @@ class MppiV15(MppiV10):
                 keep.append(i)
             if len(keep) >= 3 * self.N_PROP:
                 break
-        self.prop_info = [(round(float(cand[i][0]), 2), round(float(cand[i][1]), 2), round(float(sc[i]), 2)) for i in keep]
+        self.prop_info = [(round(float(cand[i][0]), 2), round(float(cand[i][1]), 2), round(float(c[i]), 2)) for i in keep]
         return [cand[i] for i in keep]
 
-    def seed_path(self, obs, here, yaw0, goal, center, H, long_way=False):
-        """Lattice actions (0 F, 1 L, 2 R, 3 stay) that follow the local-map path here -> goal (pure pursuit on a
+    def path_rollout(self, obs, here, yaw0, goal, center, H, long_way=False):
+        """Warm-start rollout: lattice actions (0 F, 1 L, 2 R, 3 stay) that follow the local-map path here -> goal (pure pursuit on a
         LOOK m look-ahead point, turning the short way when off by > 15 deg), then turn to face the object and stay."""
         pf = obs.pathfinder
         cells = pf.path_cells(here, goal)
@@ -1504,7 +1515,7 @@ class MppiV15(MppiV10):
                 k += 1 if a == 1 else -1
         return np.array(seq[:H], int)
 
-    # ---------------- the view planner ----------------
+    # ---------------- planning and execution ----------------
     def view_act(self, obs):
         pf = obs.pathfinder
         mask = np.asarray(obs.mask, bool)
@@ -1512,9 +1523,7 @@ class MppiV15(MppiV10):
             self.vox = VoxelMap(np.asarray(obs.position)[[0, 2]], obs.floor_y)
         self.vox.update(np.asarray(obs.depth), mask, obs.position, obs.yaw)
         if self.prev is not None and self.prev[2] == "move_forward":
-            moved = float(np.hypot(*(np.asarray(obs.position) - self.prev[0])[[0, 2]]))
-            if moved < 0.5 * S.FORWARD_M:
-                pf.lmap.bump(self.prev[0], self.prev[1])
+            if pf.lmap.forward_feedback(self.prev[0], self.prev[1], obs.position):
                 pf.refresh(obs.position)
         if self.done or not len(obs.cloud) or not hasattr(pf, "lmap"):
             self.last = {"stop": "no_object" if not len(obs.cloud) else "done"}
@@ -1524,11 +1533,10 @@ class MppiV15(MppiV10):
             import pickle
             pickle.dump({"obs": obs, "self": {k: v for k, v in self.__dict__.items() if k not in ("sim", "ctrl", "closer", "dev")}},
                         open(f"{os.environ['MPPI_DUMP']}_{obs.step}.pkl", "wb"))
-        r = self.view_plan(obs)
-        return self.execute(obs, r)
+        return self.execute(obs, self.plan(obs))
 
-    def view_plan(self, obs):
-        """One planning round; closer's planned drive (self._ref) is one of the seeds."""
+    def plan(self, obs):
+        """One MPPI optimization from the current pose: the lowest-cost rollout and the costs the stop rule needs."""
         pf = obs.pathfinder
         here = np.asarray(obs.position)[[0, 2]].astype(float)
         cloud = np.asarray(obs.cloud)
@@ -1536,90 +1544,96 @@ class MppiV15(MppiV10):
         H = max(1, min(self.H, obs.remaining))
         pts, wts, info = self.model_points(obs)
         self._prepare(obs, pts, wts, center, self.object_cells(self.vox, cloud))
-        seeds = []
-        goals = list(self.proposals(obs, here, center, pts)) + [np.asarray(q, float) for q in getattr(self, "_extra_goals", [])]
-        ref = self._ref
+        goals = list(self.proposals(obs, here, center, pts)) + ([self._ws_goal] if self._ws_goal is not None else [])
+        warm = []
         for g in goals:
             for lw in (False, True):
-                sp = self.seed_path(obs, here, obs.yaw, g, center, H, long_way=lw)
-                if sp is not None:
-                    seeds.append(sp)
-        if len(seeds) > 2 * self.N_PROP:   # keep the seeds whose full rollout value is best
-            v = self.values(np.array(seeds), here, obs.yaw, pf, center)[0]
-            seeds = [seeds[i] for i in np.argsort(-v)[: 2 * self.N_PROP]]
-        inc = j_inc = j_ref = None
-        if self.plan_seq is not None and len(self.plan_seq) > 1:
-            inc = np.r_[self.plan_seq[1:], np.full(H, self.STAY)][:H].astype(int)
-            j_inc = len(seeds)
-            seeds.append(inc)
-        if ref is not None:
-            j_ref = len(seeds)
-            seeds.append(np.r_[ref, np.full(H, self.STAY)][:H].astype(int))
-        j_stay = len(seeds)
-        seeds.append(np.full(H, self.STAY))
+                r = self.path_rollout(obs, here, obs.yaw, np.asarray(g, float), center, H, long_way=lw)
+                if r is not None:
+                    warm.append(r)
+        if len(warm) > 2 * self.N_PROP:   # keep the warm starts with the lowest cost
+            cst = self.costs(np.array(warm), here, obs.yaw, pf, center)[0]
+            warm = [warm[i] for i in np.argsort(cst)[: 2 * self.N_PROP]]
+        j_prev = j_ws = None
+        if self.prev_rollout is not None and len(self.prev_rollout) > 1:   # the previous rollout, shifted one step
+            j_prev = len(warm)
+            warm.append(np.r_[self.prev_rollout[1:], np.full(H, self.STAY)][:H].astype(int))
+        if self._ws_seq is not None:
+            j_ws = len(warm)
+            warm.append(np.r_[self._ws_seq, np.full(H, self.STAY)][:H].astype(int))
+        j_stay = len(warm)
+        warm.append(np.full(H, self.STAY))
         diff = G.wrap(G.bearing_yaw(here, center) - obs.yaw)
-        seeds.append(np.r_[[1 if diff > 0 else 2], np.full(H - 1, self.STAY)][:H])   # face it and stay
-        seeds = np.array(seeds)
+        warm.append(np.r_[[1 if diff > 0 else 2], np.full(H - 1, self.STAY)][:H])   # turn to face, then stay
+        warm = np.array(warm)
         pi = np.tile(self.PRIOR, (H, 1))
-        best_seq, best_val, best_t, inc_val, ref_val = None, -np.inf, 0, None, None
+        best, best_cost, best_t, ws_cost = None, np.inf, 0, None
         for it in range(self.ITERS):
-            n_seed = self.K // 2
-            centres = seeds if best_seq is None else np.r_[seeds, best_seq[None]]
-            base = centres[self.rng.integers(0, len(centres), n_seed)]
-            keep = self.rng.random((n_seed, H)) >= self.EPS
-            pert = np.where(keep, base, self.rng.integers(0, 3, (n_seed, H)))
+            n_warm = self.K // 2
+            centres = warm if best is None else np.r_[warm, best[None]]
+            base = centres[self.rng.integers(0, len(centres), n_warm)]
+            keep = self.rng.random((n_warm, H)) >= self.EPS
+            pert = np.where(keep, base, self.rng.integers(0, 3, (n_warm, H)))
             cum = pi.cumsum(1)
-            free = (self.rng.random((self.K - n_seed, H, 1)) > cum[None]).sum(-1).clip(0, 2)
-            seqs = np.r_[centres, pert, free][: self.K + len(centres)]
-            stopped = np.maximum.accumulate(seqs == self.STAY, axis=1)
-            seqs = np.where(stopped, self.STAY, seqs)
-            vals, tstar, sc, poses_ = self.values(seqs, here, obs.yaw, pf, center)
+            free = (self.rng.random((self.K - n_warm, H, 1)) > cum[None]).sum(-1).clip(0, 2)
+            rollouts = np.r_[centres, pert, free][: self.K + len(centres)]
+            stopped = np.maximum.accumulate(rollouts == self.STAY, axis=1)
+            rollouts = np.where(stopped, self.STAY, rollouts)
+            cost, tstar, c, poses = self.costs(rollouts, here, obs.yaw, pf, center)
             if it == 0:
-                self.seed_info = [("".join("FLRS"[a] for a in seeds[j]), round(float(vals[j]), 2), int(tstar[j]),
-                                   round(float(sc[j].max()), 2), [round(float(x), 2) for x in poses_[j, -1]])
-                                  for j in range(len(seeds))]
-            if it == 0:
-                stay_val = float(vals[j_stay])
-            if it == 0 and j_ref is not None:
-                ref_val = float(vals[j_ref])
-            if it == 0 and j_inc is not None:
-                inc_val = float(vals[j_inc])
-                vals[j_inc] += self.DELTA   # a new plan must beat the incumbent by the stop margin
-            s0 = float(sc[0, 0])
-            i = int(vals.argmax())
-            if vals[i] > best_val:
-                best_seq, best_val, best_t = seqs[i].copy(), float(vals[i]), int(tstar[i])
-            wt = np.exp((vals - vals.max()) / self.LAMBDA)
+                self.warm_info = [("".join("FLRS"[a] for a in warm[j]), round(float(cost[j]), 2), int(tstar[j]),
+                                   round(float(c[j].min()), 2), [round(float(x), 2) for x in poses[j, -1]])
+                                  for j in range(len(warm))]
+                stay_cost = float(cost[j_stay])
+                c0 = float(c[0, 0])
+                if j_ws is not None:
+                    ws_cost = float(cost[j_ws])
+                if j_prev is not None:
+                    cost[j_prev] -= self.DELTA   # a new rollout must beat the previous one by the stop margin
+            i = int(cost.argmin())
+            if cost[i] < best_cost:
+                best, best_cost, best_t = rollouts[i].copy(), float(cost[i]), int(tstar[i])
+            wt = np.exp(-(cost - cost.min()) / self.LAMBDA)
             wt /= wt.sum()
-            pi = np.einsum("k,kha->ha", wt, np.eye(4)[seqs])[:, :3] + 1e-3
+            pi = np.einsum("k,kha->ha", wt, np.eye(4)[rollouts])[:, :3] + 1e-3
             pi /= pi.sum(1, keepdims=True)
-        return {"best_seq": best_seq, "best_val": best_val, "best_t": best_t, "s0": s0, "ref_val": ref_val, "stay_val": stay_val,
-                "diff": diff, "info": info}
+        return {"rollout": best, "cost": best_cost, "t*": best_t, "c0": c0, "ws_cost": ws_cost,
+                "stay_cost": stay_cost, "diff": diff, "info": info}
+
+    def stop_delta(self, p):
+        """The stop tolerance DELTA_eff for the belief's P(consistent) ``p`` (None: DELTA)."""
+        if p is None:
+            return self.DELTA
+        return float(np.clip(self.DELTA * (1 - self.P_STAR) / max(1 - float(p), 1e-3), 0.2 * self.DELTA,
+                             3 * self.DELTA))
 
     def execute(self, obs, r):
-        best_seq, best_val, best_t, s0, diff = r["best_seq"], r["best_val"], r["best_t"], r["s0"], r["diff"]
+        best, diff = r["rollout"], r["diff"]
         off = math.degrees(abs(diff))
-        self.last = {"phase": "view12", "J0": round(float(np.exp(s0)), 4), "V": round(best_val, 3), "t*": best_t,
-                     "seq": "".join("FLRS"[a] for a in best_seq), "phantom": r["info"],
-                     "props": getattr(self, "prop_info", []), "seeds": self.seed_info,
+        self.last = {"phase": "mppi_v15", "J0": round(float(np.exp(-r["c0"])), 4), "cost": round(r["cost"], 3),
+                     "t*": r["t*"], "rollout": "".join("FLRS"[a] for a in best), "phantom": r["info"],
+                     "props": getattr(self, "prop_info", []), "warm": self.warm_info,
                      "cut": [self.top_cut, self.top_seen, self.bot_cut, self.bot_seen]}
-        if r["ref_val"] is not None:
-            self.last["deviate_from_closer"] = round(best_val - r["ref_val"], 2)
-        if self._ref is not None:   # closer's planned drive (the warm start / far-out reference)
-            self.last["ref"] = "".join("FLRS"[a] for a in self._ref)
+        if self._ws_seq is not None:   # the warm-start trajectory and its tracking weight
+            self.last["ws"] = "".join("FLRS"[a] for a in self._ws_seq)
             self.last["w"] = round(self._w, 2)
-        stop = best_val - r["stay_val"] < self.DELTA or best_seq[0] == self.STAY or (self._w == 0.0 and best_t == 0)
+            self.last["ws_cost"] = round(r["ws_cost"], 3)
+        p = (obs.meta or {}).get("p_consistent")
+        delta = self.stop_delta(p)
+        if p is not None:
+            self.last.update(p=round(float(p), 4), delta=round(delta, 4))
+        stop = r["stay_cost"] - r["cost"] < delta or best[0] == self.STAY or (self._w == 0.0 and r["t*"] == 0)
         if stop:
             if off > self.FACE_DEG:
                 action = "turn_left" if diff > 0 else "turn_right"
-                self.plan_seq = None
+                self.prev_rollout = None
             else:
                 self.done = True
                 self.last["stop"] = "best_view"
                 return None
         else:
-            action = ACTIONS[int(best_seq[0])]
-            self.plan_seq = best_seq
+            action = ACTIONS[int(best[0])]
+            self.prev_rollout = best
         self.prev = (np.asarray(obs.position).copy(), obs.yaw, action)
         self.last["action"] = action
         return action

@@ -2,6 +2,7 @@ import base64
 import os
 import random
 import socket
+import threading
 import time
 from typing import Any, Dict
 
@@ -24,11 +25,15 @@ def host_model(model: Any, name: str, port: int = 5000) -> None:
     Hosts a model as a REST API using Flask.
     """
     app = Flask(__name__)
+    # Flask serves requests on threads; the models keep per-call state (SAM's set_image -> predict), and the
+    # clients' lockfiles (send_request) are not a strict mutex, so concurrent episode workers are serialized here
+    lock = threading.Lock()
 
     @app.route(f"/{name}", methods=["POST"])
     def process_request() -> Dict[str, Any]:
         payload = request.json
-        return jsonify(model.process_payload(payload))
+        with lock:
+            return jsonify(model.process_payload(payload))
 
     app.run(host="localhost", port=port)
 
@@ -110,15 +115,17 @@ def _send_request(url: str, **kwargs: Any) -> dict:
 
             rand_str = str(random.randint(0, 1000000))
 
-            with open(filename, "w") as f:
-                f.write(rand_str)
-            time.sleep(0.001)
+            # Atomic create: exactly one client gets the lock. The old write-then-read-back check let two
+            # clients that both opened with "w" before writing leave mixed bytes that matched neither, so
+            # nobody held the lock and every client waited for the 120 s stale timeout (parallel workers,
+            # 2026-11-10)
             try:
-                with open(filename, "r") as f:
-                    if f.read() == rand_str:
-                        break
-            except FileNotFoundError:
-                pass
+                fd = os.open(filename, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666)
+            except FileExistsError:
+                continue
+            os.write(fd, rand_str.encode())
+            os.close(fd)
+            break
 
         # Create a payload dict which is a clone of kwargs but all np.array values are
         # converted to strings

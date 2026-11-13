@@ -73,10 +73,12 @@ the target is its top (server ``select.fuse_views``; 2026-11-07, it replaced the
 
 Failure policy (fail open by default): a server error or timeout applies
 ``on_error``, a cluster without a stored view ``on_no_evidence``; both are
-logged. ``max_consecutive_errors`` server errors in a row raise, which aborts
+logged. ``on_no_evidence`` may also be ``defer``: the planner carries on to the cluster and the stop
+re-verifies it (by position, with the views gathered on the way); a request at the stop without a view
+is rejected, as the planner treats a deferral at the stop. ``max_consecutive_errors`` server errors in a row raise, which aborts
 the run, so a run never goes on silently ungated.
 
-Re-check: a rejected cluster is reopened (``observe`` returns its id; the caller
+Re-check: a rejected (or deferred) cluster is reopened (``observe`` returns its id; the caller
 publishes state 0, so the planner's next selection of it requests a new check)
 once all hold: ``recheck_cooldown_steps`` steps since its last check, a new view
 of it this step whose camera is ``recheck_min_distance_m`` from every view used
@@ -144,16 +146,27 @@ DEFAULTS = {
     "multiview_grid_scores": False,  # diagnostic: SAM3 top-1 of each grid render (logged only)
     "approach_planner": None,        # None: ApexNav's object navigation approaches (state 3); mppi / closer: the eval
                                      # loop drives the approach itself (perception_gate.approach, sync_step only)
+    "last_mile": True,               # approach_planner: after an accept the gate's planner drives the last mile
+                                     # (habitat_evaluation.run_gate_last_mile / run_gate_approach); false: ApexNav's
+                                     # own navigation goes on to the accepted (unforced) cluster
+    "close_in": False,               # terminal close-in at an accepted object when the planner stops / ends stucking
+                                     # (perception_gate.close_in; habitat_evaluation.run_close_in)
+    "close_in_budget": 12,           # actions before its final STOP
 }
 POLICIES = ("accept", "reject")
+NO_EVIDENCE_POLICIES = POLICIES + ("defer",)
 ACCEPTED, UNVERIFIED, REJECTED, DEFERRED, APPROACH = 1, 0, -1, 2, 3
 NAMES = {ACCEPTED: "ACCEPTED", REJECTED: "REJECTED", DEFERRED: "DEFERRED", APPROACH: "APPROACH"}
 # VerificationRequest.viewpoint_status of an approach re-request
 ARRIVED, UNREACHABLE, ABORTED, EARLY = 1, 2, 3, 4
+# approach_planner hand-off (approach_close): the gate's planner takes an approach once the object is this close
+# and detected (target mask of >= HANDOFF_PX matching the object point within HANDOFF_MATCH_M)
+HANDOFF_M, HANDOFF_MATCH_M, HANDOFF_PX = 3.0, 1.0, 200
+HANDOFF_SEEN_M = 1.0   # ... or the evidence view was taken within this of the agent (seen from here: turning finds it)
 STATUS_NAMES = {ARRIVED: "arrived", UNREACHABLE: "unreachable", ABORTED: "aborted", EARLY: "early"}
 TRI_STATES = ("correct", "wrong", "insufficient")
 APPROACH_COUNTS = ("insufficient", "moves", "unreachable", "aborted", "not_redetected", "fallback",
-                   "approach_arrived", "approach_early", "approach_accepted", "approach_rejected",
+                   "approach_arrived", "approach_early", "approach_accepted", "approach_rejected", "approach_undecided",
                    "approach_insufficient", "approach_exhausted", "approach_steps", "sam3_decisions",
                    "qwen_decisions", "jev_decisions")
 MULTIVIEW_COUNTS = ("multiview_requests", "multiview_qwen", "multiview_sam3", "multiview_failure_decided",
@@ -222,9 +235,9 @@ class VerificationGate:
         if unknown:
             raise ValueError(f"unknown verification settings: {sorted(unknown)}")
         self.cfg = {**DEFAULTS, **{k: v for k, v in dict(cfg or {}).items() if v is not None}}
-        for key in ("on_error", "on_no_evidence"):
-            if self.cfg[key] not in POLICIES:
-                raise ValueError(f"verification.{key} must be one of {POLICIES}")
+        for key, allowed in (("on_error", POLICIES), ("on_no_evidence", NO_EVIDENCE_POLICIES)):
+            if self.cfg[key] not in allowed:
+                raise ValueError(f"verification.{key} must be one of {allowed}")
         if self.cfg["on_view_reject"] not in ("reject", "defer"):
             raise ValueError("verification.on_view_reject must be reject or defer")
         self.approach = bool(self.cfg["approach"])
@@ -238,6 +251,11 @@ class VerificationGate:
             from perception_gate.approach import PLANNERS
             if self.approach_planner not in PLANNERS or not self.approach:
                 raise ValueError(f"verification.approach_planner must be one of {PLANNERS} and needs approach")
+        self.last_mile = bool(self.cfg["last_mile"]) and self.approach_planner is not None
+        if not self.cfg["last_mile"] and self.approach_planner is None:
+            raise ValueError("verification.last_mile=false needs approach_planner (no last mile runs without it)")
+        self.close_in = bool(self.cfg["close_in"])
+        self._frame = None
         self.multiview = bool(self.cfg["multiview"])
         if self.multiview:
             if not self.approach:
@@ -296,7 +314,11 @@ class VerificationGate:
             self.counts.update({key: 0 for key in APPROACH_COUNTS})
         if self.multiview:
             self.counts.update({key: 0 for key in MULTIVIEW_COUNTS})
+        if self.close_in:
+            self.counts.update({"close_in": 0, "close_in_actions": 0, "close_in_end": None})
+        self.accepted_cloud = None   # the most recent accepted object's points (close_in)
         self.approach_steps_used = 0
+        self.decided_objects = []   # (points, state) of objects the gate's approaches decided (same_as_decided)
         self._sam3_cache = {}  # multiview: SAM3 scores per view (step, index), sent back with later requests
 
     def finish_episode(self):
@@ -371,7 +393,7 @@ class VerificationGate:
     def _reopen(self, step, new, snapshot):
         reopened = []
         for cluster_id, state in self.clusters.items():
-            if (state["state"] != REJECTED or state["checks"] >= self.cfg["max_checks"]
+            if (state["state"] not in (REJECTED, DEFERRED) or state["checks"] >= self.cfg["max_checks"]
                     or step - state["last_step"] < self.cfg["recheck_cooldown_steps"]):
                 continue
             centroid = snapshot.get(cluster_id, state["centroid"])
@@ -413,13 +435,68 @@ class VerificationGate:
     # Verification
     # ------------------------------------------------------------------
 
-    def handle(self, request, fusion=None, step=0):
+    def remember_object(self, points, state):
+        """Keep a decided object's points (sim world frame; LiveApproach.object_points) with its verdict, so a later
+        request for the same object, under another cluster id, inherits it (same_as_decided)."""
+        if state in (ACCEPTED, REJECTED) and points is not None and len(points) >= 3:
+            self.decided_objects.append((np.asarray(points, np.float32), state))
+            if state == ACCEPTED:
+                self.accepted_cloud = np.asarray(points, np.float32)
+
+    def log_close_in(self, reason, entry):
+        """Record the terminal close-in (habitat_evaluation.run_close_in) in the counts, the step events and
+        close_in.jsonl: reason (stop / stucking), start_d, end_d, actions, blocks, end."""
+        entry = {"run_index": self.episode.get("run_index"), "episode_id": self.episode.get("episode_id"),
+                 "reason": reason, **entry}
+        self.counts.update(close_in=1, close_in_actions=entry["actions"], close_in_end=entry["end"])
+        self.events.append({"event": "close_in", **entry})
+        print(f"[verification] close-in ({reason}): {entry['start_d']} -> {entry['end_d']} m, {entry['actions']} "
+              f"actions, {entry['end']}")
+        if self.log_dir:
+            os.makedirs(self.log_dir, exist_ok=True)
+            with open(os.path.join(self.log_dir, "close_in.jsonl"), "a", encoding="utf-8") as stream:
+                stream.write(json.dumps(entry) + "\n")
+
+    def same_as_decided(self, centroid, frame):
+        """The identity rule of the approach (approach.associate) against the decided objects: each one's points
+        projected into the request frame with the depth test (local_nav.track_mask) is its outline T; the request is
+        that object when one of the frame's target masks near the requested point (HANDOFF_MATCH_M) has IoU >=
+        ASSOC_MIN with T. ``frame``: {depth (m), masks, centroids (planner frame), cam (position, rotation)}.
+        -> (state, iou) of the most recent such object, or None."""
+        if not self.decided_objects or frame is None:
+            return None
+        from active_approach.local_nav import track_mask
+        from perception_gate.approach import associate
+        c = np.asarray(centroid, float)
+        masks = [np.asarray(m).squeeze() > 0 for m, p in zip(frame["masks"], frame["centroids"])
+                 if p is not None and np.hypot(*(np.asarray(p[:2], float) - c)) <= HANDOFF_MATCH_M]
+        if not masks:
+            return None
+        for points, state in reversed(self.decided_objects):
+            outline = track_mask(points, frame["depth"], *frame["cam"])
+            if not outline.any():
+                continue
+            best, scores = associate(masks, outline)
+            if best is not None:
+                return state, scores[best][1]
+        return None
+
+    def handle(self, request, fusion=None, step=0, frame=None):
+        """``_handle`` with the request frame kept for the accepted object's points (close_in)."""
+        self._frame = frame
+        try:
+            return self._handle(request, fusion, step, frame)
+        finally:
+            self._frame = None
+
+    def _handle(self, request, fusion, step, frame):
         """Verify the requested cluster; returns 1 (accept), -1 (reject), 2 (defer) or 3 (approach;
         ``pending_approach`` has it) for the planner.
 
         ``request``: dict with seq, cluster_id, centroid_x/y, confidence, observation_num,
         expl_result, at_stop, and for an approach re-request approach_id, viewpoint_status,
-        viewpoint_x/y and approach_steps (the VerificationRequest message)."""
+        viewpoint_x/y and approach_steps (the VerificationRequest message). ``frame`` (the request frame, see
+        same_as_decided): a request for an object a gate approach already decided inherits that verdict."""
         cluster_id = int(request["cluster_id"])
         centroid = (float(request["centroid_x"]), float(request["centroid_y"]))
         approach_id = int(request.get("approach_id", 0) or 0)
@@ -457,12 +534,20 @@ class VerificationGate:
             print(f"[verification] cluster {cluster_id}: stale approach {state['approach']['id']} dropped")
             state["approach"] = None
 
+        same = self.same_as_decided(centroid, frame)
+        if same is not None:
+            decided, iou = same
+            self.counts["same_object"] = self.counts.get("same_object", 0) + 1
+            record["policy"] = "same_as_accepted" if decided == ACCEPTED else "same_as_rejected"
+            record["same_iou"] = round(float(iou), 3)
+            return self._decide(record, decided, None, None, state)
         evidence, match = self.select_evidence(cluster_id, centroid, by_position=at_stop)
         if evidence is None:
             self.counts["no_evidence"] += 1
             record["policy"] = f"on_no_evidence={self.cfg['on_no_evidence']}"
-            return self._decide(record, ACCEPTED if self.cfg["on_no_evidence"] == "accept" else REJECTED,
-                                None, None, state)
+            decided = {"accept": ACCEPTED, "reject": REJECTED, "defer": DEFERRED}[self.cfg["on_no_evidence"]]
+            # at the stop there is nothing left to defer to (the planner rejects a deferral there too)
+            return self._decide(record, REJECTED if decided == DEFERRED and at_stop else decided, None, None, state)
         return self._judge(record, evidence, match, state, step, at_stop)
 
     def _judge(self, record, evidence, match, state, step, at_stop, approach=None):
@@ -625,9 +710,58 @@ class VerificationGate:
         return {"approach_id": pending["id"], "object": pending["object"], "camera": pending["camera"],
                 "max_steps": pending["max_steps"]}
 
+    def approach_close(self, request, last):
+        """approach_planner: True when the gate's planner can take the pending approach of the requested cluster
+        from the last executed step ``last`` (habitat_evaluation's ctx["last_step"]): the object point is within
+        HANDOFF_M of the agent and a target detection of >= HANDOFF_PX matches it (HANDOFF_MATCH_M), or its evidence
+        view was taken within HANDOFF_SEEN_M of the agent (out of frame now, in view after a turn). Farther or
+        out of view, ApexNav's object navigation (state 3) approaches first: the local planner only knows what
+        the agent has seen since it took over."""
+        pending = self.clusters.get(int(request["cluster_id"]), {}).get("approach")
+        if pending is None or last is None:
+            return False
+        obj = np.asarray(pending["object"], float)
+        here = np.asarray(last["pose"][:2], float)
+        if np.hypot(*(obj - here)) > HANDOFF_M:
+            return False
+        if np.hypot(*(np.asarray(pending["camera"], float) - here)) <= HANDOFF_SEEN_M:
+            return True   # seen from where the agent stands (e.g. during a spin): the planner turns to it
+        return any(c is not None and np.hypot(*(np.asarray(c[:2], float) - obj)) <= HANDOFF_MATCH_M
+                   and int((np.asarray(m).squeeze() > 0).sum()) >= HANDOFF_PX
+                   for m, c in zip(last["masks"], last["centroids"]))
+
+    def approach_handoff(self, request, last):
+        """approach_planner, for a re-request of the pending approach ApexNav drives: "planner" (the gate's
+        planner takes over: the object is close in view, or ApexNav arrived / gave up), "native" (keep
+        approaching, nothing judged), or None (not such a re-request: ``handle`` it)."""
+        approach_id = int(request.get("approach_id", 0) or 0)
+        pending = self.clusters.get(int(request["cluster_id"]), {}).get("approach")
+        if not approach_id or pending is None or pending["id"] != approach_id:
+            return None
+        status = int(request.get("viewpoint_status", 0))
+        if status == EARLY and not self.approach_close(request, last):
+            pending["early"] = None   # as "insufficient,keep_approaching": the next new view re-requests
+            return "native"
+        steps = int(request.get("approach_steps", 0) or 0)
+        self.approach_steps_used += steps
+        self.counts["approach_steps"] += steps
+        self.counts["approach_arrived" if status == ARRIVED else "approach_early"] += 1
+        print(f"[verification] cluster {request['cluster_id']}: native approach {approach_id} "
+              f"{STATUS_NAMES.get(status, status)} after {steps} steps -> {self.approach_planner}")
+        return "planner"
+
+    def approach_bank(self, cluster_id):
+        """The view bank of the pending approach of ``cluster_id`` (every stored detection of the object, also from
+        before the request; ``multiview``): the items the gate's planner seeds its decision flow with."""
+        return list(self.clusters.get(int(cluster_id), {}).get("bank", []))
+
     def finish_external_approach(self, request, step, result, approach_log=None):
-        """The verdict of an approach the gate drove itself (perception_gate.approach): ACCEPTED or REJECTED,
-        logged like any decision (policy ``approach_planner,<by>,<accept|reject>``)."""
+        """The verdict of an approach the gate drove itself (perception_gate.approach): ACCEPTED, REJECTED, or
+        DEFERRED when it ended without evidence (status ``undecided``: the object not found, no counted frame) or
+        stuck (end ``stuck``, whatever the forced verification said: the agent is wedged, not the object wrong),
+        logged like any decision (policy ``approach_planner,<by>,<accept|reject|defer>``). ApexNav drops a
+        cluster that is not accepted after an external approach and keeps exploring; the re-check rule reopens a
+        rejected or deferred one, its cooldown counted from the approach's end (``step``)."""
         cluster_id = int(request["cluster_id"])
         state = self.clusters.get(cluster_id)
         pending = state.get("approach") if state is not None else None
@@ -635,10 +769,15 @@ class VerificationGate:
         self.approach_steps_used += steps
         self.counts["approach_steps"] += steps
         accept = bool(result.get("accept"))
-        self.counts["approach_accepted" if accept else "approach_rejected"] += 1
+        # an approach that ended stuck brought no evidence it could act on: DEFERRED, never REJECTED
+        decided = ACCEPTED if accept else DEFERRED if result.get("status") == "undecided" or \
+            result.get("end") == "stuck" else REJECTED
+        verb = {ACCEPTED: "accept", REJECTED: "reject", DEFERRED: "defer"}[decided]
+        self.counts[{ACCEPTED: "approach_accepted", REJECTED: "approach_rejected",
+                     DEFERRED: "approach_undecided"}[decided]] += 1
         self.counts["sam3_decisions"] += result.get("by") in ("belief", "forced")
         if state is not None:
-            state["approach"] = None
+            state.update(approach=None, last_step=int(step))
         record = {**{k: self.episode.get(k) for k in ("run_index", "scene", "episode_id", "label", "target")},
                   "step": int(step), "seq": int(request.get("seq", 0)),
                   "cluster": {"id": cluster_id, "centroid": [float(request["centroid_x"]), float(request["centroid_y"])],
@@ -649,14 +788,14 @@ class VerificationGate:
                   "evidence": None, "verdict": {"status": result.get("status"), "label": None},
                   "latency_s": result.get("seconds"), "error": None, "source": "server", "ground_truth": None,
                   "status": result.get("status"), "model": "sam3",
-                  "policy": f"approach_planner,{result.get('by')},{'accept' if accept else 'reject'}",
+                  "policy": f"approach_planner,{result.get('by')},{verb}",
                   "approach": {"id": None if pending is None else pending["id"], "planner": self.approach_planner,
                                "status": result.get("end") or result.get("by"), "steps": steps,
                                "views": result.get("views"), "counted": result.get("counted"),
                                "object": None if pending is None else list(pending["object"]),
                                "issued_step": None if pending is None else pending["issued_step"],
                                "log": approach_log, "episode_steps_used": self.approach_steps_used}}
-        return self._decide(record, ACCEPTED if accept else REJECTED, None, None, state)
+        return self._decide(record, decided, None, None, state)
 
     def _approach_view(self, item, cluster_id, pending, used, arrival_step=None):
         """Match distance when ``item`` is a new view of the approached object: taken since the
@@ -949,6 +1088,11 @@ class VerificationGate:
         record["state"] = decided
         if decided != APPROACH:  # an approach is counted as a move when issued
             self.counts[NAMES[decided].lower()] += 1
+        if decided == ACCEPTED and self.close_in and self._frame is not None and record["policy"] != "same_as_accepted":
+            from perception_gate import close_in
+            points = close_in.object_points(self._frame, record["cluster"]["centroid"], HANDOFF_MATCH_M)
+            if points is not None:   # (a gate approach's own points replace these: remember_object)
+                self.accepted_cloud = points
         self._log(record, evidence, reply, views)
         label = (record["verdict"] or {}).get("label")
         self.events.append({"event": "decision", "cluster_id": record["cluster"]["id"], "state": decided,

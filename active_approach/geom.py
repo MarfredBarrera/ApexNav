@@ -5,7 +5,7 @@ depth frames (a local 2.5D height map), the navmesh for paths, the agent pose. W
 (y up); 2D quantities use (x, z).
 
     ObjectModel(cloud, floor_y)   z_lo/z_hi (5/95 % height above the floor), PCA footprint, centre
-    HeightMap                     5 cm cells: max height of non-object depth points, seen flag
+    HeightMap                     5 cm cells: max height of non-object depth points, the same below BODY_TOP, seen flag
     predict(...)                  area_hat, trunc_hat, occ_hat, facing_hat of a candidate pose
     d_fit(...)                    the fit distance (pitch 0, margin 3 deg, kappa of the height may be cut)
     lattice_candidates(...)       viewpoints on the 12 lattice yaws (yaw0 + k 30 deg) facing the centre
@@ -23,6 +23,7 @@ MARGIN = math.radians(3.0)
 CELL = 0.05
 DEPTH_MAX = 4.99                                       # ApexNav's depth range (map_ros depth_filter_maxdist)
 LATTICE = math.radians(S.TURN_DEG)
+BODY_TOP = 1.6                                         # m above the floor: higher structure does not block the base
 
 
 def forward(yaw):
@@ -55,6 +56,15 @@ class ObjectModel:
         self.center = mean + ((lo + hi) / 2) @ self.axes
         self.bbox = np.r_[xz.min(0), xz.max(0)]
 
+    def robust_extent(self, q=(2.0, 98.0)):
+        """Footprint (L, S) along the PCA axes between the ``q`` percentiles (2-98 %): ``extent`` without the
+        stray points of a merge (size_opinion's width W). (0, 0) for fewer than 3 points."""
+        if len(self.xz) < 3:
+            return np.zeros(2)
+        local = (self.xz - self.xz.mean(0)) @ self.axes.T
+        lo, hi = np.percentile(local, q, axis=0)
+        return hi - lo
+
     @property
     def height(self):
         return max(self.z_hi - self.z_lo, 0.05)
@@ -86,12 +96,15 @@ def d_fit(model, yaw, kappa=0.25, top_clipped=False, side_clipped=False):
 
 class HeightMap:
     """Local 2.5D map around the object: per 5 cm cell the max height (above the floor) of non-object
-    depth points, and whether the cell was seen (a hit or crossed by a depth ray)."""
+    depth points (``top``, for occlusion), the max height of those below BODY_TOP (``low``, for collision: a wall
+    or a table seen up to the ceiling has ``top`` above BODY_TOP but ``low`` in the base's height band), and
+    whether the cell was seen (a hit or crossed by a depth ray)."""
 
     def __init__(self, center_xz, floor_y, half=7.0):
         self.origin = np.asarray(center_xz, float) - half
         self.n = int(2 * half / CELL)
         self.top = np.full((self.n, self.n), -np.inf, np.float32)
+        self.low = np.full((self.n, self.n), -np.inf, np.float32)
         self.seen = np.zeros((self.n, self.n), bool)
         self.floor_y = floor_y
         self._navigable = {}
@@ -109,6 +122,8 @@ class HeightMap:
         ij, ok = self.cells(pts[:, [0, 2]])
         ij, h = ij[ok], (pts[ok, 1] - self.floor_y).astype(np.float32)
         np.maximum.at(self.top, (ij[:, 0], ij[:, 1]), h)
+        below = h < BODY_TOP
+        np.maximum.at(self.low, (ij[below, 0], ij[below, 1]), h[below])
         self.seen[ij[:, 0], ij[:, 1]] = True
         # free space: cells crossed by the rays to every 4th hit
         cam = cam_pos[[0, 2]]

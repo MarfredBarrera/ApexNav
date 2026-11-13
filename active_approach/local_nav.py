@@ -4,9 +4,11 @@ Everything here is built from what any ObjectNav agent has: its own depth frames
 mask and collision feedback (a blocked ``move_forward`` does not move the agent; ``allow_sliding`` false).
 
     LocalMap        occupancy on a 10 cm grid from geom.HeightMap (5 cm, own depth only) + the object cloud +
-                    collision marks: free (seen, nothing in 0.12-1.6 m), occupied, unknown
+                    collision marks: free (seen, nothing in 0.12-1.6 m), occupied, unknown. Collision feedback
+                    (``forward_feedback``): without sliding a forward step stops where the base touches something, so
+                    any shortfall marks the cells ahead of where it stopped
     plan(...)       A* from the agent to a goal set; unknown cells cost UNKNOWN_COST per cell (optimistic),
-                    occupied cells inflated by the agent radius + margin are blocked
+                    occupied cells inflated by INFLATE are blocked
     LocalController viewpoint -> action: follow the A* path with lattice line-following (turn when the
                     path point LOOKAHEAD ahead is > 25 deg off, else step forward), replan every step;
                     a blocked step marks the cell ahead occupied. Same interface as policies.Controller.
@@ -22,8 +24,12 @@ from active_approach import geom as G
 from active_approach import scene as S
 
 CELL = 0.10
-OBST_LO, OBST_HI = 0.12, 1.6          # heights (above the floor) that block the base
-INFLATE = S.AGENT_RADIUS + 0.02       # obstacle inflation (m)
+OBST_LO, OBST_HI = 0.12, G.BODY_TOP   # heights (above the floor) that block the base
+# obstacle inflation (m): the agent radius plus half a cell diagonal (an occupied cell's centre stands for anything in
+# the cell). Measured 2026-11-09 on the logged gate approaches (assoc4, GT depth replay): forward steps the simulator
+# blocked had 0.1-0.22 m centre clearance to the nearest occupied cell, steps that went through >= 0.28 m (except 5/211)
+INFLATE = S.AGENT_RADIUS + CELL / math.sqrt(2)
+BUMP_TOL = 0.02                       # m: a forward step this much short of FORWARD_M touched something
 UNKNOWN_COST = float(__import__('os').environ.get('AA_UNKNOWN_COST', 1.0))   # per unknown cell, vs 1 free (3: long detours)
 GOAL_RADIUS, FACE_TOLERANCE_DEG = 0.25, 15.0
 LEASH_RATIO, LEASH_M = 2.0, 1.0       # a viewpoint whose path is longer than 2 x straight + 1 m is given up
@@ -53,8 +59,18 @@ class LocalMap:
             ok = (ij >= 0).all(1) & (ij < self.n).all(1)
             self.object[ij[ok, 0], ij[ok, 1]] = True
 
+    def forward_feedback(self, start, yaw, end):
+        """Collision feedback of a move_forward from ``start`` along ``yaw`` that ended at ``end`` (xyz). Without sliding
+        the step stops where the base touches an obstacle, so a partial step is contact as much as a blocked one: the
+        cells ahead of where it stopped are occupied. True when it was short."""
+        moved = float(np.hypot(*(np.asarray(end, float) - np.asarray(start, float))[[0, 2]]))
+        if moved >= S.FORWARD_M - BUMP_TOL:
+            return False
+        self.bump(end, yaw)
+        return True
+
     def bump(self, position, yaw):
-        """A forward step from ``position`` along ``yaw`` was blocked: the cell ahead is occupied."""
+        """The base at ``position`` touches something along ``yaw``: the cells ahead are occupied."""
         f = G.forward(yaw)
         side = np.array([-f[1], f[0]])
         for t in (-0.1, 0.0, 0.1):
@@ -64,9 +80,9 @@ class LocalMap:
     def grids(self):
         """(occupied, free, unknown) on the 10 cm grid."""
         k, n = self.k, self.n
-        top = self.hmap.top[: n * k, : n * k].reshape(n, k, n, k)
+        low = self.hmap.low[: n * k, : n * k]            # max height below OBST_HI (a wall's top may be above it)
         seen = self.hmap.seen[: n * k, : n * k].reshape(n, k, n, k).any((1, 3))
-        hit = ((top > OBST_LO) & (top < OBST_HI)).reshape(n, k, n, k)
+        hit = (low > OBST_LO).reshape(n, k, n, k)
         occupied = (hit.sum((1, 3)) >= 2) | self.bumps | self.object
         free = seen & ~occupied
         return occupied, free, ~seen & ~occupied
@@ -75,7 +91,7 @@ class LocalMap:
         from scipy.ndimage import binary_dilation
         occupied, free, unknown = self.grids()
         r = int(math.ceil(INFLATE / CELL))
-        disk = np.hypot(*np.mgrid[-r:r + 1, -r:r + 1]) <= r + 1e-6
+        disk = np.hypot(*np.mgrid[-r:r + 1, -r:r + 1]) * CELL <= INFLATE + 1e-6
         blocked = binary_dilation(occupied, structure=disk)
         cost = np.where(unknown, UNKNOWN_COST, 1.0)
         cost[blocked] = np.inf
@@ -201,9 +217,7 @@ class LocalController:
 
     def _bump_check(self, position):
         if self.last is not None and self.last[2] == "move_forward":
-            moved = float(np.hypot(*(position - self.last[0])[[0, 2]]))
-            if moved < 0.5 * S.FORWARD_M:
-                self.lmap.bump(self.last[0], self.last[1])
+            self.lmap.forward_feedback(self.last[0], self.last[1], position)
 
     def action(self, viewpoint, obs=None):
         """A viewpoint that is unreachable or too costly is given up: the agent turns to face the object

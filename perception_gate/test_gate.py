@@ -114,6 +114,29 @@ class GateTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             VerificationGate({"on_view_reject": "maybe"}, "v")
 
+    def test_no_evidence_defer(self):
+        """on_no_evidence=defer: no view defers; the stop re-verifies by position (with a view gathered on the
+        way it is judged; still without one it rejects). on_error has no defer."""
+        self.gate.cfg["on_no_evidence"] = "defer"
+        self.assertEqual(self.gate.handle(request(), step=1), DEFERRED)
+        self.assertEqual(self.calls, [])
+        self.observe(2, 16, (2.1, 0.0))   # seen on the way to the cluster
+        self.accept = True
+        self.assertEqual(self.gate.handle(request(seq=2, centroid=(2.1, 0.0), at_stop=True), step=3), 1)
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(self.gate.handle(request(cluster_id=8, centroid=(9.0, 9.0), seq=3, at_stop=True),
+                                          step=4), REJECTED)
+        lines = [json.loads(line) for line in open(os.path.join(self.folder, "v", "decisions.jsonl"))]
+        self.assertEqual([(line["policy"], line["state"]) for line in lines],
+                         [("on_no_evidence=defer", DEFERRED), (None, 1), ("on_no_evidence=defer", REJECTED)])
+        counts = self.gate.finish_episode()
+        self.assertEqual((counts["no_evidence"], counts["deferred"], counts["rejected"]), (2, 1, 1))
+        VerificationGate({"on_no_evidence": "defer"}, "v")
+        with self.assertRaises(ValueError):
+            VerificationGate({"on_error": "defer"}, "v")
+        with self.assertRaises(ValueError):
+            VerificationGate({"on_no_evidence": "maybe"}, "v")
+
     def test_recheck_cooldown(self):
         self.observe(1, 16, (2.0, 0.0), camera=(0.0, 0.0))
         self.assertEqual(self.gate.handle(request(), step=1), REJECTED)

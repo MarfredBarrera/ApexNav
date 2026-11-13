@@ -77,6 +77,8 @@ def launch_setup(context, *args, **kwargs):
     """Build the exploration node once the launch arguments can be resolved."""
     trajectory_manager_share = get_package_share_directory('trajectory_manager')
     lkh_mtsp_solver_share = get_package_share_directory('lkh_mtsp_solver')
+    # LKH problem/parameter/tour files; parallel episode workers (scripts/run_gate_e2e.sh WORKER=k) each set their own
+    tsp_dir = os.environ.get('APEXNAV_TSP_DIR') or os.path.join(lkh_mtsp_solver_share, 'resource')
 
     # Load trajectory planning parameters
     planning_param_file = os.path.join(
@@ -135,7 +137,7 @@ def launch_setup(context, *args, **kwargs):
                 'exploration/sigma_threshold': 0.015,
                 'exploration/max_to_mean_threshold': 1.10,
                 'exploration/max_to_mean_percentage': 0.90,
-                'exploration/tsp_dir': os.path.join(lkh_mtsp_solver_share, 'resource'),
+                'exploration/tsp_dir': tsp_dir,
 
                 # Frontier (C++ uses dots)
                 'frontier.cluster_min': 2,
@@ -177,7 +179,7 @@ def launch_setup(context, *args, **kwargs):
         name='tsp_solver',
         output='log',
         parameters=[{
-            'exploration/tsp_dir': os.path.join(lkh_mtsp_solver_share, 'resource'),
+            'exploration/tsp_dir': tsp_dir,
         }]
     )
 

@@ -259,23 +259,13 @@ def execute_step(env, node, ctx, action, planned_action, count_steps, camera_pit
     return ctx["last_step"]
 
 
-def run_gate_approach(env, node, ctx, request, count_steps, camera_pitch, label, room, llm_answer,
-                      cld_with_score_msg):
-    """An approach driven by the gate (verification.approach_planner; perception_gate.approach): the planner
-    is waiting for the verdict on ``request``. Each step goes through execute_step (detector, planner map,
-    gate evidence, records) without ACTION_FINISH. Returns (state 1 / -1, count_steps, camera_pitch,
-    pass_object)."""
-    from perception_gate.approach import LiveApproach
-    gate = ctx["gate"]
-    if not ctx["sync_step"]:
-        raise RuntimeError("verification.approach_planner needs sync_step")
-    pending = gate.pending_approach(request["cluster_id"])
-    run = gate.episode["run_index"]
-    tag = f"epi{run}_c{request['cluster_id']}_s{count_steps}"
-    log_dir = os.path.join(gate.log_dir, "approach", tag) if gate.log_dir else None
-    start = time.time()
+MIN_PLANNER_STEPS = 12   # the gate's planner gets at least this many actions after a native approach
+
+
+def level_camera(env, node, ctx, count_steps, camera_pitch, label, room, llm_answer, cld_with_score_msg):
+    """The gate's planners assume camera pitch 0 (ApexNav's pitch after its initial spin): look up / down
+    until level. Returns (count_steps, camera_pitch, pass_object)."""
     passed = 0
-    # the planners assume camera pitch 0 (ApexNav's pitch after its initial spin)
     while abs(camera_pitch) > 1e-6 and count_steps < ctx["max_episode_steps"] - 1:
         planned = ACTION.TURN_UP if camera_pitch < 0 else ACTION.TURN_DOWN
         camera_pitch += PITCH_STEP if planned == ACTION.TURN_UP else -PITCH_STEP
@@ -284,9 +274,143 @@ def run_gate_approach(env, node, ctx, request, count_steps, camera_pitch, label,
                            count_steps, camera_pitch, label, room, llm_answer, cld_with_score_msg,
                            external_approach=True)
         passed = max(passed, out["pass_object"])
+    return count_steps, camera_pitch, passed
+
+
+def drive_last_mile(env, node, ctx, approach, count_steps, camera_pitch, label, room, llm_answer,
+                    cld_with_score_msg):
+    """Drive the gate's last mile (LiveApproach.start_last_mile) from the last executed step until it stops the
+    agent (STOP: the episode ends here, final state REACH_OBJECT) or hands back. Returns (stopped, count_steps,
+    pass_object)."""
+    passed = 0
+    last = ctx["last_step"]
+    while not env.episode_over:
+        if count_steps >= ctx["max_episode_steps"] - 1:   # the last step is the STOP
+            approach.finish_last_mile("episode_end")
+            name = "stop" if approach.last_mile["end"] == "stop" else None
+        else:
+            name = approach.step(last["rgb"], last["depth"], last["masks"], last["centroids"], last["pose"])
+        if name is None:
+            break
+        planned = {"move_forward": ACTION.MOVE_FORWARD, "turn_left": ACTION.TURN_LEFT,
+                   "turn_right": ACTION.TURN_RIGHT, "stop": ACTION.STOP}[name]
+        if planned == ACTION.STOP:
+            node.final_state = FINAL_RESULT.REACH_OBJECT
+        count_steps += 1
+        last = execute_step(env, node, ctx, getattr(HabitatSimActions, ACTION_TO_HABITAT[planned]), planned,
+                            count_steps, camera_pitch, label, room, llm_answer, cld_with_score_msg,
+                            external_approach=True)
+        passed = max(passed, last["pass_object"])
+        if planned == ACTION.STOP:
+            break
+    if env.episode_over and approach.driving_last_mile:
+        approach.finish_last_mile("episode_over")
+    lm = approach.last_mile or {}
+    print(f"[verification] gate last mile: {lm.get('end')} ({lm.get('reason')}) after {lm.get('actions')} actions, "
+          f"{lm.get('distance')} m from the object")
+    return env.episode_over, count_steps, passed
+
+
+def run_gate_last_mile(env, node, ctx, request, count_steps, camera_pitch, label, room, llm_answer,
+                       cld_with_score_msg):
+    """After an accept on the first view (gate.handle -> 1, approach_planner runs): the gate drives the last mile
+    itself when the object is within LAST_MILE_REACH_M (a fresh LiveApproach in last-mile mode finds it first).
+    None when it is farther or verification.last_mile is false (ApexNav's own navigation goes on to it); else (stopped, count_steps,
+    camera_pitch, pass_object, steps taken)."""
+    from perception_gate.approach import LAST_MILE_REACH_M, LM_BUDGET, LiveApproach
+    gate = ctx["gate"]
+    obj = (float(request["centroid_x"]), float(request["centroid_y"]))
+    pose = ctx["last_step"]["pose"]
+    if (not gate.last_mile or not ctx["sync_step"]
+            or np.hypot(obj[0] - pose[0], obj[1] - pose[1]) > LAST_MILE_REACH_M):
+        return None
+    start_steps = count_steps
+    count_steps, camera_pitch, passed = level_camera(env, node, ctx, count_steps, camera_pitch, label, room,
+                                                     llm_answer, cld_with_score_msg)
+    tag = f"epi{gate.episode['run_index']}_c{request['cluster_id']}_s{count_steps}_lastmile"
+    log_dir = os.path.join(gate.log_dir, "approach", tag) if gate.log_dir else None
+    budget = max(0, min(LM_BUDGET, ctx["max_episode_steps"] - 1 - count_steps))
+    approach = LiveApproach(env.sim, gate.cfg["url"], gate.episode["target"], obj, budget, gate.approach_planner,
+                            log_dir=log_dir, tag=tag, last_mile=True)
+    try:
+        stopped, count_steps, p = drive_last_mile(env, node, ctx, approach, count_steps, camera_pitch, label, room,
+                                                  llm_answer, cld_with_score_msg)
+        if len(approach.cloud):
+            gate.remember_object(approach.object_points(), 1)
+    finally:
+        approach.close()
+    return stopped, count_steps, camera_pitch, max(passed, p), count_steps - start_steps
+
+
+def run_close_in(env, node, ctx, planned_action, step_cap, count_steps, camera_pitch, label, room, llm_answer,
+                 cld_with_score_msg):
+    """The terminal close-in (verification.close_in; perception_gate.close_in): the planner's action is STOP (at an
+    object, or ApexNav's stucking end) and the gate accepted an object near the agent. Before that STOP the agent spends
+    up to close_in_budget actions getting nearer to the accepted object, and ends with its own STOP (final state
+    REACH_OBJECT). None when nothing triggers (the planner's STOP goes ahead as it is, also at the step cap);
+    else (count_steps, camera_pitch, pass_object)."""
+    from active_approach import scene as S
+    from perception_gate import close_in
+    gate = ctx["gate"]
+    position = S.agent_pose(env.sim)[0]
+    reason = close_in.trigger_reason(planned_action == ACTION.STOP, node.final_state, step_cap, position,
+                                     gate.accepted_cloud)
+    last_step = ctx.get("last_step")
+    if reason is None or last_step is None:
+        return None
+    count_steps, camera_pitch, passed = level_camera(env, node, ctx, count_steps, camera_pitch, label, room,
+                                                     llm_answer, cld_with_score_msg)
+    # the budget's actions and the final STOP all stay below the step cap's forced STOP
+    budget = max(0, min(int(gate.cfg["close_in_budget"]), ctx["max_episode_steps"] - 2 - count_steps))
+    steps = {"move_forward": ACTION.MOVE_FORWARD, "turn_left": ACTION.TURN_LEFT, "turn_right": ACTION.TURN_RIGHT,
+             "stop": ACTION.STOP}
+    state = {"count": count_steps, "passed": passed, "last": ctx["last_step"]}
+
+    def act(name):
+        if name == "stop":
+            node.final_state = FINAL_RESULT.REACH_OBJECT
+        state["count"] += 1
+        state["last"] = execute_step(env, node, ctx, getattr(HabitatSimActions, ACTION_TO_HABITAT[steps[name]]),
+                                     steps[name], state["count"], camera_pitch, label, room, llm_answer,
+                                     cld_with_score_msg, external_approach=True)
+        state["passed"] = max(state["passed"], state["last"]["pass_object"])
+        return state["last"]
+
+    def view():
+        position, yaw, _ = S.agent_pose(env.sim)
+        return (position, yaw, *S.camera(env.sim))
+
+    entry = close_in.drive(gate.accepted_cloud, act, view, state["last"], budget)
+    gate.log_close_in(reason, entry)
+    return state["count"], camera_pitch, state["passed"]
+
+
+def run_gate_approach(env, node, ctx, request, count_steps, camera_pitch, label, room, llm_answer,
+                      cld_with_score_msg):
+    """An approach driven by the gate (verification.approach_planner; perception_gate.approach): the planner
+    is waiting for the verdict on ``request``. Each step goes through execute_step (detector, planner map,
+    gate evidence, records) without ACTION_FINISH. Returns (state 1 / -1 / 2, count_steps, camera_pitch,
+    pass_object, stopped); 2 (deferred: the approach found no evidence) reaches the planner as a non-accept, so
+    ApexNav drops the cluster and keeps exploring until the gate's re-check reopens it. After an accept the same
+    planner drives the last mile (drive_last_mile; not with verification.last_mile false): ``stopped`` when it
+    ended the episode with STOP, else the accept reaches the planner without a forced target."""
+    from perception_gate.approach import LM_BUDGET, LiveApproach
+    gate = ctx["gate"]
+    if not ctx["sync_step"]:
+        raise RuntimeError("verification.approach_planner needs sync_step")
+    pending = gate.pending_approach(request["cluster_id"])
+    run = gate.episode["run_index"]
+    tag = f"epi{run}_c{request['cluster_id']}_s{count_steps}"
+    log_dir = os.path.join(gate.log_dir, "approach", tag) if gate.log_dir else None
+    start = time.time()
+    count_steps, camera_pitch, passed = level_camera(env, node, ctx, count_steps, camera_pitch, label, room,
+                                                     llm_answer, cld_with_score_msg)
+    native = int(request.get("approach_steps", 0) or 0) if int(request.get("approach_id", 0) or 0) else 0
     approach = LiveApproach(env.sim, gate.cfg["url"], gate.episode["target"], pending["object"],
-                            min(pending["max_steps"], ctx["max_episode_steps"] - 1 - count_steps),
-                            gate.approach_planner, log_dir=log_dir, tag=tag)
+                            min(max(pending["max_steps"] - native, MIN_PLANNER_STEPS),
+                                ctx["max_episode_steps"] - 1 - count_steps),
+                            gate.approach_planner, log_dir=log_dir, tag=tag,
+                            bank=gate.approach_bank(request["cluster_id"]))
     last = ctx["last_step"]   # the request's frame: the last executed step
     frame = {"rgb": last["rgb"], "depth": last["depth"]}
     detections, pose = (last["masks"], last["centroids"]), last["pose"]
@@ -308,9 +432,29 @@ def run_gate_approach(env, node, ctx, request, count_steps, camera_pitch, label,
             break
     result = dict(approach.result, seconds=round(time.time() - start, 1))
     state = gate.finish_external_approach(request, count_steps, result, approach_log=log_dir)
+    gate.remember_object(approach.object_points(), state)   # a later request for the same object inherits it
     print(f"[verification] gate approach ({gate.approach_planner}) cluster {request['cluster_id']}: "
           f"{result['status']} by {result['by']} after {result['actions']} actions")
-    return state, count_steps, camera_pitch, passed
+    stopped = False
+    try:
+        if state == 1 and gate.last_mile and not env.episode_over:
+            approach.start_last_mile(max(0, min(LM_BUDGET, ctx["max_episode_steps"] - 1 - count_steps)))
+            stopped, count_steps, p = drive_last_mile(env, node, ctx, approach, count_steps, camera_pitch, label,
+                                                      room, llm_answer, cld_with_score_msg)
+            passed = max(passed, p)
+    finally:
+        approach.close()
+    return state, count_steps, camera_pitch, passed, stopped or env.episode_over
+
+
+def request_frame(env, ctx):
+    """The request frame for gate.same_as_decided: the last executed step's depth, target masks / centroids and
+    the camera (sim frame)."""
+    from active_approach import scene as S
+    last = ctx.get("last_step")
+    if last is None:
+        return None
+    return {"depth": last["depth"], "masks": last["masks"], "centroids": last["centroids"], "cam": S.camera(env.sim)}
 
 
 def run_episode(env, node, ctx, label, llm_answer, room):
@@ -340,18 +484,49 @@ def run_episode(env, node, ctx, label, llm_answer, room):
                 node.wait_for_fusion(request.get("fusion_seq", 0))
             # A gate-off run never gets here (main() checks the planner flag);
             # accepting keeps a mismatched planner from waiting for its timeout
-            state = gate.handle(request, node.object_fusion, count_steps) if gate else 1
+            handoff = gate.approach_handoff(request, ctx["last_step"]) if gate and gate.approach_planner else None
+            if handoff == "native":
+                # a re-request of an approach ApexNav drives, object not yet close in view: keep approaching
+                node.publish_verification_result(request["seq"], request["cluster_id"], 3,
+                                                 gate.pending_approach(request["cluster_id"]))
+                last_progress = time.time()
+                continue
+            if handoff == "planner":
+                state = 3
+            else:
+                state = gate.handle(request, node.object_fusion, count_steps,
+                                    frame=request_frame(env, ctx) if gate.approach_planner or gate.close_in else None) if gate else 1
+                if state == 3 and gate.approach_planner and not gate.approach_close(request, ctx["last_step"]):
+                    state = "native"   # far or out of view: ApexNav's object navigation gets close first
+            if state == "native":
+                node.publish_verification_result(request["seq"], request["cluster_id"], 3,
+                                                 gate.pending_approach(request["cluster_id"]))
+                last_progress = time.time()
+                continue
             if state == 3 and gate.approach_planner:
                 # the gate drives the approach itself and answers the request with its verdict; the
                 # planner integrates the approach steps (resume_step) and replans from the new pose
-                state, count_steps, camera_pitch, passed = run_gate_approach(
+                state, count_steps, camera_pitch, passed, stopped = run_gate_approach(
                     env, node, ctx, request, count_steps, camera_pitch, label, room, llm_answer,
                     cld_with_score_msg)
                 pass_object = max(pass_object, passed)
-                node.publish_verification_result(request["seq"], request["cluster_id"], state,
-                                                 resume_step=max(count_steps, 1))
+                if not stopped:   # (stopped: the gate's last mile ended the episode)
+                    node.publish_verification_result(request["seq"], request["cluster_id"], state,
+                                                     resume_step=max(count_steps, 1))
                 last_progress = time.time()
                 continue
+            if state == 1 and gate and gate.approach_planner:
+                # accepted on the first view: the gate drives the last mile itself when the object is near
+                lm = run_gate_last_mile(env, node, ctx, request, count_steps, camera_pitch, label, room,
+                                        llm_answer, cld_with_score_msg)
+                if lm is not None:
+                    stopped, count_steps, camera_pitch, passed, steps = lm
+                    pass_object = max(pass_object, passed)
+                    if not stopped:   # handed back: plain accept, or replan from the new pose without a lock
+                        node.publish_verification_result(request["seq"], request["cluster_id"], 1,
+                                                         resume_step=max(count_steps, 1) if steps else 0)
+                    last_progress = time.time()
+                    continue
             # state 3: approach the object first; the planner re-requests the cluster
             approach = gate.pending_approach(request["cluster_id"]) if gate and state == 3 else None
             node.publish_verification_result(request["seq"], request["cluster_id"], state, approach)
@@ -387,10 +562,18 @@ def run_episode(env, node, ctx, label, llm_answer, room):
             if planned["expl_result"] >= 0:
                 node.expl_result = planned["expl_result"]
             last_progress = time.time()
-        if count_steps == ctx["max_episode_steps"] - 1:
+        step_cap = count_steps == ctx["max_episode_steps"] - 1
+        if step_cap:
             node.global_action = ACTION.STOP
         planned_action = node.global_action
         node.global_action = None
+        if gate and gate.close_in:
+            closed = run_close_in(env, node, ctx, planned_action, step_cap, count_steps, camera_pitch, label, room,
+                                  llm_answer, cld_with_score_msg)
+            if closed is not None:   # the close-in ended the episode with its own STOP
+                count_steps, camera_pitch, passed = closed
+                pass_object = max(pass_object, passed)
+                continue
 
         name = ACTION_TO_HABITAT.get(planned_action)
         if name is None:

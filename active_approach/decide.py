@@ -47,6 +47,7 @@ from pathlib import Path
 import numpy as np
 
 from active_approach import belief as B
+from active_approach import size_opinion as SZ
 
 J, SEL = B.J, B.SEL
 
@@ -73,7 +74,11 @@ MAX_VIEWS = 6
 DEFAULTS = {"DIST_M": 0.5, "ANGLE_DEG": 30.0, "MIN_AREA": 0.0, "N_MIN": 2, "P_STAR": 0.8, "EVIDENCE": "E1",
             "T": 2.0, "MARGIN": -0.1, "FAIL_MARGIN": -0.1, "VETO_K": 0.0, "TV_MONITOR": False, "JEV_FALLBACK": False,
             "A_REF": None, "W_MIN": 0.0, "GATE": "all", "REPLACE_GAIN": 1.2, "VIEWS": "nearest",
-            "VOTE": "count", "REL_AREA": 0.1, "TRIGGER": "consistent", "VERIFY": "fused"}
+            "VOTE": "count", "REL_AREA": 0.1, "TRIGGER": "consistent", "VERIFY": "fused",
+            # the metric-size opinion (active_approach/size_opinion.py, 2026-11-10) multiplied into the fused SAM3
+            # belief when the object's width is complete and the target is in SIZE_TARGETS; a veto only (it can
+            # lower the target, never raise it: size_opinion.likelihood); False: the frozen flow
+            "SIZE": True}
 GRID = {"GATE": ["pose", "replace", "all"], "VIEWS": ["nearest", "select"], "P_STAR": [0.8, 0.9, 0.95, 0.99, 2.0],
         "VETO_K": [0.0, 0.25, 0.5], "JEV_FALLBACK": [False, True], "MIN_AREA": [0.0, 0.005]}
 DEFAULTS["ANGLE_DEG"] = 20.0
@@ -166,8 +171,32 @@ def weighted_vote(per_view, target):
     return sum(w for w, v in zip(weights, used) if SEL.top1(v["scores"])[0] == target) / total
 
 
-def verify(counted, belief, target, margin, P, run=None):
-    """jev_sam3 forced over the chosen views with the JEV belief veto (and fallback without SAM3 views)."""
+def fused_accept(per_view, target, P, size=None, info=None):
+    """The fused SAM3 verdict (select.fuse_views) with the size opinion: belief' = belief x
+    size_opinion.likelihood(W, complete, target, classes), renormalised; accept iff the target is still the top
+    class. The opinion is a veto: it can turn an accept into a reject, never the reverse. ``size``: {"W": width (m),
+    "complete": bool} of the tracked object, or None (no geometry: the plain fused
+    verdict, as with P["SIZE"] False). ``info`` (a dict, optional) receives the belief before / after, the
+    likelihoods and both verdicts (logging)."""
+    fused = SEL.fuse_views(per_view, target)
+    accept, before = fused["accept"], fused["belief"]
+    lik = after = None
+    if P.get("SIZE") and size is not None and before:
+        lik = SZ.likelihood(size.get("W"), size.get("complete"), target, list(before))
+        after = SZ.update(before, lik)
+        accept = SZ.top(after, target) == target
+    if info is not None:
+        def r6(d):
+            return None if d is None else {c: round(v, 6) for c, v in d.items()}
+        info.update({"applied": bool(lik) and any(v != 1.0 for v in lik.values()),
+                     "accept_before": fused["accept"], "accept_after": accept,
+                     "belief_before": before, "likelihood": r6(lik), "belief_after": r6(after)})
+    return accept
+
+
+def verify(counted, belief, target, margin, P, run=None, size=None, info=None):
+    """jev_sam3 forced over the chosen views with the JEV belief veto (and fallback without SAM3 views).
+    ``size`` / ``info``: the size opinion of the fused verdict (``fused_accept``)."""
     views = chosen_views(counted, P)
     per_view = [{"scores": (f["jev"].get("sam3") or {}).get("scores"), "area": f["mask"]["area"],
                  "clipped": any(f["mask"][k] for k in ("top", "bottom", "left", "right"))} for f in views]
@@ -176,7 +205,7 @@ def verify(counted, belief, target, margin, P, run=None):
     t = belief.options.index(target)
     rival = max(a[i] for i in range(len(a)) if i != t)
     if agg["margin"] is not None and P.get("VERIFY", "fused") == "fused":
-        accept = SEL.fuse_views(per_view, target)["accept"]
+        accept = fused_accept(per_view, target, P, size, info)
         if accept and P["VETO_K"] > 0:
             accept = a[t] >= P["VETO_K"] * rival
         return "correct" if accept else "wrong"
@@ -228,15 +257,15 @@ def flow(run, P):
         if f["step"] == 0 or len(counted) < P["N_MIN"] or mass < P["W_MIN"] or target not in belief.options:
             continue
         if sure(belief, P):
-            return {"status": verify(counted, belief, target, P["MARGIN"], P, run), "by": "belief", "step": f["step"],
-                    "counted": len(counted), "calls": calls + 1}
+            return {"status": verify(counted, belief, target, P["MARGIN"], P, run, size=run.get("size")),
+                    "by": "belief", "step": f["step"], "counted": len(counted), "calls": calls + 1}
     if not counted:
         return {"status": "wrong", "by": "empty", "step": None, "counted": 0, "calls": calls}
     if belief.options is None or target not in belief.options:
         return {"status": "wrong", "by": "forced", "step": None, "counted": len(counted), "calls": calls + 1}
     margin = P["FAIL_MARGIN"] if run["end"] in ("budget", "stuck", "no_path") else P["MARGIN"]
-    return {"status": verify(counted, belief, target, margin, P, run), "by": "forced", "step": None,
-            "counted": len(counted), "calls": calls + 1}
+    return {"status": verify(counted, belief, target, margin, P, run, size=run.get("size")), "by": "forced",
+            "step": None, "counted": len(counted), "calls": calls + 1}
 
 
 def actions(run, out):
